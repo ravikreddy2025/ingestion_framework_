@@ -1,0 +1,129 @@
+# PRIMARY INGESTION - one job definition, every topic.
+#
+# A new topic is added by appending a task to the `tasks` list below with a different
+# topic_key. No new job, no new notebook, no code change.
+#
+# THE TASKS ARE DUPLICATED ON PURPOSE (for now). They differ only in task_key and topic-key,
+# so YAML anchors would remove the repetition - but bundle schema validation of anchors could
+# not be confirmed here, and a bundle that fails to parse blocks every deployment. The
+# duplication is visible and harmless; a broken bundle is neither. If you do introduce
+# anchors, run `databricks bundle validate -t dev` before merging.
+# Keep the retry settings identical across tasks - they had already drifted once. (If the domain prefers full
+# isolation of failure blast radius, the same job definition can instead be run once per
+# topic from a scheduler loop - the entrypoint is identical either way.)
+#
+# SERVERLESS COMPUTE DEPENDENCY
+# -----------------------------
+# The environment below targets serverless jobs compute. That requires network
+# connectivity from the serverless egress to every Kafka bootstrap endpoint AND every
+# Schema Registry in conf/, via Network Connectivity Configuration (NCC) private
+# endpoints or firewall allowlisting of the NCC's stable egress IPs.
+# For the on-prem clusters (cp_onprem_rcm, cp_onprem_antifraud) that connectivity is NOT
+# assumed - confirm it per cluster before moving those topics off classic compute.
+#
+# If it turns out serverless cannot reach them, replace `environment_key: ingest_env` with
+# `job_cluster_key: classic_ingest` on the affected tasks and uncomment the `job_clusters`
+# block below. It is defined but unused on purpose: writing it during an incident, against
+# a cluster policy you have not read, is not when you want to be choosing a node type.
+
+resources:
+  jobs:
+
+    ingest_primary:
+      name: "[${bundle.target}] Kafka Ingest - Primary"
+      description: >-
+        Daily Kafka -> landing/curated ingestion. Trigger.AvailableNow, one run per day.
+        Behaviour per topic is controlled by ${var.control_table}; structure by conf/ in Git.
+
+      schedule:
+        # 02:15 UTC daily. Trigger.AvailableNow drains whatever has accumulated and stops.
+        quartz_cron_expression: "0 15 2 * * ?"
+        timezone_id: UTC
+        pause_status: UNPAUSED
+
+      # Overlapping runs would contend on the same checkpoint. One at a time, always.
+      max_concurrent_runs: 1
+
+      parameters:
+        - name: config_root
+          default: ${workspace.file_path}/conf
+        - name: control_table
+          default: ${var.control_table}
+        - name: environment
+          # Selects conf/environments/<env>.yaml. Defaulted from the bundle target, so
+          # dev/preprod/prod is declared once in databricks.yml and never typed again.
+          default: ${bundle.target}
+
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+
+      environments:
+        - environment_key: ingest_env
+          spec:
+            client: "3"
+            dependencies:
+              - ./dist/*.whl
+
+      # Classic-compute fallback for topics whose brokers serverless cannot reach. Unused
+      # until a task references it - see the note at the top of this file. Confirm the node
+      # type and runtime against your workspace's cluster policy before enabling.
+      # job_clusters:
+      #   - job_cluster_key: classic_ingest
+      #     new_cluster:
+      #       spark_version: "15.4.x-scala2.12"
+      #       node_type_id: Standard_D4ds_v5
+      #       num_workers: 2
+      #       data_security_mode: SINGLE_USER
+
+      tasks:
+
+        - task_key: vector_patient_events
+          environment_key: ingest_env
+          max_retries: 2
+          # Retries are safe: the checkpoint has not advanced past a failed batch, and
+          # Delta's txnAppId/txnVersion markers suppress the duplicate landing write.
+          min_retry_interval_millis: 300000
+          retry_on_timeout: false
+          timeout_seconds: 10800
+          python_wheel_task:
+            package_name: kafka_ingest
+            entry_point: ingest-primary
+            named_parameters:
+              config-root: "{{job.parameters.config_root}}"
+              control-table: "{{job.parameters.control_table}}"
+              environment: "{{job.parameters.environment}}"
+              topic-key: vector_patient_events
+              job-run-id: "{{job.run_id}}"
+
+        - task_key: rcm_claim_status
+          environment_key: ingest_env
+          max_retries: 2
+          min_retry_interval_millis: 300000
+          retry_on_timeout: false
+          timeout_seconds: 10800
+          python_wheel_task:
+            package_name: kafka_ingest
+            entry_point: ingest-primary
+            named_parameters:
+              config-root: "{{job.parameters.config_root}}"
+              control-table: "{{job.parameters.control_table}}"
+              environment: "{{job.parameters.environment}}"
+              topic-key: rcm_claim_status
+              job-run-id: "{{job.run_id}}"
+
+        - task_key: antifraud_txn_alerts
+          environment_key: ingest_env
+          max_retries: 2
+          min_retry_interval_millis: 300000
+          retry_on_timeout: false
+          timeout_seconds: 10800
+          python_wheel_task:
+            package_name: kafka_ingest
+            entry_point: ingest-primary
+            named_parameters:
+              config-root: "{{job.parameters.config_root}}"
+              control-table: "{{job.parameters.control_table}}"
+              environment: "{{job.parameters.environment}}"
+              topic-key: antifraud_txn_alerts
+              job-run-id: "{{job.run_id}}"

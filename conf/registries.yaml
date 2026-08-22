@@ -1,0 +1,76 @@
+# =====================================================================================
+# SCHEMA REGISTRY PROFILES  --  the REGISTER of which registries exist.
+#
+# Holds what is the SAME in every environment: auth mode, secret KEY names, certificate
+# paths, timeouts. What DIFFERS - url and secret_scope - lives in
+# conf/environments/<env>.yaml and is merged over the profile at load time.
+#
+# Registry auth is INDEPENDENT of Kafka auth, deliberately. A domain may authenticate to
+# the broker with mTLS and to the registry with basic auth, or point at a registry that is
+# not co-located with its cluster. Never assume one credential pair serves both.
+#
+# The registry is contacted from the DRIVER only. Schema JSON is resolved there and passed
+# to the executors as a literal string, so Volume-backed PEM files need DRIVER access only.
+# (Contrast with the Kafka keystore/truststore in clusters.yaml, which executors do open.)
+#
+# Full reference: docs/CONFIGURATION.md
+# =====================================================================================
+
+registries:
+
+  # ===================================================================================
+  # Confluent Cloud Schema Registry - basic auth (API key/secret)
+  # ===================================================================================
+  confluent_cloud_shared:
+
+    # ----------------------------------------------------------- NO CHANGE REQUIRED --
+    # Confluent Cloud Schema Registry is always basic auth (user-info).
+    auth_mode: basic
+
+    # ------------------------------------------------------------------ MUST CHANGE --
+    # KEY names inside the environment's scope. A Schema Registry API key is a SEPARATE
+    # credential from a Kafka API key, even when both live in the same scope.
+    username_key: sr-shared-api-key      # "user" half of the SR user-info credential
+    password_key: sr-shared-api-secret   # "secret" half
+
+    # -------------------------------------------------------------- NICE TO CHANGE --
+    timeout_seconds: 20                  # raise behind a slow private link
+    max_retries: 3                       # GETs only, exponential backoff, on 429/5xx
+
+  # ===================================================================================
+  # Self-managed registry behind a corporate CA - basic auth
+  # ===================================================================================
+  sr_onprem_rcm:
+
+    # ----------------------------------------------------------- NO CHANGE REQUIRED --
+    auth_mode: basic
+
+    # ------------------------------------------------------------------ MUST CHANGE --
+    username_key: rcm-sr-username
+    password_key: rcm-sr-password
+
+    # PEM CA bundle so `requests` trusts the registry's certificate. UC Volume path only.
+    # Omit if the registry uses a publicly-trusted certificate.
+    ca_bundle_path: "/Volumes/{catalog}/ingestion/certs/rcm/corp-ca-bundle.pem"
+
+    # -------------------------------------------------------------- NICE TO CHANGE --
+    timeout_seconds: 30
+
+  # ===================================================================================
+  # Self-managed registry requiring MUTUAL TLS. No username/password.
+  # ===================================================================================
+  sr_onprem_antifraud:
+
+    # ----------------------------------------------------------- NO CHANGE REQUIRED --
+    # No secret_scope needed: the certificate IS the credential.
+    auth_mode: mtls
+
+    # ------------------------------------------------------------------ MUST CHANGE --
+    # Client identity presented to the registry. PEM format (not JKS - this is `requests`,
+    # not the JVM). Driver-readable is sufficient.
+    client_cert_path: "/Volumes/{catalog}/ingestion/certs/antifraud/sr-client.pem"
+    client_key_path: "/Volumes/{catalog}/ingestion/certs/antifraud/sr-client-key.pem"
+    ca_bundle_path: "/Volumes/{catalog}/ingestion/certs/antifraud/fraud-ca-bundle.pem"
+
+    # -------------------------------------------------------------- NICE TO CHANGE --
+    timeout_seconds: 30

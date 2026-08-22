@@ -1,0 +1,118 @@
+# =====================================================================================
+# CONFLUENT KAFKA CLUSTER PROFILES  --  the REGISTER of which clusters exist.
+#
+# This file holds what is the SAME in every environment:
+#   auth mode, secret KEY names, certificate paths, store types, tuning options.
+#
+# What DIFFERS per environment - bootstrap_servers and secret_scope - lives in
+# conf/environments/<env>.yaml and is merged over the profile at load time. A profile
+# named there must already exist here; that keeps this file the single place to answer
+# "which clusters do we consume from?".
+#
+# Nothing in either file is secret. Only secret SCOPE and KEY NAMES appear; values live in
+# Azure Key Vault and are read at runtime via dbutils.secrets.get(). If you are pasting a
+# password into YAML, stop.
+#
+# TIER MARKERS
+#   [MUST CHANGE]         Placeholder. Will not work as shipped.
+#   [NICE TO CHANGE]      Sensible default. Tune with a reason.
+#   [NO CHANGE REQUIRED]  Dictated by how the brokers are configured.
+#
+# Full reference: docs/CONFIGURATION.md
+# =====================================================================================
+
+clusters:
+
+  # ===================================================================================
+  # Confluent Cloud - API key/secret over SASL_SSL + PLAIN. Public CA, so NO truststore.
+  # Used by Vector and GMA. The simplest profile - start here.
+  # ===================================================================================
+  confluent_cloud_shared:
+
+    # ----------------------------------------------------------- NO CHANGE REQUIRED --
+    # Confluent Cloud API keys are always PLAIN over TLS. The framework derives
+    # security.protocol=SASL_SSL and sasl.mechanism=PLAIN from this single value.
+    auth_mode: sasl_plain
+
+    # ------------------------------------------------------------------ MUST CHANGE --
+    # Names of the KEYS inside the environment's secret scope - NOT the values.
+    #   sasl_username_key -> the Confluent Cloud API KEY
+    #   sasl_password_key -> the Confluent Cloud API SECRET
+    # Keep the key names identical across environments; the SCOPE is what changes.
+    sasl_username_key: cc-shared-api-key
+    sasl_password_key: cc-shared-api-secret
+
+    # -------------------------------------------------------------- NICE TO CHANGE --
+    # Passed to the consumer with a "kafka." prefix added. Confluent Cloud's own
+    # recommendations; safe to leave as-is.
+    extra_options:
+      # Longer than the Kafka default: this consumer sits idle between daily runs.
+      session.timeout.ms: "45000"
+      # Resilience when a bootstrap host resolves to several IPs.
+      client.dns.lookup: "use_all_dns_ips"
+
+  # ===================================================================================
+  # Self-managed Confluent Platform, SCRAM-SHA-512 over TLS, PRIVATE CA. Used by RCM.
+  #
+  # NOTE: this is SASL, not mTLS, but it STILL needs a truststore because the broker
+  # certificate is signed by a corporate CA the JVM does not trust by default. That
+  # combination surprises people - the two are not an either/or.
+  # ===================================================================================
+  cp_onprem_rcm:
+
+    # ----------------------------------------------------------- NO CHANGE REQUIRED --
+    # Dictated by broker configuration. Confirm with the Kafka team; do not guess.
+    # SCRAM-SHA-256 is a different value (sasl_scram_sha_256).
+    auth_mode: sasl_scram_sha_512
+
+    # ------------------------------------------------------------------ MUST CHANGE --
+    sasl_username_key: rcm-consumer-username
+    sasl_password_key: rcm-consumer-password
+
+    # Corporate CA truststore. MUST be a Unity Catalog Volume path - validation rejects
+    # dbfs:/ and /Workspace outright. {catalog} resolves per environment.
+    truststore_path: "/Volumes/{catalog}/ingestion/certs/rcm/corp-truststore.jks"
+    truststore_password_key: rcm-truststore-password
+
+    # -------------------------------------------------------------- NICE TO CHANGE --
+    # JKS is the Java default. Use PKCS12 if your security team standardised on it.
+    truststore_type: JKS
+
+  # ===================================================================================
+  # Self-managed cluster requiring MUTUAL TLS. No SASL at all. Used by Anti-Fraud.
+  # The client authenticates with a certificate, not a password.
+  #
+  # PREREQUISITE, verify before onboarding an mTLS topic: the keystore/truststore are
+  # opened by the Kafka client on the EXECUTORS, so UC Volume paths must be readable from
+  # executors on your compute profile. notebooks/02_check_connectivity checks this.
+  # ===================================================================================
+  cp_onprem_antifraud:
+
+    # ----------------------------------------------------------- NO CHANGE REQUIRED --
+    # Selects the mTLS code path: security.protocol=SSL and no JAAS config at all.
+    auth_mode: mtls
+
+    # ------------------------------------------------------------------ MUST CHANGE --
+    # Server-side trust: which CA signed the BROKER's certificate.
+    truststore_path: "/Volumes/{catalog}/ingestion/certs/antifraud/truststore.jks"
+    truststore_password_key: af-truststore-password
+
+    # Client-side identity: OUR certificate, presented to the broker.
+    keystore_path: "/Volumes/{catalog}/ingestion/certs/antifraud/client-keystore.jks"
+    keystore_password_key: af-keystore-password
+
+    # -------------------------------------------------------------- NICE TO CHANGE --
+    # Only if the PRIVATE KEY inside the keystore has its own password, distinct from the
+    # keystore password. Omit this line entirely when it does not.
+    key_password_key: af-private-key-password
+
+    keystore_type: JKS
+    truststore_type: JKS
+
+    extra_options:
+      # On-prem brokers over a corporate WAN are slower than Confluent Cloud.
+      request.timeout.ms: "60000"
+      # DELIBERATELY ABSENT: ssl.endpoint.identification.algorithm. Leaving it unset keeps
+      # hostname verification ON. If a cluster genuinely cannot present matching SANs, set
+      # it to "" HERE, per cluster, so the exception shows up in a PR diff rather than
+      # being buried in code and applied everywhere.

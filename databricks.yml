@@ -1,0 +1,130 @@
+# Databricks Asset Bundle - deploys code, structural config and job definitions as one
+# versioned unit. Structural YAML travels with the wheel that reads it, so a config change
+# and the code that understands it are promoted together.
+#
+#   databricks bundle validate -t dev
+#   databricks bundle deploy   -t dev
+#   databricks bundle run ingest_primary -t dev
+
+bundle:
+  name: kafka-ingest
+
+include:
+  - resources/*.yml
+
+artifacts:
+  kafka_ingest_wheel:
+    type: whl
+    build: python -m build --wheel
+    path: .
+
+sync:
+  # conf/ is deployed as workspace files next to the wheel; --config-root points at it.
+  # It is deliberately NOT baked into the wheel: a structural config change should be a
+  # reviewable diff of a YAML file, not an opaque artifact rebuild.
+  include:
+    - conf/**
+    - sql/**
+
+# TARGET NAMES MUST MATCH conf/environments/<name>.yaml.
+# Each job passes `environment: ${bundle.target}` to the code, which then loads
+# conf/environments/<target>.yaml. Renaming a target without renaming the environment file
+# makes every job fail at startup with "unknown environment" - which is the intended
+# behaviour, but rename both together.
+#
+# The data catalog lives in conf/environments/<env>.yaml under `vars.catalog`, because the
+# CODE builds table names from it. It is ALSO declared here as `data_catalog`, for the one
+# thing that cannot read conf/: the maintenance job, which is SQL. The duplication is
+# deliberate and guarded - tests/test_shipped_config.py asserts the two agree per target.
+# Nothing else should read `data_catalog`; the Python path always goes through conf/.
+
+variables:
+  ops_catalog:
+    description: Catalog holding the operational control table
+    default: ops_dev
+  control_table:
+    description: 3-tier name of the operational control table
+    default: ops_dev.ingestion.ingestion_topic_control
+  service_principal:
+    description: Principal the ingestion jobs run as
+    default: sp-kafka-ingestion-dev
+  notification_email:
+    description: Where job failures are sent
+    default: data-platform-oncall@example.com
+
+  # TWO RETENTIONS. They are unrelated numbers that sit near each other, and merging them
+  # would be expensive in opposite directions - so they are named in their own units.
+  landing_retention_days:
+    description: >-
+      How long a LANDING ROW is kept before it is eligible for deletion. The agreed policy is
+      20 years (7300 days). Override per target where a shorter window is wanted - dev has no
+      reason to keep two decades of data. Changing this in prod is a compliance decision.
+    default: "7300"
+  vacuum_retention_hours:
+    description: >-
+      How long Delta keeps SUPERSEDED DATA FILES, i.e. how far back time travel and recovery
+      still work. NOT the row retention above: setting this to 20 years would keep every
+      version of every file for two decades. 168 hours (7 days) is Delta's default and the
+      floor it will accept without an explicit override.
+    default: "168"
+  data_catalog:
+    description: >-
+      The DATA catalog, i.e. where landing/curated/audit live. MUST MATCH `vars.catalog` in
+      conf/environments/<target>.yaml - the Python reads it from there, and the maintenance
+      job (which is SQL and cannot read conf/) reads it from here. A test asserts they agree,
+      because a silent mismatch would point maintenance at a catalog that does not exist.
+    default: platform_dev
+  sql_warehouse_id:
+    description: >-
+      SQL warehouse that runs the maintenance job. MUST BE SET before deploying that job -
+      the default below is a placeholder and will not resolve.
+    default: REPLACE_WITH_SQL_WAREHOUSE_ID
+
+targets:
+
+  dev:
+    mode: development
+    default: true
+    workspace:
+      host: https://adb-0000000000000000.0.azuredatabricks.net
+
+  preprod:
+    mode: production
+    workspace:
+      host: https://adb-1111111111111111.1.azuredatabricks.net
+      root_path: /Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      ops_catalog: ops_preprod
+      data_catalog: platform_preprod
+      control_table: ops_preprod.ingestion.ingestion_topic_control
+      service_principal: sp-kafka-ingestion-preprod
+    run_as:
+      service_principal_name: ${var.service_principal}
+
+  prod:
+    mode: production
+    workspace:
+      host: https://adb-2222222222222222.2.azuredatabricks.net
+      root_path: /Shared/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      ops_catalog: ops_prod
+      data_catalog: platform_prod
+      control_table: ops_prod.ingestion.ingestion_topic_control
+      service_principal: sp-kafka-ingestion
+    run_as:
+      service_principal_name: ${var.service_principal}
+    permissions:
+      # NOTE: these are TARGET-level, so they apply to EVERY job in the bundle - the replay
+      # jobs, the maintenance job, AND the primary ingestion job. CAN_MANAGE_RUN therefore
+      # lets support trigger and cancel primary production ingestion, not just a replay.
+      #
+      # That is deliberate: during an incident, support needs to be able to re-run the
+      # primary job after a fix without waiting for an engineer. They still cannot EDIT any
+      # job definition - that requires CAN_MANAGE, which is not granted here.
+      #
+      # To narrow it to replays only, remove this block and attach permissions to the
+      # individual jobs in resources/job_replay.yml instead.
+      #
+      # CAN_MANAGE_RUN already implies CAN_VIEW, so CAN_VIEW is not listed separately.
+      - level: CAN_MANAGE_RUN
+        group_name: ingestion-support

@@ -1,0 +1,432 @@
+# Design
+
+For the team taking this over. Read this before changing code.
+
+**Scope: Kafka → landing → curated.** Nothing downstream of curated is in this package.
+
+---
+
+## 1. What the framework does
+
+```
+                       ┌──────────────────────────── ONE streaming query ───────────────────────────┐
+                       │                                                                            │
+  Confluent Kafka ──readStream──▶ foreachBatch(batch_df, batch_id)                                  │
+                       │              │                                                             │
+                       │              ├─▶ audit  landing STARTED                                    │
+                       │              ├─▶ project + write  LANDING   (raw bytes, + CloudEvent cols) │
+                       │              ├─▶ audit  landing COMPLETED   record_count=N                 │
+                       │              ├─▶ audit  curated STARTED                                    │
+                       │              ├─▶ parse the SAME cached batch_df                            │
+                       │              ├─▶ write CURATED  (+ quarantine)                             │
+                       │              └─▶ audit  curated COMPLETED   record_count=M                 │
+                       │                                                                            │
+                       └─▶ StreamingQueryListener ─▶ audit  stream COMPLETED  + Kafka offsets ──────┘
+```
+
+One read from Kafka. Landing and curated are written from the **same in-memory microbatch**
+inside one `foreachBatch`. Curated never re-reads Kafka and never re-reads the landing table.
+
+Trigger is `availableNow`: drain what is on the topic, then stop. Scheduled once daily.
+
+### The three tables
+
+| Layer | Tables | Partitioned by | Contents |
+|---|---|---|---|
+| **landing** | **ONE per topic** | `(ingest_date)` | Kafka value bytes **verbatim**, incl. the 5-byte Confluent header, + Kafka columns + CloudEvent columns |
+| **curated** | **ONE PER TOPIC** | `(event_date)` | Same Kafka + CloudEvent columns, plus the parsed payload as **one nested `payload` STRUCT** |
+| **audit** | ONE for the whole estate | `(audit_date)` | One row per (batch, layer, status) transition |
+| quarantine | One per topic (optional) | `(ingest_date)` | Records that could not be parsed, raw bytes retained |
+
+Landing and curated deliberately share their Kafka and CloudEvent column names, so any
+curated row joins back to its landing row on `(topic, kafka_partition, kafka_offset)` —
+which is also the MERGE key that makes replay idempotent.
+
+---
+
+## 2. File lineage
+
+Read the modules in this order. It is the order data flows through them.
+
+| # | File | Owns | Depends on |
+|---|---|---|---|
+| 1 | `config.py` | Two-tier config → one `TopicConfig`. Validation. Checkpoint-path derivation. | *(no PySpark — testable in plain CI)* |
+| 2 | `security.py` | Key Vault secrets + UC Volume certs → Kafka/registry connection options. Redaction. | `config` |
+| 3 | `kafka_source.py` | `readStream` / bounded batch read. Primary vs replay positioning. Trigger. | `config`, `security` |
+| 4 | `schema_resolver.py` | Confluent wire-format column expressions. Schema Registry REST client + cache. | `config`, `security` |
+| 5 | `landing_writer.py` | Landing projection (incl. CloudEvent extraction) + write. | `config`, `schema_resolver` |
+| 6 | `curated_writer.py` | Per-writer-schema Avro decode → curated + quarantine, and their writes. | `config`, `schema_resolver`, `landing_writer` |
+| 7 | `audit.py` | Audit row construction, `AuditWriter`, `StreamAuditListener`. | `config` |
+| 8 | `tables.py` | DDL + partitioning for landing / quarantine / audit. | `config` |
+| 9 | `pipeline.py` | The chained `foreachBatch` body, the four run shapes, the startup guard. | **all of the above** |
+| 10 | `entrypoints/*.py` | argparse → resolve config → `pipeline.run()`. Nothing else. | `config`, `security`, `pipeline` |
+
+### Dependency graph
+
+```
+                    config.py  ◀── (everything depends on this; it depends on nothing)
+                    ╱    │    ╲
+           security.py   │     tables.py
+              ╱   ╲      │        │
+  kafka_source   schema_resolver  │
+        │            ╱      ╲     │
+        │   landing_writer   │    │        audit.py
+        │        │      ╲    │    │          │
+        │        │    curated_writer         │
+        │        │           │               │
+        └────────┴──── pipeline.py ──────────┘
+                            │
+                      entrypoints/
+```
+
+No cycles. `config.py` is a leaf on purpose: it imports no PySpark, which is what lets the
+config and validation tests run in CI without a Spark install.
+
+### Supporting files
+
+| Path | Purpose |
+|---|---|
+| `conf/clusters.yaml` | Kafka cluster profiles (bootstrap, auth mode, secret **names**) |
+| `conf/registries.yaml` | Schema Registry profiles — auth is independent of Kafka auth |
+| `conf/topics/<key>.yaml` | One per topic. **The filename is the `topic_key`.** |
+| `conf/topics/_TEMPLATE.yaml` | Copy-to-onboard. Inert; skipped by the validator. |
+| `sql/01_operational_config.sql` | Control table + grants (support-editable tier) |
+| `sql/02_layer_tables.sql` | Landing / audit / quarantine DDL + grants. A `{catalog}`/`{topic_table}` **template** now landing is per-topic - the code creates the real tables itself; this is for pre-provisioning |
+| `sql/03_support_queries.sql` | Triage queries and the no-deploy fixes |
+| `sql/04_maintenance.sql` | `OPTIMIZE`/`VACUUM`, run weekly by `resources/job_maintenance.yml`. The retention `DELETE` is written but commented out - see §9 item 4 |
+| `resources/job_*.yml` | Databricks Workflows definitions (DAB) |
+| `notebooks/00–03` | Escalating sequence: config → tests → connectivity → real run |
+
+---
+
+## 3. Configuration: five layers, two tiers
+
+```
+1. conf/defaults.yaml            common to every topic in every environment
+2. conf/environments/<env>.yaml  vars (catalog), per-env defaults, cluster/registry endpoints
+3. conf/topics/<key>.yaml        unique to one topic
+     3a. topic:.environments.<env>  RARE - unique to one topic IN ONE environment, nested
+                                    in the same file. Working example:
+                                    conf/topics/vector_patient_events.yaml
+      ^-- STRUCTURAL: Git, PR-reviewed, next deploy
+4. operational control table     support-team overrides
+5. Workflows job parameters      one-off overrides
+      ^-- OPERATIONAL: next run, no deploy
+```
+
+Later wins per key; absent keys fall through. `{catalog}`, `{topic_key}`, `{topic_table}` and `{domain}`
+placeholders in layers 1–3 (3a included) resolve after the merge — an unresolved one is a
+hard error.
+
+3a stays inside layer 3 in every other respect: still Git, still PR-reviewed, still deployed
+by DAB. It exists only for a value specific to both one topic and one environment — a
+platform-wide environment difference belongs in layer 2, and a runtime toggle belongs in
+layer 4. Full precedence and rationale: `docs/CONFIGURATION.md` §4.
+
+| | **Structural** (1–3) | **Operational** (4–5) |
+|---|---|---|
+| Holds | Topic, cluster, registry, tables, **partitioning**, checkpoint root, dedup keys | enable/disable, trigger, batch size, failure mode, reader schema, **replay controls** |
+| Changed by | Platform + domain engineers | **Support team** |
+| Process | PR → deploy | `UPDATE` |
+| Effect | Next deploy | **Next run — no deploy** |
+
+The environment comes from `--environment ${bundle.target}`, so a DAB target name must
+match an `environments/<name>.yaml` file. The data catalog is **not** a bundle variable —
+DAB substitution does not reach files under `sync.include`, so `conf/` is copied verbatim
+and the catalog lives in `vars.catalog` where the code can read it.
+
+A **topic file that hardcodes a catalog works in prod and silently breaks dev**, which is
+why `tests/test_shipped_config.py` resolves the full (topic × environment) cross product.
+
+A **missing control row is not an error** (it means "no overrides"), so a topic runs the
+moment its YAML merges. **Duplicate rows are** an error.
+
+Note what is *not* operational: table names, partition columns and dedup keys are
+structural. Changing a table's physical layout should require a PR, so those fields are
+deliberately absent from the override set. `tests/test_config.py` asserts this.
+
+---
+
+## 4. Re-runs and duplicates
+
+**The most important section in this document.**
+
+### Two mechanics everything follows from
+
+1. **Checkpoint protocol.** Spark writes the batch's offset range to `<checkpoint>/offsets/N`
+   *before* running `foreachBatch`, and `<checkpoint>/commits/N` *after* it returns
+   cleanly. On restart, if `offsets/N` exists but `commits/N` does not, Spark
+   **re-executes batch N over the identical offset range**. A retry never reads a
+   different set of records.
+2. **Delta idempotent writes.** `txnAppId` + `txnVersion=batchId` are recorded **per
+   table**. A repeat write with an already-seen version is skipped. That is why one shared
+   `txn_app_id` is correct: landing skips itself while curated still proceeds.
+
+`txn_app_id` is derived from `topic_key` + run type + replay lineage (`pipeline._make_txn_app_id`).
+It **must stay stable across restarts** — never make it random per run.
+
+### Failure scenarios
+
+| # | Failure | Duplicates? | Fix — no code change |
+|---|---|---|---|
+| 1 | Curated fails, transient | No | Re-run |
+| 2 | Curated fails persistently (unregistered schema) | No | Register schema, **or** `on_deser_error → quarantine` |
+| 3 | Driver dies between landing and curated | No | Re-run |
+| 4 | Landing write itself fails | No | Fix cause, re-run |
+| 5 | Job timeout mid-run | No | Re-run; lower `max_offsets_per_trigger` |
+| 6 | **Primary checkpoint deleted** | **No — silent data loss instead** | Kafka replay job |
+| 7 | Batch succeeded, curated data wrong | No | Curated replay job |
+| 8 | Records genuinely missed | No | Kafka replay job |
+
+#### Scenario 1–3 — self-healing
+
+```
+Batch 5, attempt 1:  landing append (X,5) → COMMITTED
+                     curated write        → FAILS
+                     no commits/5         → run fails
+Batch 5, retry:      landing append (X,5) → SKIPPED by Delta
+                     curated write        → SUCCEEDS
+                     commits/5 written    → done
+```
+
+#### Scenario 2 — poison batch, the one that actually hurts
+
+A *persistent* parse failure retries forever; the topic never advances. Not a duplicate
+problem — a stuck stream. Fixes, in order of preference:
+
+1. Register the missing schema. Next run succeeds naturally.
+2. `UPDATE ... SET on_deser_error = 'quarantine'` (see `sql/03_support_queries.sql` Q5).
+   Bad records go to quarantine with raw bytes, the batch completes, the stream drains.
+   Recover them later with the **curated replay** job, then set it back to `fail`.
+
+#### Scenario 6 — the only failure that looks like success
+
+Deleting the primary checkpoint restarts `batchId` at 0. Delta has already recorded high
+versions for this `txnAppId`, so appends are **skipped as duplicates**. The job reports
+success and writes nothing.
+
+`pipeline.guard_against_checkpoint_reset()` refuses to run when the primary checkpoint is
+missing **and** the landing table already holds rows for this topic. A genuine first run is
+unaffected: its own landing table has no rows yet — which is also why a migration that
+pre-loads **curated** from a legacy system before the stream ever starts is unaffected too;
+the guard never inspects curated.
+
+**Never delete a primary checkpoint. Use the Kafka replay job** to recover the missed *data*
+— it derives a different checkpoint *and* a different `txnAppId` from `rerun_id`, so neither
+collides. Replay does **not**, by itself, unblock the *primary* job: the guard keeps refusing
+every trigger until support sets `checkpoint_reset_id` in the control table, which forks
+`_make_txn_app_id`'s lineage the same way `rerun_id` does, so the restarted primary also gets
+an identity with no committed history to collide with. See
+[`RUNBOOK_SUPPORT.md` §5.4a](RUNBOOK_SUPPORT.md#5-4a-restarting-the-primary-after-a-genuine-checkpoint-loss).
+
+### ⚠️ Verify this on your DBR before go-live
+
+`txnAppId` / `txnVersion` behaviour is taken from Delta's documented contract, **not
+measured** — there was no Delta available in the environment this was written in. In
+particular, confirm whether the skip triggers on `txnVersion ≤ last recorded` or only on
+`==`; scenario 6 depends on it. Test by killing a job deliberately between the landing and
+curated writes, then re-running and checking `sql/03_support_queries.sql` **Q9**
+(duplicate check) returns zero rows.
+
+---
+
+## 5. Design decisions
+
+### Payload stays nested
+
+Curated stores the parsed record as **one `payload` STRUCT**, not flattened columns.
+
+- Every curated table has the same recognisable outer shape, so an operator moving between
+  topics does not relearn the columns.
+- No collision is possible between business fields and framework columns — which is why
+  the framework columns are plainly named (`topic`, `ingest_ts`) instead of underscore-prefixed.
+- Nested structures survive as structs/arrays/maps: query `payload.patient.id`, read with
+  `SELECT to_json(payload)`.
+- Business fields in config are therefore written as `payload.<field>` — e.g.
+  `curated_dedup_keys: [payload.claim_id]`.
+
+**Arrays are not exploded.** Curated is 1:1 with Kafka records. Exploding would break the
+`(topic, kafka_partition, kafka_offset)` merge key that makes replay idempotent. Fan-out is
+a modelling decision that belongs downstream.
+
+### Reader schema is mandatory; `writer` mode does not exist
+
+`from_avro(payload, jsonFormatSchema, options)` maps onto Avro's two-schema resolution:
+positional = **writer** (how the bytes were encoded), `avroSchema` option = **reader**
+(the shape you want out). The reader schema fixes the `payload` struct's type.
+
+Because curated stores payload as one struct column, two writer versions decoded *without*
+a common reader schema would produce two incompatible struct types that cannot share a
+table. So there is no "use each writer schema as-is" mode — only `registry_latest` and
+`pinned_id`. Avro resolution fills reader-only fields from defaults and drops writer-only
+fields, so a mixed-version batch lands cleanly.
+
+That positional/option mapping is easy to get backwards and has moved between Spark
+versions, so `curated_writer.assert_from_avro_semantics()` **proves it at runtime**, once
+per run, with a 5-byte synthetic record. A DBR upgrade that changed the behaviour fails the
+job at startup instead of silently mis-decoding production data.
+
+### Partitioning, not Liquid Clustering
+
+Delta allows `PARTITIONED BY` or `CLUSTER BY`, never both.
+
+- **landing** `(ingest_date)` — one table per topic, so `topic` is constant inside it and a
+  low-cardinality column essentially every read filters on, and it gives per-topic file
+  isolation for retention and replay. `ingest_date` stops one topic's partition growing
+  without bound.
+- **curated** `(event_date)` — already one table per topic, so `topic` is constant.
+  `event_date` = date of `ce_time`, falling back to `kafka_timestamp`. Late-arriving events
+  write into older partitions; that is expected.
+
+Liquid Clustering would be the better default for a *single-topic* landing table. It is not
+available here because partitioning was the requirement, and the two are exclusive.
+
+### MERGE vs append
+
+| | Primary | Replay |
+|---|---|---|
+| **landing** | append + `txnAppId`/`txnVersion` | MERGE on record key, **insert-if-absent only** |
+| **curated** | append + `txnAppId`/`txnVersion` | MERGE on record key, **upsert** |
+
+Append on the primary path because exactly-once is already guaranteed by checkpoint +
+idempotent markers; MERGE would scan the target every batch to discover it has nothing to do.
+
+MERGE on replays because a replay overlaps existing data *by definition*.
+
+**The asymmetry is the important part.** Landing records *what arrived* — overwriting a
+row's provenance with replay metadata would destroy the thing replays are meant to be
+distinguishable by. Curated records *what the data means* — replacing a bad parse is the
+entire point of a curated replay.
+
+### CloudEvents
+
+CloudEvents v1.0, Kafka binary content mode: context attributes arrive as `ce_*` headers
+and the event data is the Kafka value — exactly the Avro payload. Eight attributes are
+promoted to typed columns in both layers. Header matching is case-insensitive.
+
+Two judgement calls:
+
+- **`ce_time` is stored as STRING, verbatim.** RFC3339 UTC sorts correctly as a string, and
+  parsing here would either silently NULL a malformed value or throw under ANSI mode.
+  `event_date` is derived separately with a regex guard so a malformed `ce_time` can never
+  fail a batch.
+- **No `ce_extensions` MAP.** Kafka permits duplicate header keys and map construction from
+  them errors on duplicates. Non-standard attributes stay in `kafka_headers`.
+
+### Hand-rolled `foreachBatch`, not Lakeflow Declarative Pipelines
+
+LDP is the better default for most medallion work, and is the right tool downstream of
+curated. It does not fit *this* layer, for three concrete reasons:
+
+1. **Per-record writer-schema resolution needs a driver-side registry call inside the
+   batch.** The query plan is a function of the schema ids *in that batch*, so it cannot be
+   declared up front.
+2. **Replay checkpoint isolation is not expressible.** LDP owns its checkpoints; the replay
+   pattern here depends on *choosing* the checkpoint path per run so a `startingOffsets`
+   override is honoured at all.
+3. **Bounded replay and the asymmetric MERGE are per-run imperative decisions.**
+
+If LDP gains user-controlled per-run checkpoint/offset overrides, revisit this.
+
+---
+
+## 6. Deliberately not built
+
+Flagged as future extension points, not implemented:
+
+- **Pluggable serialization formats.** Avro-via-Schema-Registry is the only format in
+  scope; `schema_resolver` refuses non-`AVRO` `schemaType` with a clear error.
+- **A Kafka client factory.** There is one client.
+- **Executor-local cert staging** (`SparkContext.addFile`). Documented in `security.py` as
+  the fallback if a compute profile cannot read UC Volumes from executors.
+- **Per-partition replay timestamps.** `startingTimestamp` covers what support asks for.
+- **`ce_extensions` map**, **payload flattening**, **array explosion** — see above.
+
+---
+
+## 7. Where to make common changes
+
+| I want to… | Edit | Deploy needed? |
+|---|---|---|
+| Add a topic | `conf/topics/<key>.yaml` + a task in `resources/job_ingest_primary.yml` | Yes (PR) |
+| Add a Kafka cluster or registry | `conf/clusters.yaml` / `conf/registries.yaml` | Yes (PR) |
+| Change a partition column | `conf/topics/<key>.yaml` **and** back-fill/rewrite the table | Yes (PR) |
+| Stop a topic now | `enabled = false` in the control table | **No** |
+| Unblock a stuck stream | `on_deser_error = 'quarantine'` | **No** |
+| Replay from an offset/time | Kafka replay job parameters | **No** |
+| Re-parse bad curated data | Curated replay job parameters | **No** |
+| Add a CloudEvent attribute | `CE_ATTRIBUTES` in `landing_writer.py` + the DDL blocks in `tables.py` | Yes |
+| Change the audit row shape | `AUDIT_SCHEMA` in `audit.py` + `AUDIT_DDL_COLUMNS` in `tables.py` | Yes |
+
+The last two are the only ones needing changes in two places, and a test asserts the two
+stay in step (`tests/test_audit_and_tables.py`).
+
+---
+
+## 8. Testing
+
+```bash
+pytest -m "not spark"   # config, security, registry, shipped-config, writers, dispatch.
+                         # No JVM needed. This is the azure-pipelines.yml CI gate.
+pytest                  # everything, including the Spark-backed tests
+```
+
+The tests worth knowing about:
+
+| Test | Proves |
+|---|---|
+| `test_curated_writer.py::test_one_microbatch_with_two_writer_schema_versions_parses_correctly` | The central claim — mixed schema versions in one batch |
+| `test_curated_writer.py::test_payload_stays_nested_and_is_not_exploded` | The shape decision, so a change is deliberate |
+| `test_curated_writer.py::test_event_date_prefers_ce_time_and_falls_back_to_kafka_timestamp` | The partition key never NULLs or throws |
+| `test_config.py::test_primary_and_replay_checkpoints_never_collide` | Replay isolation |
+| `test_writers.py::test_primary_landing_append_carries_the_idempotency_markers` | **The txnAppId/txnVersion mechanics this section rests on** - not simulated, asserted on the exact writer options |
+| `test_writers.py::test_curated_replay_allows_the_schema_to_widen` | Schema evolution on the replay MERGE path (§5, §9 item 6) |
+| `test_pipeline.py::test_guard_refuses_when_the_checkpoint_vanished_but_data_exists` | Scenario 6 - the failure that looks like success |
+| `test_shipped_config.py` | Every shipped YAML resolves in every environment - runs on every PR via `azure-pipelines.yml` |
+| `test_audit_and_tables.py` | Audit row ↔ schema ↔ DDL alignment, and `sql/02` ↔ `tables.py` column drift |
+
+Run them on Databricks via `notebooks/01_run_unit_tests` — DBR has Spark and `spark-avro`
+built in, so the whole suite runs with no setup. No test connects to Kafka, reads a secret,
+or writes to a table.
+
+---
+
+## 9. Open items for the incoming team
+
+1. **Verify `txnAppId` behaviour on your DBR** (§4). This is the one unverified assumption
+   the correctness of re-runs rests on.
+2. **Confirm UC Volume readability from executors** before onboarding any mTLS topic —
+   `notebooks/02_check_connectivity` has the check.
+3. **Confirm serverless network reachability** to every broker and registry, or move
+   on-prem topics to classic compute (`resources/job_ingest_primary.yml` header).
+4. **Landing retention is set to 20 years** (`landing_retention_days` in `databricks.yml`,
+   overridable per target). The `DELETE` that enforces it is written and parameterised in
+   `sql/04_maintenance.sql` but is deliberately **commented out** — switching on automatic
+   deletion of raw payloads is the data owner's call, not a default. Two questions remain
+   open: does the same window apply to the **quarantine** tables (they hold full payloads
+   too), and to **curated** (derived, so arguably shorter)?
+   `OPTIMIZE`/`VACUUM` now run weekly via `resources/job_maintenance.yml`; that job needs
+   `sql_warehouse_id` set before it will deploy.
+5. **`record_count` caveat** (§4, and `audit.py`): it counts rows *presented*, not rows
+   Delta inserted.
+6. **Curated replay schema evolution is runtime-dependent.** `curated_writer._merge_curated`
+   prefers Delta's `withSchemaEvolution()` (DBR 15.4 LTS+, and serverless environment
+   version 2+) and falls back to scoping the legacy
+   `spark.databricks.delta.schema.autoMerge.enabled` flag around the single merge. Confirm
+   which branch your runtime takes the first time you run a curated replay after an additive
+   schema change — that is the scenario the fallback exists for.
+7. **The checkpoint guard's filesystem probe** (`pipeline._checkpoint_offsets_exist`) uses
+   `os.stat` so that "cannot reach the Volume" raises rather than being mistaken for
+   "checkpoint deleted". Confirm the driver on your compute profile can stat the checkpoint
+   Volume — on serverless this is the branch most likely to surprise you.
+8. **`azure-pipelines.yml`'s deploy stage is not wired up.** It calls `databricks bundle
+   deploy`, but the service connection (or variable group) and the per-target service
+   principal credentials it needs are commented placeholders, not real values — platform
+   configuration only a human can supply. The test stage runs today without any of this.
+9. **A pre-loaded curated table (Cloudera migration) must match `curated_schema()`'s derived
+   schema exactly** — same columns, same order, all-nullable. `ensure_curated_table` is
+   `CREATE TABLE IF NOT EXISTS`, so if the migration creates the table first with a
+   different shape, that call silently no-ops and the mismatch only surfaces as a write
+   failure on the first real batch, not at migration time. Landing itself is unaffected by
+   pre-loaded historical data either way — `guard_against_checkpoint_reset` never inspects
+   curated, only landing (§4, Scenario 6).

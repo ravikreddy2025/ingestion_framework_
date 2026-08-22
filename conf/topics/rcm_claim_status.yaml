@@ -1,0 +1,62 @@
+# =====================================================================================
+# TOPIC: rcm.claim.status.v2
+#
+# WHAT THIS EXAMPLE DEMONSTRATES
+#   1. A DIFFERENT cluster AND registry from the Vector topic - the framework does not
+#      assume one Kafka or one Schema Registry across the platform.
+#   2. reader_schema_mode: pinned_id  - a deliberate CONTRACT FREEZE.
+#   3. on_deser_error: quarantine     - a deliberate deviation from the FAILFAST default.
+#
+# Both deviations override conf/defaults.yaml and are documented inline. Copy the pattern,
+# not the values.
+# =====================================================================================
+
+topic:
+
+  # -------------------------------------------------------------------- MUST CHANGE --
+  topic: rcm.claim.status.v2
+  domain: rcm
+
+  # Self-managed Confluent Platform + its own registry. These are DIFFERENT names from
+  # each other - cluster and registry profiles are unrelated namespaces.
+  cluster: cp_onprem_rcm
+  registry: sr_onprem_rcm
+
+  subject: rcm.claim.status.v2-value
+
+  # ---------------------------------------------------------------- NICE TO CHANGE --
+  # A claim can receive several status updates in one batch; keep only the newest per
+  # (claim_id, status_seq). Both live inside the payload struct.
+  curated_dedup_keys: [payload.claim_id, payload.status_seq]
+
+  # ------------------------------------------- DELIBERATE DEVIATION 1: CONTRACT FREEZE
+  # RCM froze their contract at schema id 5512 while a downstream mapping is rebuilt.
+  # Producers may register newer versions; the curated payload struct will not change,
+  # because Avro resolution projects every newer writer version onto this reader schema
+  # (newer writer-only fields dropped, reader-only fields filled from their defaults).
+  #
+  # Records are still DECODED with their own writer schema - the freeze affects the output
+  # shape only, never how the bytes are read.
+  #
+  # NOTE: a schema id is registry-specific, so this pins the SAME id in every environment.
+  # If dev and prod use separate registries with different ids, move this to the
+  # environment files' topic_defaults instead.
+  #
+  # TO UNFREEZE: delete both lines. registry_latest is inherited from defaults.yaml.
+  reader_schema_mode: pinned_id
+  reader_schema_id: 5512
+
+  # ----------------------------------------------- DELIBERATE DEVIATION 2: QUARANTINE
+  # This feed carries a small, KNOWN population of records from a legacy service that does
+  # not use the Confluent serializer. Under the platform default (fail) those would break
+  # the nightly run every night for a problem nobody is going to fix this quarter.
+  #
+  # Quarantined records keep their RAW BYTES, so they are fully recoverable: register the
+  # schema (or fix the producer), then run the replay_curated job filtered on those rows.
+  # The count surfaces per batch in the audit table's quarantined_count column, so a rising
+  # trend is visible the next morning without opening the quarantine table.
+  #
+  # This is ALSO the emergency lever for a stuck stream - see docs/DESIGN.md, scenario 2.
+  # DO NOT copy this setting to a new topic just to make it stop failing. Ask first whether
+  # the records are genuinely expected.
+  on_deser_error: quarantine

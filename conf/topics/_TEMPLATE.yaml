@@ -1,0 +1,87 @@
+# =====================================================================================
+# TOPIC ONBOARDING TEMPLATE
+#
+# 1. Copy this file to conf/topics/<your_topic_key>.yaml
+#      The FILENAME becomes the topic_key: it fills {topic_key} in the derived table names,
+#      becomes a checkpoint path segment, keys the operational control table, and appears
+#      in every audit row. lower_snake_case, e.g. gma_provider_updates.
+# 2. Replace the five <ANGLE_BRACKET> placeholders below. That is usually the whole job.
+# 3. Add optional settings only where this topic genuinely differs from the platform
+#    default. Everything you omit is inherited.
+# 4. Add a task to resources/job_ingest_primary.yml with the new topic-key.
+# 5. Run `pytest tests/test_shipped_config.py` - it validates every topic in EVERY
+#    environment, so it catches a value that works in prod but breaks in dev.
+# 6. Open a PR. No Python changes are needed, ever, to add a topic.
+#
+# WHAT YOU DO **NOT** PUT HERE
+#   Table names, catalogs, checkpoint paths, broker endpoints, secret scopes, partition
+#   columns, trigger, fail_on_data_loss. Those live in conf/defaults.yaml (common) and
+#   conf/environments/<env>.yaml (per environment). Hardcoding any of them here silently
+#   breaks the other environments.
+#
+# This file is inert: topic_key "_TEMPLATE" is never scheduled, and the config validator
+# skips underscore-prefixed files.
+# =====================================================================================
+
+topic:
+
+  # -------------------------------------------------------------------- MUST CHANGE --
+  topic: <exact.kafka.topic.name>
+  domain: <vector|rcm|gma|antifraud|dwh_pes>
+
+  # Must match a profile in conf/clusters.yaml / conf/registries.yaml. If your cluster or
+  # registry is not registered there yet, add it in the same PR - and add its endpoint and
+  # secret scope to EVERY environment file.
+  cluster: <cluster_profile_name>
+  registry: <registry_profile_name>
+
+  # Usually "<topic>-value" under the default TopicNameStrategy. VERIFY IT:
+  #   curl -u $KEY:$SECRET https://<registry>/subjects | jq
+  subject: <topic>-value
+
+  # ------------------------------------------------------- OPTIONAL - omit to inherit --
+  # Every line below has a platform default. Delete what you do not need.
+
+  # Table name for BOTH layers. Omit it and the name is derived from the Kafka topic, with
+  # dots and hyphens turned into underscores:
+  #     vector.patient.events.v1  ->  <catalog>.landing.vector_patient_events_v1
+  #                                   <catalog>.curated.vector_patient_events_v1
+  # Set it only when the derived name collides with another topic's, or reads badly. It
+  # overrides the NAME only - the catalog and schema still come from conf/defaults.yaml, so
+  # this is not the same as hardcoding a table name here.
+  # table_name: patient_events
+
+  # Collapse duplicates within a microbatch. Business fields are nested inside the payload
+  # struct, so write them as `payload.<field>` - a bare name is rejected with a clear error.
+  # curated_dedup_keys: [payload.<business_key>]
+
+  # Override the environment's batch size for a high- or low-volume topic.
+  # max_offsets_per_trigger: 2000000
+
+  # Default is `earliest` (backfill everything retained on the first run). Use `latest`
+  # when replaying history would wrongly re-trigger downstream consumers.
+  # starting_offsets: latest
+
+  # Default is `fail` - a record that cannot be parsed fails the batch loudly. Only set
+  # `quarantine` for a topic with a KNOWN, ACCEPTED source of bad records.
+  # on_deser_error: quarantine
+
+  # Default is `registry_latest`. Pin only to freeze a contract; the id is registry-
+  # specific, so check it is the same in every environment before putting it here.
+  # reader_schema_mode: pinned_id
+  # reader_schema_id: 5512
+
+  # ------------------------------------------------- RARE - a value for ONE environment --
+  # Almost never needed. Reach for this ONLY when a setting must differ in exactly one
+  # environment for THIS topic - not for a change that should apply platform-wide (that
+  # belongs in conf/environments/<env>.yaml) and not for something that changes at runtime
+  # without a deploy (that belongs in the operational control table).
+  #
+  # Wins over every setting above, but ONLY in the named environment; every other
+  # environment falls through to the topic-level value as if this block did not exist.
+  # Every environment name here must be real - a typo is a hard error at load, naming the
+  # environments that do exist.
+  #
+  # environments:
+  #   prod:
+  #     max_offsets_per_trigger: 5000000

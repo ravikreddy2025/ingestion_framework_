@@ -1,0 +1,73 @@
+# =====================================================================================
+# TOPIC: vector.patient.events.v1        REFERENCE EXAMPLE - read this one first
+#
+# Layer 3 of 5. Holds ONLY what is unique to this topic. Everything else comes from
+# conf/defaults.yaml and conf/environments/<env>.yaml:
+#
+#   table names, checkpoint root, consumer group prefix, partitioning, trigger,
+#   fail_on_data_loss, reader_schema_mode, on_deser_error, include_headers
+#
+# If you are about to paste a table name or a catalog into this file, stop - it belongs in
+# defaults.yaml with a {catalog} placeholder. Anything hardcoded here breaks dev/preprod.
+#
+# THE FILENAME IS THE KEY. `vector_patient_events.yaml` -> topic_key
+# `vector_patient_events`, which fills {topic_key} in the derived table names, becomes a
+# checkpoint path segment, and appears in every audit row. Renaming it orphans the
+# checkpoint - don't.
+#
+# To onboard a new topic, copy conf/topics/_TEMPLATE.yaml.
+# Full reference: docs/CONFIGURATION.md   Architecture: docs/DESIGN.md
+# =====================================================================================
+
+topic:
+
+  # -------------------------------------------------------------------- MUST CHANGE --
+  # Exact Kafka topic name, as it exists on the broker. Case-sensitive.
+  topic: vector.patient.events.v1
+
+  # Owning domain. Appears in every audit row; used for filtering and chargeback.
+  domain: vector
+
+  # Must match a profile in conf/clusters.yaml and conf/registries.yaml. Config load fails
+  # fast and lists the valid names if either is wrong. The environment file supplies the
+  # endpoint and secret scope for that profile.
+  cluster: confluent_cloud_shared
+  registry: confluent_cloud_shared
+
+  # Schema Registry subject for the VALUE. Under the default TopicNameStrategy this is
+  # "<topic>-value". Confirm it - RecordNameStrategy subjects look completely different.
+  subject: vector.patient.events.v1-value
+
+  # ---------------------------------------------------------------- NICE TO CHANGE --
+  # Collapses repeated updates to the same business key WITHIN one microbatch. Business
+  # fields live INSIDE the payload struct, so keys are written as `payload.<field>`.
+  # Omit entirely to keep every record.
+  curated_dedup_keys: [payload.event_id]
+
+  # ------------------------------------------------- topic + environment, WORKING EXAMPLE --
+  # No blanket `max_offsets_per_trigger:` here on purpose - this topic wants a DIFFERENT
+  # value in every environment, so it is expressed entirely through the sub-layer below
+  # rather than one topic-level value that would win over every environment's own default.
+  #
+  #   dev      no override here -> falls through to dev.yaml's env-level 100_000
+  #            (fast feedback; also the only environment where this topic's checkpoint is
+  #            routinely reset, so small batches keep a rerun cheap)
+  #   preprod  2,000,000 - a real rehearsal-scale batch. Left equal to prod's ORDER OF
+  #            MAGNITUDE deliberately: conf/environments/preprod.yaml exists to fail the
+  #            way prod would, and a wildly different batch size would be tuning away from
+  #            that, not rehearsing it.
+  #   prod     5,000,000 - real production traffic on Vector routinely exceeds what
+  #            preprod's synthetic rehearsal data can generate, so prod alone gets a
+  #            larger cap: fewer, bigger batches for a genuinely bigger topic. This is a
+  #            pure throughput knob, not a behaviour change, so it does not threaten
+  #            preprod's role as a valid rehearsal of prod's FAILURE MODE.
+  #
+  # Precedence: defaults -> environment -> topic (this file has none) -> topic+environment
+  # (below) -> operational control table -> job parameters. Full explanation and a second
+  # example: docs/CONFIGURATION.md, "Environment-specific overrides for one topic".
+  # Resolution asserted for real in tests/test_shipped_config.py.
+  environments:
+    preprod:
+      max_offsets_per_trigger: 2000000
+    prod:
+      max_offsets_per_trigger: 5000000

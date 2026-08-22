@@ -1,0 +1,42 @@
+# =====================================================================================
+# ENVIRONMENT: preprod        Layer 2 of 5 - overrides conf/defaults.yaml
+#
+# Deliberately close to prod: same batch sizes, same starting_offsets, same failure mode.
+# The point of preprod is to fail the way prod would, so overriding tuning here defeats it.
+# Only the catalog, endpoints and secret scopes differ.
+#
+# See conf/environments/dev.yaml for what belongs in this file and what does not.
+# =====================================================================================
+
+vars:
+  catalog: platform_preprod
+
+# Intentionally empty: preprod inherits production behaviour from conf/defaults.yaml.
+# If you find yourself adding tuning here, ask whether prod needs the same change -
+# otherwise preprod stops being a valid rehearsal of prod.
+topic_defaults: {}
+
+clusters:
+  confluent_cloud_shared:
+    bootstrap_servers: "pkc-ppd01.westeurope.azure.confluent.cloud:9092"
+    secret_scope: kv-kafka-preprod
+
+  cp_onprem_rcm:
+    bootstrap_servers: "kafka-rcm-ppd01.corp.internal:9093,kafka-rcm-ppd02.corp.internal:9093"
+    secret_scope: kv-kafka-rcm-preprod
+
+  cp_onprem_antifraud:
+    bootstrap_servers: "kafka-af-ppd01.fraud.internal:9094,kafka-af-ppd02.fraud.internal:9094"
+    secret_scope: kv-kafka-antifraud-preprod
+
+registries:
+  confluent_cloud_shared:
+    url: "https://psrc-ppd01.westeurope.azure.confluent.cloud"
+    secret_scope: kv-kafka-preprod
+
+  sr_onprem_rcm:
+    url: "https://schema-registry-rcm-ppd.corp.internal:8081"
+    secret_scope: kv-kafka-rcm-preprod
+
+  sr_onprem_antifraud:
+    url: "https://schema-registry-af-ppd.fraud.internal:8081"

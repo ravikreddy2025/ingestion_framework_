@@ -1,0 +1,124 @@
+# =====================================================================================
+# CI for the Kafka -> landing/curated ingestion framework.
+#
+# TEST STAGE  runs on every pull request. Deliberately the same commands a developer runs
+#             locally (see docs/RUNBOOK_DEVELOPER.md) - a gate that differs from local
+#             practice is a gate people learn to ignore.
+#
+# DEPLOY      calls the Databricks Asset Bundle in databricks.yml. The bundle already knows
+#             how to build the wheel (its `artifacts:` block) and what to deploy, so there
+#             is nothing bespoke here on purpose.
+#
+# WHY THE FAST SUITE IS THE PR GATE
+# ---------------------------------
+# `pytest -m "not spark"` needs no Spark, no JVM, no secrets and no network: config
+# resolution, auth option construction, the registry client, the writers' Delta options,
+# the run-shape dispatch, and validation of every shipped topic in EVERY environment.
+# It runs in seconds.
+#
+# The `spark`-marked tests are NOT run here. They need a JVM and the spark-avro connector,
+# and the point of them is to confirm `from_avro` behaviour on a real Databricks Runtime -
+# which a build agent is not. Run them on the cluster via notebooks/01_run_unit_tests.
+# =====================================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  pythonVersion: "3.11"
+
+stages:
+
+  # ===================================================================================
+  - stage: test
+    displayName: Lint and unit tests
+    jobs:
+      - job: fast_suite
+        displayName: Fast suite (no Spark)
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            displayName: Use Python $(pythonVersion)
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          - script: python -m pip install --upgrade pip && pip install -e ".[dev]"
+            displayName: Install package and dev dependencies
+
+          - script: ruff check src tests
+            displayName: Lint (ruff)
+
+          # Report-only for now: the codebase has never been type-checked, so failing the
+          # build on it today would block work rather than improve it. Remove the
+          # continueOnError once the backlog it reports is empty.
+          - script: mypy
+            displayName: Type check (mypy, non-blocking)
+            continueOnError: true
+
+          - script: pytest -m "not spark" -q --junitxml=junit/test-results.xml
+            displayName: Unit tests
+
+          # Without this, a failure is a wall of console text rather than a named test in
+          # the run summary.
+          - task: PublishTestResults@2
+            displayName: Publish test results
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFiles: junit/test-results.xml
+              testRunTitle: kafka-ingest fast suite
+
+  # ===================================================================================
+  # DEPLOY - runs on merge only, never on a pull request.
+  #
+  # NOT WIRED UP YET. Before enabling, the platform team must supply:
+  #
+  #   1. A variable group (or Azure DevOps service connection) per target, providing the
+  #      workspace host and the service principal credentials the CLI authenticates with.
+  #      Link it below with `variables: - group: <name>`.
+  #   2. An Azure DevOps *environment* per target, so preprod and prod can carry approval
+  #      gates. Convert these jobs to `deployment:` jobs pointing at those environments.
+  #   3. A decision on whether prod deploys automatically on merge or only on a tag.
+  #
+  # `databricks bundle validate` is not in the PR gate above because it resolves against a
+  # workspace, and the PR stage deliberately has no credentials. Confirm that against your
+  # CLI version - if validate works fully offline for you, move it into the test stage,
+  # where it would catch a broken bundle before merge rather than after.
+  # ===================================================================================
+  - stage: deploy_dev
+    displayName: Deploy to dev
+    dependsOn: test
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - job: bundle_deploy
+        displayName: databricks bundle deploy -t dev
+        pool:
+          vmImage: ubuntu-latest
+        # variables:
+        #   - group: kafka-ingest-dev      # <-- supplies DATABRICKS_HOST + SP credentials
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(pythonVersion)
+
+          # The Databricks CLI is a standalone binary; check the current documented install
+          # route for your agent image before relying on this line.
+          - script: curl -fsSL https://raw.githubusercontent.com/databricks/setup-cli/main/install.sh | sh
+            displayName: Install the Databricks CLI
+
+          - script: databricks bundle validate -t dev
+            displayName: Validate bundle
+
+          - script: databricks bundle deploy -t dev
+            displayName: Deploy bundle
+
+# Add deploy_preprod and deploy_prod by copying the stage above once the environments and
+# approval gates in (2) exist. Do not add them before that: an unapproved automatic path to
+# prod is exactly what the approval gate is for.

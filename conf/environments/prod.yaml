@@ -1,0 +1,41 @@
+# =====================================================================================
+# ENVIRONMENT: prod        Layer 2 of 5 - overrides conf/defaults.yaml
+#
+# conf/defaults.yaml already carries the production-safe values (FAILFAST,
+# fail_on_data_loss, earliest, availableNow), so this file only supplies what is
+# genuinely environment-specific: the catalog, the broker endpoints and the secret scopes.
+#
+# If a change here would also be correct in preprod, put it in conf/defaults.yaml instead.
+# =====================================================================================
+
+vars:
+  catalog: platform_prod
+
+# Empty on purpose - production behaviour IS the default in conf/defaults.yaml. Anything
+# added here silently diverges prod from what preprod rehearsed.
+topic_defaults: {}
+
+clusters:
+  confluent_cloud_shared:
+    bootstrap_servers: "pkc-abc12.westeurope.azure.confluent.cloud:9092"
+    secret_scope: kv-kafka-prod
+
+  cp_onprem_rcm:
+    bootstrap_servers: "kafka-rcm-01.corp.internal:9093,kafka-rcm-02.corp.internal:9093"
+    secret_scope: kv-kafka-rcm
+
+  cp_onprem_antifraud:
+    bootstrap_servers: "kafka-af-01.fraud.internal:9094,kafka-af-02.fraud.internal:9094"
+    secret_scope: kv-kafka-antifraud
+
+registries:
+  confluent_cloud_shared:
+    url: "https://psrc-xyz98.westeurope.azure.confluent.cloud"
+    secret_scope: kv-kafka-prod
+
+  sr_onprem_rcm:
+    url: "https://schema-registry-rcm.corp.internal:8081"
+    secret_scope: kv-kafka-rcm
+
+  sr_onprem_antifraud:
+    url: "https://schema-registry-af.fraud.internal:8081"

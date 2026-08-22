@@ -1,0 +1,134 @@
+# REPLAY JOBS - triggered by hand from the Workflows UI, never scheduled.
+#
+# Two separate jobs on purpose. They solve different problems and confusing them during an
+# incident is expensive:
+#
+#   replay_kafka    data is MISSING or WRONG AT SOURCE. Re-pulls from the broker from a
+#                   given offset/timestamp into an ISOLATED checkpoint with its own Delta
+#                   txnAppId. Subject to Kafka retention.
+#                   ALSO the correct tool if someone deleted a primary checkpoint.
+#   replay_curated  the bytes are fine, the PARSE was not. Re-reads the landing table, no
+#                   broker contact, works forever regardless of retention.
+#
+# Both are parameterised identically to the primary job and reuse the same modules.
+
+resources:
+  jobs:
+
+    replay_kafka:
+      name: "[${bundle.target}] Kafka Ingest - REPLAY from Kafka"
+      description: >-
+        Re-pull a topic from a given offset or timestamp. Writes into an isolated
+        checkpoint keyed by rerun_id. Landing inserts-if-absent, curated upserts.
+        Rows are tagged ingested_via='kafka_replay' and replay_run_id=<rerun_id>.
+      max_concurrent_runs: 3   # different topics may be recovered in parallel
+
+      parameters:
+        - name: topic_key
+          default: ""
+        - name: rerun_id
+          # REQUIRED. Isolates BOTH the checkpoint path and the Delta txnAppId, which is
+          # what stops a replay colliding with the primary stream's idempotency markers.
+          default: ""
+        - name: starting_offsets
+          # Spark startingOffsets JSON. -2 = earliest, -1 = latest.
+          default: ""
+        - name: starting_timestamp
+          # ISO-8601 (2026-08-11T09:00:00Z) or epoch millis. Mutually exclusive with offsets.
+          default: ""
+        - name: ending_offsets
+          # Optional. Present => bounded batch replay rather than a streaming replay.
+          default: ""
+        - name: ending_timestamp
+          default: ""
+        - name: config_root
+          default: ${workspace.file_path}/conf
+        - name: control_table
+          default: ${var.control_table}
+        - name: environment
+          # Selects conf/environments/<env>.yaml. Defaulted from the bundle target, so the
+          # environment is never typed twice and a replay cannot be aimed at the wrong one.
+          default: ${bundle.target}
+
+      environments:
+        - environment_key: ingest_env
+          spec:
+            client: "3"
+            dependencies:
+              - ./dist/*.whl
+
+      tasks:
+        - task_key: replay
+          environment_key: ingest_env
+          # No automatic retries. A replay is a deliberate human action; if it fails, a
+          # human should read the audit rows before it runs again.
+          max_retries: 0
+          timeout_seconds: 21600
+          python_wheel_task:
+            package_name: kafka_ingest
+            entry_point: replay-kafka
+            named_parameters:
+              config-root: "{{job.parameters.config_root}}"
+              control-table: "{{job.parameters.control_table}}"
+              environment: "{{job.parameters.environment}}"
+              topic-key: "{{job.parameters.topic_key}}"
+              rerun-id: "{{job.parameters.rerun_id}}"
+              starting-offsets: "{{job.parameters.starting_offsets}}"
+              starting-timestamp: "{{job.parameters.starting_timestamp}}"
+              ending-offsets: "{{job.parameters.ending_offsets}}"
+              ending-timestamp: "{{job.parameters.ending_timestamp}}"
+              job-run-id: "{{job.run_id}}"
+
+    replay_curated:
+      name: "[${bundle.target}] Kafka Ingest - REPLAY Curated from Landing"
+      description: >-
+        Re-parse existing landing rows into curated against the current/corrected schema.
+        Does not contact Kafka. Curated rows matching (topic, kafka_partition,
+        kafka_offset) are updated in place.
+      max_concurrent_runs: 3
+
+      parameters:
+        - name: topic_key
+          default: ""
+        - name: rerun_id
+          default: ""
+        - name: landing_filter
+          # REQUIRED. SQL predicate over the LANDING table, e.g.
+          #   ingest_date BETWEEN '2026-08-01' AND '2026-08-03'
+          #   writer_schema_id = 5513
+          # The topic predicate is added automatically. Landing is one table per topic,
+          # so it matches everything - but it makes a mistyped table name produce an
+          # empty replay rather than another topic's rows in this curated table.
+          default: ""
+        - name: config_root
+          default: ${workspace.file_path}/conf
+        - name: control_table
+          default: ${var.control_table}
+        - name: environment
+          # Selects conf/environments/<env>.yaml. Defaulted from the bundle target, so the
+          # environment is never typed twice and a replay cannot be aimed at the wrong one.
+          default: ${bundle.target}
+
+      environments:
+        - environment_key: ingest_env
+          spec:
+            client: "3"
+            dependencies:
+              - ./dist/*.whl
+
+      tasks:
+        - task_key: replay_curated
+          environment_key: ingest_env
+          max_retries: 0
+          timeout_seconds: 21600
+          python_wheel_task:
+            package_name: kafka_ingest
+            entry_point: replay-curated
+            named_parameters:
+              config-root: "{{job.parameters.config_root}}"
+              control-table: "{{job.parameters.control_table}}"
+              environment: "{{job.parameters.environment}}"
+              topic-key: "{{job.parameters.topic_key}}"
+              rerun-id: "{{job.parameters.rerun_id}}"
+              landing-filter: "{{job.parameters.landing_filter}}"
+              job-run-id: "{{job.run_id}}"

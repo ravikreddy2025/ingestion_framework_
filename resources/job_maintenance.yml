@@ -1,0 +1,95 @@
+# TABLE MAINTENANCE - compaction and file reclamation for the tables this framework owns.
+#
+# Separate from the ingestion jobs on purpose: it touches every topic's data, it is not
+# urgent, and it must never be able to make an ingestion run fail. If maintenance breaks,
+# ingestion keeps working and someone fixes maintenance on Monday.
+#
+# ONE TASK PER TOPIC, because landing is one table per topic. Adding a topic means adding a
+# task here with its landing table name - the same five-line copy as job_ingest_primary.yml.
+# The shared settings live in the anchor so they cannot drift between tasks.
+#
+# BEFORE THIS DEPLOYS, set `sql_warehouse_id` in databricks.yml. The default is a placeholder.
+#
+# WHAT IT DOES NOT DO
+# -------------------
+# It does not delete data. The 20-year landing retention policy is parameterised in
+# sql/04_maintenance.sql but the DELETE is commented out - switching on automatic deletion of
+# raw payloads is a decision for the data owner, not a default. See that file for the two
+# questions to settle first (quarantine, and curated).
+
+resources:
+  jobs:
+
+    maintenance:
+      name: "[${bundle.target}] Kafka Ingest - Table Maintenance"
+      description: >-
+        OPTIMIZE and VACUUM over each topic's landing table and the shared audit table.
+        Retention parameters come from the bundle variables landing_retention_days and
+        vacuum_retention_hours, so each environment can differ. Does not delete data.
+
+      schedule:
+        # 04:30 UTC on Sundays - well clear of the 02:15 daily ingestion window, and weekly
+        # is enough for tables that autoOptimize is already compacting on write.
+        quartz_cron_expression: "0 30 4 ? * SUN"
+        timezone_id: UTC
+        pause_status: UNPAUSED
+
+      # Maintenance overlapping itself achieves nothing and competes for the same files.
+      max_concurrent_runs: 1
+
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+
+      parameters:
+        - name: catalog
+          # The DATA catalog. Must match vars.catalog in conf/environments/<target>.yaml;
+          # a test asserts they agree.
+          default: ${var.data_catalog}
+        - name: landing_retention_days
+          default: ${var.landing_retention_days}
+        - name: vacuum_retention_hours
+          default: ${var.vacuum_retention_hours}
+
+      tasks:
+        # Shared task settings. No retries: OPTIMIZE and VACUUM are idempotent, but a failure
+        # means the warehouse or the grants are wrong, and repeating will not fix that.
+        - &maintenance_task
+          task_key: vector_patient_events
+          max_retries: 0
+          timeout_seconds: 14400
+          sql_task:
+            warehouse_id: ${var.sql_warehouse_id}
+            file:
+              path: ../sql/04_maintenance.sql
+            parameters:
+              catalog: "{{job.parameters.catalog}}"
+              landing_retention_days: "{{job.parameters.landing_retention_days}}"
+              vacuum_retention_hours: "{{job.parameters.vacuum_retention_hours}}"
+              # Derived from the Kafka topic name - see config.table_name_for(). If a topic
+              # sets `table_name:` in its config file, use that name here instead.
+              landing_table: "${var.data_catalog}.landing.vector_patient_events_v1"
+
+        - <<: *maintenance_task
+          task_key: rcm_claim_status
+          sql_task:
+            warehouse_id: ${var.sql_warehouse_id}
+            file:
+              path: ../sql/04_maintenance.sql
+            parameters:
+              catalog: "{{job.parameters.catalog}}"
+              landing_retention_days: "{{job.parameters.landing_retention_days}}"
+              vacuum_retention_hours: "{{job.parameters.vacuum_retention_hours}}"
+              landing_table: "${var.data_catalog}.landing.rcm_claim_status_v2"
+
+        - <<: *maintenance_task
+          task_key: antifraud_txn_alerts
+          sql_task:
+            warehouse_id: ${var.sql_warehouse_id}
+            file:
+              path: ../sql/04_maintenance.sql
+            parameters:
+              catalog: "{{job.parameters.catalog}}"
+              landing_retention_days: "{{job.parameters.landing_retention_days}}"
+              vacuum_retention_hours: "{{job.parameters.vacuum_retention_hours}}"
+              landing_table: "${var.data_catalog}.landing.antifraud_txn_alerts_v1"

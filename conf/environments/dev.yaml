@@ -1,0 +1,58 @@
+# =====================================================================================
+# ENVIRONMENT: dev        Layer 2 of 5 - overrides conf/defaults.yaml
+#
+# Holds ONLY what differs between environments and that the CODE needs:
+#   - catalog name           (feeds every table path and the checkpoint volume)
+#   - Kafka broker endpoints (differ per environment)
+#   - secret scope names     (one Key Vault per environment)
+#   - registry URLs
+#   - any per-environment tuning
+#
+# Deliberately NOT here: storage accounts, external locations, credentials, UC metastore
+# wiring, cluster policies. Those are handled by your Databricks deployment - the code
+# never sees them.
+#
+# The environment is chosen by the --environment job parameter, which the DAB job
+# definitions default to ${bundle.target}. You never type it twice.
+# =====================================================================================
+
+# Substituted into any {placeholder} in defaults / topics / cluster / registry values.
+vars:
+  catalog: platform_dev
+
+# Overrides conf/defaults.yaml -> topic_defaults, for every topic in this environment.
+topic_defaults:
+  # Small batches in dev: faster feedback, and a failure costs seconds not minutes.
+  max_offsets_per_trigger: 100000
+
+  # Dev usually wants a small, recent sample rather than the full retained history.
+  # Remember this only applies on a topic's FIRST run, before a checkpoint exists.
+  starting_offsets: latest
+
+# Overrides named profiles in conf/clusters.yaml. The profile must already exist there -
+# conf/clusters.yaml stays the single register of which clusters exist.
+clusters:
+  confluent_cloud_shared:
+    bootstrap_servers: "pkc-dev01.westeurope.azure.confluent.cloud:9092"
+    secret_scope: kv-kafka-dev
+
+  cp_onprem_rcm:
+    bootstrap_servers: "kafka-rcm-dev01.corp.internal:9093"
+    secret_scope: kv-kafka-rcm-dev
+
+  cp_onprem_antifraud:
+    bootstrap_servers: "kafka-af-dev01.fraud.internal:9094"
+    secret_scope: kv-kafka-antifraud-dev
+
+# Overrides named profiles in conf/registries.yaml.
+registries:
+  confluent_cloud_shared:
+    url: "https://psrc-dev01.westeurope.azure.confluent.cloud"
+    secret_scope: kv-kafka-dev
+
+  sr_onprem_rcm:
+    url: "https://schema-registry-rcm-dev.corp.internal:8081"
+    secret_scope: kv-kafka-rcm-dev
+
+  sr_onprem_antifraud:
+    url: "https://schema-registry-af-dev.fraud.internal:8081"

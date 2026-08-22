@@ -1,0 +1,103 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kafka-ingest"
+version = "0.2.0"
+description = "Config-driven Kafka -> Databricks landing/curated ingestion framework"
+requires-python = ">=3.10"
+
+# Runtime deps that are NOT already on DBR. PySpark / delta-spark are provided by
+# the runtime and are deliberately NOT pinned here (pinning them fights the runtime).
+dependencies = [
+    "PyYAML>=6.0",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "ruff>=0.6",
+    "mypy>=1.11",
+]
+
+# Job entrypoints. DAB `python_wheel_task.entry_point` refers to these names.
+[project.scripts]
+ingest-primary = "kafka_ingest.entrypoints.ingest_primary:main"
+replay-kafka = "kafka_ingest.entrypoints.replay_kafka:main"
+replay-curated = "kafka_ingest.entrypoints.replay_curated:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# So `pytest` works in a fresh clone without `pip install -e .` first. tests/ has no
+# __init__.py, so pytest's prepend import mode already puts it on sys.path for `conftest`.
+pythonpath = ["src"]
+markers = [
+    "spark: tests that require a live SparkSession (skipped by default in CI)",
+]
+
+# --------------------------------------------------------------------------------------
+# Ruff - linter + formatter. Selected because the codebase was already written against it:
+# every `# noqa` comment in src/ and tests/ uses Ruff's rule codes.
+# --------------------------------------------------------------------------------------
+[tool.ruff]
+# The code's observed maximum is 115 characters, all of it inside the DDL string literals
+# in tables.py. 120 accommodates those without reformatting what is effectively data.
+line-length = 120
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Deliberately a small set: pyflakes + the four families the existing `noqa` comments name,
+# plus import sorting and Ruff's own stale-suppression check. Widening this is a separate,
+# reviewable change - not something to do while fixing something else.
+select = [
+    "E",      # pycodestyle errors, incl. E402 module-import-not-at-top-of-file
+    "F",      # pyflakes
+    "I",      # import sorting
+    "BLE",    # flake8-blind-except  -> BLE001
+    "N",      # pep8-naming          -> N802
+    "SLF",    # flake8-self          -> SLF001
+    "RUF100", # unused `noqa` - stops suppressions outliving the problem they hid
+]
+ignore = [
+    # `from pyspark.sql import functions as F` is the universal PySpark convention and is
+    # used consistently across this codebase. Renaming it would make every Spark example
+    # on the internet stop matching our code.
+    "N812",
+]
+
+# The formatter is configured but has NOT been run across the codebase: it would rewrite 20
+# of 22 files, and this framework is already being adopted into live environments. Adopting it
+# is a separate, single-purpose commit - `ruff format src tests` - so that the reformatting
+# diff never has to be reviewed alongside a behavioural change.
+[tool.ruff.format]
+docstring-code-format = false
+
+[tool.ruff.lint.per-file-ignores]
+# Tests exercise module-private helpers on purpose - `_make_txn_app_id` and friends are the
+# units under test, not somebody else's internals. SLF001 is about production code reaching
+# into another object's privates, which is a different thing.
+"tests/*" = ["SLF001"]
+# Databricks notebooks: `spark`, `dbutils` and `display` are injected by the runtime, and
+# cells legitimately import after running setup code. Everything else still applies - which
+# is how a broken notebook gets caught in CI rather than on a cluster.
+"notebooks/*" = ["F821", "E402"]
+
+[tool.ruff.lint.isort]
+# conftest is a test-local module, not a third-party package.
+known-first-party = ["kafka_ingest", "conftest"]
+
+# --------------------------------------------------------------------------------------
+# mypy - report-only for now. The annotations already encode real contracts (e.g.
+# Optional[DataFrame] in ParseResult), so checking them is worth doing; failing the build
+# on them today is not, because the codebase has never been type-checked.
+# --------------------------------------------------------------------------------------
+[tool.mypy]
+files = ["src"]
+python_version = "3.10"
+ignore_missing_imports = true   # pyspark and delta ship no stubs on this runtime
+warn_unused_ignores = true

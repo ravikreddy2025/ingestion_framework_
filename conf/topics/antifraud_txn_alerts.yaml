@@ -1,0 +1,37 @@
+# =====================================================================================
+# TOPIC: antifraud.txn.alerts.v1
+#
+# WHAT THIS EXAMPLE DEMONSTRATES
+#   Mutual TLS end to end - to the BROKER (clusters.yaml -> cp_onprem_antifraud) and,
+#   independently, to the SCHEMA REGISTRY (registries.yaml -> sr_onprem_antifraud).
+#   No SASL, no passwords: the certificates are the credentials.
+#
+# BEFORE ONBOARDING AN mTLS TOPIC, confirm the executor-visibility prerequisite in
+# docs/CONFIGURATION.md -> "mTLS prerequisites". The keystore/truststore are opened by the
+# Kafka client on the EXECUTORS, unlike the registry PEMs which are driver-only.
+# notebooks/02_check_connectivity checks this in about thirty seconds.
+# =====================================================================================
+
+topic:
+
+  # -------------------------------------------------------------------- MUST CHANGE --
+  topic: antifraud.txn.alerts.v1
+  domain: antifraud
+
+  cluster: cp_onprem_antifraud
+  registry: sr_onprem_antifraud
+
+  subject: antifraud.txn.alerts.v1-value
+
+  # ---------------------------------------------------------------- NICE TO CHANGE --
+  curated_dedup_keys: [payload.alert_id]
+
+  # DELIBERATE: overrides the defaults.yaml value of `earliest` in EVERY environment.
+  # Alerts are actioned downstream; ingesting the full retained history on first run would
+  # replay old alerts as if they were new. Applies to the FIRST RUN ONLY - afterwards the
+  # checkpoint governs.
+  starting_offsets: latest
+
+  # FAILFAST is inherited from defaults.yaml and deliberately NOT overridden: for a fraud
+  # feed, a record we cannot parse is an incident, not something to file in a quarantine
+  # table and look at next week.
