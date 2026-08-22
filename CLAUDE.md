@@ -65,6 +65,19 @@ stage you were asked to run. Progress and decisions so far are in `docs/build_lo
   does not.
 - One stage per session. Finish it, run the gate, write the report, stop.
 
+**Git workflow -- one branch and one PR per stage**
+- Never commit to `main`. At the start of a stage, branch from an up-to-date `main`:
+  `git checkout main && git pull && git checkout -b stage-<n>-<short-name>`
+- Commit as you go, in logical units. Do not squash a whole stage into one commit -- the
+  per-commit diff is how the stage gets reviewed.
+- At the end of the stage, after the gate is green and the report is written:
+  `git push -u origin stage-<n>-<short-name>`
+- Then open a PR into `main`. Title: `Stage <n>: <name>`. Body: the five lists from the stage
+  report, plus the test count before and after, plus any new VB entries. If `gh` is available
+  use `gh pr create`; if not, print the PR URL git returns on push and stop.
+- **Never merge your own PR, and never push to `main`.** The human reviews and merges.
+- Never use `--no-verify`, `--force`, or amend a pushed commit.
+
 ---
 
 ## Layout
