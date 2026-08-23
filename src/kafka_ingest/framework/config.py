@@ -67,11 +67,30 @@ class ConfigError(ValueError):
 # them. Keep this list very short: anything here is a key three source authors can no
 # longer use for their own purposes.
 #
-#   domain    owning team. Appears in every audit row and fills {domain}.
-#   enabled   the emergency stop. Settable in YAML and, more usefully, in the control
-#             table - turning a source off must not need a deploy.
-FRAMEWORK_STRUCTURAL_KEYS = frozenset({"domain", "enabled"})
-FRAMEWORK_OPERATIONAL_KEYS = frozenset({"enabled"})
+#   domain            owning team. Appears in every audit row and fills {domain}.
+#   enabled           the emergency stop. Settable in YAML and, more usefully, in the
+#                     control table - turning a source off must not need a deploy.
+#   audit_table       the one shared audit table. Written by framework/audit.py.
+#   state_table       durable watermarks and run sequences. framework/state.py.
+#   control_table     where the layer-4 overrides are read from. framework/control.py.
+#   table_properties  TBLPROPERTIES for every table the framework creates.
+#   rerun_id          identifies a replay. Operational ONLY - a replay id checked into Git
+#                     would re-apply on every future deploy.
+#
+# The three table names are here rather than in each SOURCE_SPEC because the framework
+# reads them and no source does; a source type that had to declare them could also
+# misspell them.
+FRAMEWORK_STRUCTURAL_KEYS = frozenset(
+    {
+        "domain",
+        "enabled",
+        "audit_table",
+        "state_table",
+        "control_table",
+        "table_properties",
+    }
+)
+FRAMEWORK_OPERATIONAL_KEYS = frozenset({"enabled", "rerun_id"})
 
 # Top-level keys an environment file may use that are not register names.
 _ENV_RESERVED_KEYS = frozenset({"vars", "defaults", "defaults_by_type"})
@@ -385,9 +404,26 @@ def _source_environment_override(
 # --------------------------------------------------------------------------------------
 
 
+def layer_table_keys(spec: SourceSpec) -> frozenset[str]:
+    """`<layer>_table` for every layer this source type has.
+
+    ONE convention, defined here and read in framework/tables.py: a source's target table
+    for layer L is the setting `<L>_table`. Framework-owned for the same reason the audit
+    table is - the framework resolves, validates and creates those tables, so it also
+    decides what they are called in configuration.
+    """
+    return frozenset(f"{layer}_table" for layer in spec.layers)
+
+
 def known_keys(spec: SourceSpec) -> frozenset[str]:
     """Every key any layer may set for this source type."""
-    return spec.structural_keys | spec.operational_keys | FRAMEWORK_STRUCTURAL_KEYS | FRAMEWORK_OPERATIONAL_KEYS
+    return (
+        spec.structural_keys
+        | spec.operational_keys
+        | FRAMEWORK_STRUCTURAL_KEYS
+        | FRAMEWORK_OPERATIONAL_KEYS
+        | layer_table_keys(spec)
+    )
 
 
 def _operational_only(spec: SourceSpec) -> frozenset[str]:

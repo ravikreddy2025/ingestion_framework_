@@ -412,6 +412,14 @@ class TopicConfig:
     # collide with. See docs/RUNBOOK_SUPPORT.md 5.4a.
     checkpoint_reset_id: Optional[str] = None
 
+    # The framework's own two ops tables, set in conf/defaults.yaml for every source of
+    # every type. This legacy Kafka loader does not read them - framework/state.py and
+    # framework/control.py do - but it must ACCEPT them, because every key in
+    # conf/defaults.yaml reaches every source and an unaccepted one is a hard error. Both
+    # disappear along with this module in Stage 3.
+    state_table: Optional[str] = None
+    control_table: Optional[str] = None
+
     run: RunContext = field(default_factory=RunContext)
 
     def __post_init__(self) -> None:
