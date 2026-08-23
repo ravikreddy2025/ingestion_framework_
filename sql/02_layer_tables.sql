@@ -4,7 +4,8 @@
 -- THIS FILE IS OPTIONAL. Onboarding a topic requires NO manual DDL.
 --
 -- The framework creates every table it owns on first run (src/kafka_ingest/tables.py):
---   landing / quarantine / audit  from the constants in that module
+--   landing / quarantine          from the constants in that module
+--   audit                         from framework/audit.py
 --   curated                       from a schema derived on the driver from the Avro reader
 --                                 schema, before any row is read - see
 --                                 curated_writer.curated_schema()
@@ -15,11 +16,12 @@
 -- discoverable by reading Python. Curated is deliberately not here - its payload struct is
 -- schema-derived, so a static copy would go stale.
 --
--- KEEP THIS FILE AND tables.py IN STEP. A mismatch surfaces immediately as a Delta schema
--- error on the first append, not as silently NULL columns.
--- tests/test_audit_and_tables.py::test_provisioning_sql_matches_the_python_ddl compares the
--- column lists in this file against the DDL constants in tables.py, so drift fails in CI
--- rather than on a cluster.
+-- KEEP THIS FILE AND THE PYTHON DDL IN STEP. A mismatch surfaces immediately as a Delta
+-- schema error on the first append, not as silently NULL columns. Two tests compare the
+-- column lists in this file against the constants that would otherwise create the tables,
+-- so drift fails in CI rather than on a cluster:
+--   audit                  tests/test_framework_audit.py (framework/audit.py)
+--   landing / quarantine   tests/test_audit_and_tables.py (kafka_ingest/tables.py)
 --
 -- CURATED IS NOT HERE ON PURPOSE. Its `payload` column is a STRUCT whose shape comes from
 -- the Avro reader schema, so a static copy here would go stale the first time a schema is
@@ -35,7 +37,7 @@ CREATE SCHEMA IF NOT EXISTS {catalog}.landing
 CREATE SCHEMA IF NOT EXISTS {catalog}.curated
   COMMENT 'Parsed events, one table per topic, payload kept nested.';
 CREATE SCHEMA IF NOT EXISTS {catalog}.audit
-  COMMENT 'Per-batch, per-layer streaming status. Separate from business data by design.';
+  COMMENT 'Per-run, per-layer ingestion status for every source. Separate from business data by design.';
 
 -- -------------------------------------------------------------------------------------
 -- LANDING - ONE TABLE PER TOPIC.
@@ -75,7 +77,7 @@ CREATE TABLE IF NOT EXISTS {catalog}.landing.{topic_table} (
   ingested_via          STRING    COMMENT 'primary | kafka_replay | curated_replay',
   replay_run_id         STRING,
   batch_id              BIGINT,
-  run_id                STRING    COMMENT 'Correlates with audit.stream_audit.run_id'
+  run_id                STRING    COMMENT 'Correlates with audit.ingest_audit.run_id'
 )
 USING DELTA
 PARTITIONED BY (ingest_date)
@@ -86,37 +88,45 @@ TBLPROPERTIES (
 );
 
 -- -------------------------------------------------------------------------------------
--- AUDIT - ONE table. One row per (batch, layer, status) transition.
+-- AUDIT - ONE table, shared by EVERY source of every type.
+-- One row per (run, layer, status) transition.
+--
+-- THREE COLUMNS MEAN THREE THINGS. position_start / position_end hold a Kafka offsets
+-- JSON, a database cursor value or a file boundary, depending on source_type - which is
+-- why they are STRING and why it is said on the column itself. source_detail is a JSON
+-- STRING and not a MAP, so a new source type never forces an ALTER TABLE here.
+--
+-- Keep this in step with framework/audit.py: AUDIT_DDL_COLUMNS (the table),
+-- AUDIT_SCHEMA (the DataFrame) and this block are compared column-for-column by
+-- tests/test_framework_audit.py.
 -- -------------------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS {catalog}.audit.stream_audit (
-  audit_id              STRING    COMMENT 'run_id::batch_id::layer::status',
-  run_id                STRING,
-  batch_id              BIGINT    COMMENT '-1 for bounded batch runs',
-  topic_key             STRING,
-  topic                 STRING,
-  domain                STRING,
-  layer                 STRING    COMMENT 'stream | landing | curated',
+CREATE TABLE IF NOT EXISTS {catalog}.audit.ingest_audit (
+  audit_id              STRING    COMMENT 'run_id::batch_id::layer::status - unique per row',
+  run_id                STRING    COMMENT 'One value per job execution; also stamped on data rows',
+  batch_id              BIGINT    COMMENT 'Streaming microbatch id, or the run_sequence for a batch source, or -1',
+  source_type           STRING    COMMENT 'Which source implementation ran',
+  source_key            STRING    COMMENT 'Matches conf/sources/<source_key>.yaml and ingest_control.source_key',
+  source_ref            STRING    COMMENT 'Source-side identifier: topic name, SCHEMA.TABLE, or path glob',
+  domain                STRING    COMMENT 'Owning team',
+  layer                 STRING    COMMENT 'run, plus whichever layers the source type has',
   status                STRING    COMMENT 'STARTED | COMPLETED | FAILED | SKIPPED | NO_DATA',
-  record_count          BIGINT    COMMENT 'Rows PRESENTED to the write - see the caveat in audit.py',
+  record_count          BIGINT    COMMENT 'Rows PRESENTED to the write - see the caveat in framework/audit.py',
   quarantined_count     BIGINT,
-  event_ts              TIMESTAMP,
-  duration_ms           BIGINT,
-  run_type              STRING,
-  rerun_id              STRING,
-  job_run_id            STRING,
-  starting_offsets      STRING    COMMENT 'Per-partition JSON at batch start (layer=stream)',
-  ending_offsets        STRING    COMMENT 'Per-partition JSON at batch end (layer=stream)',
-  writer_schema_ids     ARRAY<INT>,
-  reader_schema_id      INT,
-  checkpoint_path       STRING    COMMENT 'Which checkpoint lineage produced this batch',
+  event_ts              TIMESTAMP COMMENT 'When this transition was recorded',
+  duration_ms           BIGINT    COMMENT 'Time spent in this layer',
+  run_type              STRING    COMMENT 'primary, or a source-specific replay type',
+  rerun_id              STRING    COMMENT 'Set for a replay; NULL for a primary run',
+  job_run_id            STRING    COMMENT 'The Databricks Workflows run id, when there is one',
+  position_start        STRING    COMMENT 'THREE MEANINGS by source_type: Kafka offsets, a cursor, a file boundary',
+  position_end          STRING    COMMENT 'Upper read boundary. Same three meanings as position_start',
+  source_detail         STRING    COMMENT 'JSON STRING, not a map - a new source type forces no ALTER TABLE',
   error_class           STRING,
-  error_message         STRING,
-  spark_progress_json   STRING,
-  audit_date            DATE
+  error_message         STRING    COMMENT 'Truncated to 4000 characters',
+  audit_date            DATE      COMMENT 'Partition key: date of event_ts'
 )
 USING DELTA
 PARTITIONED BY (audit_date)
-COMMENT 'Per-batch, per-layer ingestion status. First stop for incident triage.'
+COMMENT 'Per-run, per-layer ingestion status for every source. First stop for incident triage.'
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact'   = 'true'
@@ -167,7 +177,7 @@ TBLPROPERTIES (
 -- =====================================================================================
 -- GRANTS
 -- =====================================================================================
-GRANT SELECT ON TABLE {catalog}.audit.stream_audit TO `ingestion-support`;
+GRANT SELECT ON TABLE {catalog}.audit.ingest_audit TO `ingestion-support`;
 GRANT SELECT ON TABLE {catalog}.landing.{topic_table} TO `ingestion-support`;
-GRANT SELECT, MODIFY ON TABLE {catalog}.audit.stream_audit TO `sp-kafka-ingestion`;
+GRANT SELECT, MODIFY ON TABLE {catalog}.audit.ingest_audit TO `sp-kafka-ingestion`;
 GRANT SELECT, MODIFY ON TABLE {catalog}.landing.{topic_table} TO `sp-kafka-ingestion`;

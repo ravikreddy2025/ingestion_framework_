@@ -33,12 +33,26 @@
 
 defaults:
 
-  # --- AUDIT ----------------------------------------------------------------------------
-  # ONE audit table for every source of every type. Only {catalog} changes between
-  # environments, so this belongs here rather than repeated in every source file.
-  # The table itself is renamed and re-shaped in Stage 2 (CORE section 5.4), together with
-  # its DDL in sql/02_layer_tables.sql - renaming it here alone would only create drift.
-  audit_table: "{catalog}.audit.stream_audit"
+  # --- THE FRAMEWORK'S OWN THREE TABLES -------------------------------------------------
+  # Shared by every source of every type. Only the catalog changes between environments,
+  # so they belong here rather than repeated in every source file. Each is created by
+  # sql/01_operational_config.sql or sql/02_layer_tables.sql when an environment is
+  # provisioned; the job creates audit and state itself if they are missing.
+  #
+  # These three are FRAMEWORK-OWNED KEYS (framework/config.py FRAMEWORK_STRUCTURAL_KEYS):
+  # no SOURCE_SPEC declares them, because the framework reads them and no source does.
+
+  # One row per (run, layer, status), for every source. First stop for incident triage.
+  # Lives in the DATA catalog, next to the data whose arrival it records.
+  audit_table: "{catalog}.audit.ingest_audit"
+
+  # Durable watermarks and run sequences. Written by the ingestion job ONLY, and its writes
+  # are mandatory - see framework/state.py.
+  state_table: "{ops_catalog}.ingestion.ingest_state"
+
+  # Layer 4: the support team's runtime overrides. Written by support, read by the job.
+  # Both live in the OPS catalog, which is a different blast radius from the data.
+  control_table: "{ops_catalog}.ingestion.ingest_control"
 
   # --- TABLE PROPERTIES -----------------------------------------------------------------
   # Delta table properties applied to EVERY table the framework creates, in every layer.
