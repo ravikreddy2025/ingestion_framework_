@@ -162,11 +162,11 @@ has to solve.
   "Structural fields must be ignored if present, not rejected". Validating against
   `operational_keys` alone would reject them instead. The behaviour asked for is the one
   implemented: unknown -> error, structural -> ignored with a log line, and both are tested.
-- **The stage file lists `sql/03_support_queries.sql` nowhere, but it is now stale.** It
-  queries `ingestion_topic_control` and `stream_audit` by `topic_key`, all three of which
-  this stage renamed. It was left alone (CORE rule 8), and it is the largest known-stale
-  artefact this stage leaves behind. Whichever stage owns support docs should rewrite it;
-  Stage 1's report already flagged it, and it is still open.
+- **The stage file lists `sql/03_support_queries.sql` nowhere, but the rename made it
+  stale.** It queried `ingestion_topic_control` and `stream_audit` by `topic_key`, all
+  three of which this stage renamed. Initially left alone under CORE rule 8 and flagged
+  here; **now rewritten** - see the addendum. `sql/02` and `sql/04` turned out to be stale
+  too, which nothing had noticed.
 - **`--control-table` was NOT added to `run_ingest.py`,** which Stage 1's report predicted
   ("Stage 2 adds one argument and one call"). The control table's name is now a
   configuration setting like the other two framework tables, so there is one mechanism -
@@ -212,13 +212,12 @@ has to solve.
    looks. The runner merges layers 1-3 once to find `control_table`, reads the control
    table, then resolves the full five layers with the overrides applied. Two passes over a
    few small YAML files buys one mechanism instead of two.
-   *Consequence for Stage 6:* `databricks.yml`'s `control_table` variable and the
-   `control-table` job parameter in `resources/*.yml` are now redundant for the new
-   entrypoint (the legacy Kafka entrypoints still use them until Stage 3). `ops_catalog`
-   was added to each environment's `vars:` and a test asserts it matches `databricks.yml`,
-   exactly as `data_catalog` already was.
-   *What would change it:* a need to point one run at a different control table without a
-   deploy -- which is a thing an incident might want.
+   `ops_catalog` was added to each environment's `vars:` and a test asserts it matches
+   `databricks.yml`, exactly as `data_catalog` already was. **The duplication is gone** -
+   `databricks.yml`'s `control_table` variable and the `control-table` job parameter were
+   removed rather than left to Stage 6; see the addendum.
+   *What would change it:* nothing outstanding. The escape hatch an incident might want -
+   pointing one run at a different table - is still there as an optional argument.
 
 3. **The framework creates tables; it does not GRANT, and it does not CREATE SCHEMA.**
    `sql/01` and `sql/02` own both. The reasoning is in `framework/tables.py`'s docstring: a
@@ -229,21 +228,24 @@ has to solve.
    that case `ensure_table` would need a `grants:` configuration block, and VB-16 becomes a
    blocker rather than a check.
 
-4. **Target-name patterns containing a source-derived token cannot survive
-   `framework/config.py` today, and Stage 3/4 has to resolve that.** `config.py` treats an
-   unresolved `{placeholder}` as a hard error, and its substitution scope is the
-   environment's `vars:` plus `{source_key}` and `{domain}`. So
-   `conf/defaults/kafka.yaml`'s `landing_table: "{catalog}.landing.{topic_table}"` would
-   fail to resolve through the framework loader -- which is why the shipped Kafka files are
-   still resolved by the legacy loader, exactly as Stage 1 left them. `tables.render()` is
-   built and tested for the derivation itself; what is undecided is HOW the pattern reaches
-   it unsubstituted.
-   *Three candidates, none chosen:* a `deferred_tokens` field on `SourceSpec` (data-driven,
-   but changes the CORE 4.1 contract); a second placeholder syntax for source-derived
-   tokens (two things to learn, rejected); or having each source resolve its own target
-   names from a raw pattern read outside the merged settings.
-   *Recommendation:* the `SourceSpec` field, decided in Stage 3 when Kafka is the concrete
-   case, and applied to Oracle in Stage 4.
+4. **A target-name pattern may now name a value only the source knows, via a new
+   `SourceSpec.target_tokens` field.** This adds a seventh field to the CORE 4.1 skeleton,
+   which is the one place this stage departs from "follow these skeletons exactly", and it
+   is the decision most worth a second opinion. The problem it solves is real and was
+   blocking: `config.py` treats an unresolved `{placeholder}` as a hard error, and
+   `conf/defaults/kafka.yaml` has always named its targets
+   `{catalog}.<layer>.{topic_table}` -- so no shipped Kafka file could resolve through the
+   framework loader at all.
+   *Two alternatives rejected:* a second placeholder syntax for source-derived tokens (two
+   things for a new joiner to learn instead of one); and having the runner ask the source
+   for its tokens before validating (which puts a source's own vocabulary into
+   `framework/`, and is what CORE section 7 exists to prevent).
+   *The cost, stated plainly:* target-name validation now happens at two moments rather
+   than one -- the runner checks every name configuration fully resolved, and the source
+   checks the rest via `tables.target()` at the top of `run()`. Both are before any read.
+   *What would change it:* if Stage 3 finds Kafka needs no token after all -- e.g. the
+   topic-to-identifier mapping moves into configuration as an explicit `table_name:` -- the
+   field would have one user (Oracle) and might not earn its keep.
 
 5. **`batch_id` carries the Delta `txnVersion` for every source type, whatever produced
    it.** Streaming sources put their microbatch id there; batch sources put their
@@ -280,11 +282,101 @@ has to solve.
 
 ---
 
-**Test count:** 263 passed, 34 deselected before -> **364 passed, 34 deselected** after
-(`pytest -m "not spark" -q`). 101 tests added net; one legacy parametrised case removed
+**Test count:** 263 passed, 34 deselected before -> **403 passed, 34 deselected** after
+(`pytest -m "not spark" -q`). 140 tests added net; one legacy parametrised case removed
 (`test_provisioning_sql_matches_the_python_ddl[audit]`), because the audit table it compared
 moved to `framework/audit.py` and is now compared there instead.
 
 **New VB entries this stage:** VB-15 (does the state MERGE upsert, and is one run per
 `source_key` true), VB-16 (can the service principal create the audit and state tables),
 VB-17 (do both SQL files execute as written).
+
+---
+
+## Addendum -- three of the items above, closed before the PR
+
+The human read the five lists and asked for three of them to be fixed rather than carried
+into a later stage. All three are now done on this branch. The sections above are amended
+in place so a later session does not act on advice this addendum has already superseded.
+
+### 1. The control table is named once (decision 2)
+
+`databricks.yml`'s `control_table` variable and the `control-table` job parameter in both
+job definitions are removed. They duplicated a name `conf/defaults.yaml` derives from
+`vars.ops_catalog` -- and the copy was still pointing at `ingestion_topic_control`, a table
+this branch renamed, which nothing would have caught.
+
+The legacy Kafka loader falls back to the configured name when given no argument, so the
+legacy entrypoints keep working with one fewer parameter. `--control-table` survives as an
+OPTIONAL argument, which is the incident escape hatch decision 2 said an incident might
+want. Two tests guard the shape rather than the symptom: the three framework tables must
+resolve to legal three-part names in every environment, and `databricks.yml` must not
+declare a control table again.
+
+### 2. Target patterns with a source-derived token (decision 4)
+
+`SourceSpec.target_tokens` implemented, `sources/kafka/spec.py` declares `topic_table`
+because `conf/defaults/kafka.yaml` already uses it, and `framework/tables.py` gains
+`target(cfg, layer, tokens)` which renders and then validates. See decision 4 above for
+the reasoning, the rejected alternatives and the cost.
+
+Note for Stage 3: this removes the blocker, it does not finish the job. The Kafka spec's
+key sets are still empty, so a shipped Kafka file still does not resolve through the
+framework loader -- `topic`, `cluster`, `registry` and the rest are still unknown keys.
+What changed is that the target patterns are no longer the reason.
+
+### 3. The support runbook, and a test so it cannot rot again
+
+`sql/03_support_queries.sql` rewritten against the three tables as they now are, and
+reorganised around what each is FOR -- audit is evidence and best-effort, control is what
+support may change, state is where each source actually got to and is read-only for
+support. It gained the two questions the old file could not answer (**which sources have
+NOT run**, and **has the watermark moved**), and its source-specific queries are marked as
+such, because one audit table now serves three source types.
+
+`tests/test_shipped_sql.py` is the guard, and it earned itself immediately: on its first
+run it found two more stragglers nobody had noticed -- `sql/02` still described quarantine
+in terms of `on_deser_error`, and `sql/04` was still VACUUMing `audit.stream_audit`
+nightly, which would have failed every night on a table that does not exist. It checks
+four things: no `.sql` file references a retired identifier; every table the runbook
+queries is one the provisioning scripts create; every column the runbook WRITES exists on
+the control table; and the runbook never shows anyone how to UPDATE `ingest_state`, because
+support has SELECT on it and a hand-moved watermark is a silent data-loss incident.
+
+Reads are deliberately not checked -- they range over joins, aliases and JSON paths, and a
+regex that tried would be wrong more often than the file is.
+
+### Gate after the addendum
+
+```
+$ python -m ruff check src tests
+All checks passed!
+
+$ python -m ruff format --check src tests
+22 files would be reformatted, 32 files already formatted
+
+$ python -m pytest -m "not spark" -q
+403 passed, 34 deselected
+```
+
+Formatter baseline still 22, unchanged since Stage 0. **Ten further mutations run**, each
+restored afterwards:
+
+| Mutation | Test that failed |
+|---|---|
+| drop the deferred-token branch in `_substitute` | `test_a_declared_token_survives_configuration_load` |
+| defer every token instead of the declared ones | `test_an_undeclared_token_is_still_a_hard_error` |
+| have `tables.target()` render without validating | `test_a_rendered_name_that_is_illegal_in_unity_catalog_is_rejected` |
+| stop skipping deferred names in `validate_targets` | `test_the_runner_skips_a_deferred_name_and_says_so` |
+| empty the Kafka spec's `target_tokens` | `test_the_shipped_kafka_spec_declares_the_token_its_defaults_use` |
+| drop the legacy loader's control-table fallback | `test_the_control_table_is_read_from_configuration_when_no_argument_is_given` |
+| reintroduce `topic_key` into `sql/03` | `test_no_sql_file_references_a_retired_identifier[topic_key-source_key]` |
+| add an `UPDATE` on `ingest_state` to the runbook | `test_support_never_updates_the_state_table` |
+| set a non-existent control column in an `UPDATE` | `test_the_support_updates_only_set_columns_the_control_table_has` |
+| re-add `control_table` to `databricks.yml` | `test_the_bundle_does_not_also_name_the_control_table` |
+
+### Still open from the five lists
+
+Decisions 1, 3, 5, 6, 7 and 8 stand as written, and VB-15 to VB-17 are unchanged. The one
+remaining known-stale artefact this branch leaves behind is the DOCUMENTATION -- `docs/`
+still describes the Kafka-only framework throughout, which CORE assigns to Stage 7.
