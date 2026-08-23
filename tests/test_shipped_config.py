@@ -35,7 +35,7 @@ CONF_ROOT = Path(__file__).resolve().parent.parent / "conf"
 
 # Files starting with "_" are templates, not deployable topics. _TEMPLATE.yaml is full of
 # <ANGLE_BRACKET> placeholders by design and must NOT be validated as a real topic.
-TOPIC_FILES = sorted(p for p in (CONF_ROOT / "topics").glob("*.yaml")
+TOPIC_FILES = sorted(p for p in (CONF_ROOT / "sources").glob("*.yaml")
                      if not p.name.startswith("_"))
 TOPIC_KEYS = [p.stem for p in TOPIC_FILES]
 
@@ -57,7 +57,7 @@ def test_conf_directory_is_present_and_populated():
     assert (CONF_ROOT / "defaults.yaml").is_file()
     assert (CONF_ROOT / "clusters.yaml").is_file()
     assert (CONF_ROOT / "registries.yaml").is_file()
-    assert TOPIC_KEYS, "no deployable topic files found in conf/topics/"
+    assert TOPIC_KEYS, "no deployable topic files found in conf/sources/"
     assert ENVIRONMENTS, "no environment files found in conf/environments/"
 
 
@@ -190,7 +190,7 @@ def test_every_referenced_profile_exists(topic_key):
 
 def test_template_is_not_mistaken_for_a_deployable_topic():
     """The template must stay inert - and must fail loudly if someone tries to deploy it."""
-    assert (CONF_ROOT / "topics" / "_TEMPLATE.yaml").is_file(), "onboarding template missing"
+    assert (CONF_ROOT / "sources" / "_TEMPLATE.yaml").is_file(), "onboarding template missing"
     assert "_TEMPLATE" not in TOPIC_KEYS
     with pytest.raises(ConfigError):
         _resolve("_TEMPLATE")

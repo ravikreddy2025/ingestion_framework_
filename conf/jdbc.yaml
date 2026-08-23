@@ -1,0 +1,25 @@
+# =====================================================================================
+# JDBC CONNECTION REGISTER
+#
+# THE REGISTER PATTERN - identical to conf/clusters.yaml and conf/registries.yaml, and
+# deliberately so. There is one mechanism for "what exists out there", not one per source
+# type:
+#
+#   * This file records WHAT EXISTS and what is TRUE IN EVERY ENVIRONMENT: the auth mode,
+#     the secret KEY NAMES, the driver options. Never a password, never a token.
+#   * conf/environments/<env>.yaml overrides NAMED PROFILES in this file with what differs
+#     per environment: the host, the port, the service name, the secret SCOPE.
+#   * A profile named in an environment file that does not exist here is a hard error
+#     listing the profiles that do. That is what keeps this file the single answer to
+#     "which databases do we extract from?" - a typo cannot quietly create a new profile.
+#   * A source file references a profile BY NAME. It never contains an endpoint.
+#
+# The top-level key must match the filename (`jdbc.yaml` holds `jdbc:`). The framework
+# discovers registers by listing conf/*.yaml, so adding one is a new file and no code
+# change at all.
+#
+# EMPTY UNTIL STAGE 4. Profiles are added when sources/oracle/ can read them - a profile
+# here that nothing reads is indistinguishable from one that is wired up.
+# =====================================================================================
+
+jdbc: {}

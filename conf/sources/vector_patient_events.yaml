@@ -10,16 +10,18 @@
 # If you are about to paste a table name or a catalog into this file, stop - it belongs in
 # defaults.yaml with a {catalog} placeholder. Anything hardcoded here breaks dev/preprod.
 #
-# THE FILENAME IS THE KEY. `vector_patient_events.yaml` -> topic_key
-# `vector_patient_events`, which fills {topic_key} in the derived table names, becomes a
+# THE FILENAME IS THE KEY. `vector_patient_events.yaml` -> source_key
+# `vector_patient_events`, which fills {source_key} in the derived table names, becomes a
 # checkpoint path segment, and appears in every audit row. Renaming it orphans the
 # checkpoint - don't.
 #
-# To onboard a new topic, copy conf/topics/_TEMPLATE.yaml.
+# To onboard a new topic, copy conf/sources/_TEMPLATE.yaml.
 # Full reference: docs/CONFIGURATION.md   Architecture: docs/DESIGN.md
 # =====================================================================================
 
-topic:
+source_type: kafka
+
+source:
 
   # -------------------------------------------------------------------- MUST CHANGE --
   # Exact Kafka topic name, as it exists on the broker. Case-sensitive.

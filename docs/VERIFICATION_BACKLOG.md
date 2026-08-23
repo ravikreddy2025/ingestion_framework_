@@ -306,3 +306,37 @@ code must change -- see "If it fails").
 - **If it fails:** Fix the specific YAML/CLI error `validate` reports -- do not guess at a fix
   and move on without re-running it.
 - **Status:** OPEN
+
+### VB-14 -- Is the oldest runtime we must support DBR 16.4 LTS, and is its Python 3.12?
+- **Stage / file:** `pyproject.toml` (`requires-python`, `[tool.mypy] python_version`),
+  `resources/*.yml` (`spark_version`), and the local `.venv`. Added in Stage 1.
+- **Why it matters:** the stated target is **DBR 16.4 LTS or later**, so
+  `requires-python = ">=3.12"` is a floor with no ceiling: 3.12 is the oldest interpreter
+  this code must run on, and a newer runtime must keep working without a release here. If
+  the floor is too HIGH, `pip install` of the wheel fails on the cluster outright -- loud,
+  and fixed in a minute. If it is too LOW, nothing fails; the code simply may use syntax or
+  stdlib the real runtime does not have, and that surfaces at import time on the cluster
+  rather than in CI. The Spark version rides along with it: the local `.venv` installs
+  `pyspark==3.5.2` so that Spark-marked tests, from Stage 3 onward, run against the Spark
+  the oldest supported cluster actually has. Note that `resources/job_ingest_primary.yml`
+  still carries a commented `spark_version: "15.4.x-scala2.12"` from before this decision;
+  whichever answer is right, those two files must agree.
+- **How to check:** In the target workspace, on the cluster the jobs will actually use:
+  ```python
+  import sys, pyspark
+  print(sys.version)            # expect 3.12.x
+  print(pyspark.__version__)    # expect 3.5.2
+  print(spark.conf.get("spark.databricks.clusterUsageTags.sparkVersion"))
+  ```
+  Or, without a cluster: `databricks clusters spark-versions` and the DBR release notes for
+  whichever version the job clusters are pinned to.
+- **Expected:** Python 3.12.x and Spark 3.5.2 on the OLDEST runtime any job uses, i.e.
+  DBR 16.4 LTS. Newer runtimes in the fleet are fine and expected -- the question is only
+  what the oldest one is.
+- **If it fails:** Set the `requires-python` floor and `[tool.mypy] python_version` in
+  `pyproject.toml` to the OLDEST supported runtime's minor version, set `spark_version` in
+  `resources/*.yml` to match, rebuild the local `.venv` on that Python, and reinstall
+  `pyspark` at that runtime's Spark version. All four must move together -- changing one
+  alone is what produces a local environment that disagrees with the cluster without
+  saying so.
+- **Status:** OPEN

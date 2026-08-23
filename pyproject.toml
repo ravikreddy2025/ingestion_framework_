@@ -6,7 +6,15 @@ build-backend = "setuptools.build_meta"
 name = "kafka-ingest"
 version = "0.2.0"
 description = "Config-driven Kafka -> Databricks landing/curated ingestion framework"
-requires-python = ">=3.10"
+
+# Floor, not a pin, and set by the runtime rather than by whatever is installed locally.
+# The target is DBR 16.4 LTS or later; 16.4 LTS ships Python 3.12 and Spark 3.5.2, so 3.12
+# is the oldest interpreter this code has to run on. There is deliberately NO upper bound:
+# "or later" means a newer runtime must keep working without a release here.
+#
+# RAISE the floor when the oldest supported runtime moves, and move
+# resources/*.yml's spark_version with it. Confirmation against the workspace is VB-14.
+requires-python = ">=3.12"
 
 # Runtime deps that are NOT already on DBR. PySpark / delta-spark are provided by
 # the runtime and are deliberately NOT pinned here (pinning them fights the runtime).
@@ -23,7 +31,12 @@ dev = [
 ]
 
 # Job entrypoints. DAB `python_wheel_task.entry_point` refers to these names.
+#
+# `run-ingest` is the multi-source entrypoint (framework/runner.py). The three below it are
+# the Kafka-only entrypoints, still live until Stage 3 ports the Kafka source; they are
+# what resources/*.yml still name, so removing them now would break the bundle.
 [project.scripts]
+run-ingest = "kafka_ingest.entrypoints.run_ingest:main"
 ingest-primary = "kafka_ingest.entrypoints.ingest_primary:main"
 replay-kafka = "kafka_ingest.entrypoints.replay_kafka:main"
 replay-curated = "kafka_ingest.entrypoints.replay_curated:main"
@@ -98,6 +111,6 @@ known-first-party = ["kafka_ingest", "conftest"]
 # --------------------------------------------------------------------------------------
 [tool.mypy]
 files = ["src"]
-python_version = "3.10"
+python_version = "3.12"   # the requires-python FLOOR - check against the oldest we support
 ignore_missing_imports = true   # pyspark and delta ship no stubs on this runtime
 warn_unused_ignores = true

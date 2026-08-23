@@ -11,7 +11,9 @@
 # not the values.
 # =====================================================================================
 
-topic:
+source_type: kafka
+
+source:
 
   # -------------------------------------------------------------------- MUST CHANGE --
   topic: rcm.claim.status.v2
@@ -40,7 +42,7 @@ topic:
   #
   # NOTE: a schema id is registry-specific, so this pins the SAME id in every environment.
   # If dev and prod use separate registries with different ids, move this to the
-  # environment files' topic_defaults instead.
+  # environment files' defaults instead.
   #
   # TO UNFREEZE: delete both lines. registry_latest is inherited from defaults.yaml.
   reader_schema_mode: pinned_id

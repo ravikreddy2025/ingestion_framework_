@@ -1,8 +1,8 @@
 # =====================================================================================
 # TOPIC ONBOARDING TEMPLATE
 #
-# 1. Copy this file to conf/topics/<your_topic_key>.yaml
-#      The FILENAME becomes the topic_key: it fills {topic_key} in the derived table names,
+# 1. Copy this file to conf/sources/<your_source_key>.yaml
+#      The FILENAME becomes the source_key: it fills {source_key} in the derived table names,
 #      becomes a checkpoint path segment, keys the operational control table, and appears
 #      in every audit row. lower_snake_case, e.g. gma_provider_updates.
 # 2. Replace the five <ANGLE_BRACKET> placeholders below. That is usually the whole job.
@@ -19,11 +19,13 @@
 #   conf/environments/<env>.yaml (per environment). Hardcoding any of them here silently
 #   breaks the other environments.
 #
-# This file is inert: topic_key "_TEMPLATE" is never scheduled, and the config validator
+# This file is inert: source_key "_TEMPLATE" is never scheduled, and the config validator
 # skips underscore-prefixed files.
 # =====================================================================================
 
-topic:
+source_type: kafka
+
+source:
 
   # -------------------------------------------------------------------- MUST CHANGE --
   topic: <exact.kafka.topic.name>

@@ -1,68 +1,65 @@
 # =====================================================================================
-# DEFAULTS - layer 1 of 5. Applies to EVERY topic in EVERY environment.
+# DEFAULTS - layer 1 of 5. Applies to EVERY source of EVERY type, in EVERY environment.
 #
 # THE MERGE CHAIN (later always wins on a per-key basis; absent keys fall through)
 #
-#   1. conf/defaults.yaml            <- you are here. Common to everything.
-#   2. conf/environments/<env>.yaml  <- what differs between dev / preprod / prod
-#   3. conf/topics/<topic_key>.yaml  <- what is unique to one topic
-#   4. operational control table     <- support-team runtime overrides, no deploy
-#   5. job parameters                <- one-off overrides typed into Workflows
+#   1.  conf/defaults.yaml                 <- you are here. Common to everything.
+#   1b. conf/defaults/<source_type>.yaml   <- common to every source of ONE type
+#   2.  conf/environments/<env>.yaml       <- what differs between dev / preprod / prod
+#                                             (`defaults:` for every type, plus
+#                                             `defaults_by_type:` for one type)
+#   3.  conf/sources/<source_key>.yaml     <- what is unique to one source
+#   4.  operational control table          <- support-team runtime overrides, no deploy
+#   5.  job parameters                     <- one-off overrides typed into Workflows
 #
 # Layers 1-3 are STRUCTURAL (Git, PR-reviewed). Layers 4-5 are OPERATIONAL.
 #
-# PLACEHOLDERS
-#   {catalog}    and any other key under `vars:` in the environment file
-#   {topic_key}  the topic's config filename without .yaml
-#   {domain}     the topic's `domain:` value
-# An unresolved placeholder is a hard error naming the key - it never reaches a cluster.
+# WHICH FILE DOES A SETTING BELONG IN?
+#   here                      same value for every source of every type
+#   defaults/<type>.yaml      same value for every source of ONE type, e.g. a trigger
+#   environments/<env>.yaml   varies by environment
+#   sources/<key>.yaml        varies by source
 #
-# Put a setting here when its value is the same everywhere. Put it in the environment
-# file when it varies by environment. Put it in the topic file when it varies by topic.
+# A setting that only one source TYPE understands must NOT go here. Every source of every
+# type is validated against this file, so a type-specific key here is an unknown key for
+# every other type - which is exactly the error you want, at the wrong moment.
+#
+# PLACEHOLDERS
+#   {catalog}      and any other key under `vars:` in the environment file
+#   {source_key}   the source's config filename without .yaml
+#   {domain}       the source's `domain:` value
+# An unresolved placeholder is a hard error naming the key - it never reaches a cluster.
 # =====================================================================================
 
-topic_defaults:
+defaults:
 
-  # --- TARGETS ------------------------------------------------------------------------
-  # Only {catalog} changes between environments, so these belong here, not repeated in
-  # every topic file.
-  #
-  # ONE TABLE PER TOPIC in landing, curated and quarantine. Only audit is shared.
-  #
-  # {topic_table} is the Kafka topic name with dots and hyphens turned into underscores,
-  # because neither is legal in an unquoted Unity Catalog identifier:
-  #     vector.patient.events.v1  ->  vector_patient_events_v1
-  #
-  # To override the name for one topic, set `table_name:` in that topic's file - NOT a full
-  # table name here or there. That keeps the catalog and schema in one place, so a topic
-  # file still never contains a catalog.
-  landing_table:    "{catalog}.landing.{topic_table}"
-  curated_table:    "{catalog}.curated.{topic_table}"
-  quarantine_table: "{catalog}.landing.{topic_table}_quarantine"
-  audit_table:      "{catalog}.audit.stream_audit"
+  # --- AUDIT ----------------------------------------------------------------------------
+  # ONE audit table for every source of every type. Only {catalog} changes between
+  # environments, so this belongs here rather than repeated in every source file.
+  # The table itself is renamed and re-shaped in Stage 2 (CORE section 5.4), together with
+  # its DDL in sql/02_layer_tables.sql - renaming it here alone would only create drift.
+  audit_table: "{catalog}.audit.stream_audit"
 
-  # Volume-backed checkpoint ROOT. The framework appends /<topic_key>/primary or
-  # /<topic_key>/replay/<rerun_id> itself - never add the topic name here.
-  checkpoint_root: "/Volumes/{catalog}/ingestion/checkpoints"
-
-  # Delta table properties applied to EVERY table the framework creates: landing, curated,
-  # quarantine and audit. Applied at CREATE time only - editing this does not alter a table
-  # that already exists (use ALTER TABLE for that).
+  # --- TABLE PROPERTIES -----------------------------------------------------------------
+  # Delta table properties applied to EVERY table the framework creates, in every layer.
+  # Applied at CREATE time only - editing this does not alter a table that already exists
+  # (use ALTER TABLE for that).
   #
-  # A topic can override the whole map in its own file if one feed genuinely needs different
-  # properties. Most never should.
+  # A source can override the whole map in its own file if one feed genuinely needs
+  # different properties. Most never should.
   table_properties:
     # ---- ON by default -----------------------------------------------------------------
-    # Streaming appends and per-layer audit rows both produce small files; letting Delta
-    # compact them removes an entire class of "why is this table slow" tickets.
+    # Streaming appends, batch appends and per-layer audit rows all produce small files;
+    # letting Delta compact them removes an entire class of "why is this table slow" tickets.
     delta.autoOptimize.optimizeWrite: "true"
     delta.autoOptimize.autoCompact: "true"
 
-    # ---- OFF by default - uncomment inside a topic's OWN table_properties to opt in ----
+    # ---- OFF by default - uncomment inside a source's OWN table_properties to opt in ----
     # These are commented OUT here deliberately: enabling any of them changes storage cost
-    # or write behaviour, and that should be a decision for one topic, made in that topic's
-    # PR - not a platform-wide default nobody chose. A topic overrides the WHOLE map, so
-    # copy this block into the topic file and adjust rather than uncommenting it here.
+    # or write behaviour, and that should be a decision for one source, made in that
+    # source's PR - not a platform-wide default nobody chose. A source overrides the WHOLE
+    # map, so copy this block into the source file and adjust rather than uncommenting it
+    # here.
     #
     # Applied at CREATE time only, like every property in this map - see "Table properties"
     # in docs/CONFIGURATION.md. Changing any of these does NOT alter a table that already
@@ -93,51 +90,8 @@ topic_defaults:
     # delta.logRetentionDuration: "interval 30 days"
 
     # Blocks UPDATE/DELETE/MERGE on the table outright, at the Delta layer.
-    # DO NOT SET THIS ON LANDING OR CURATED: both are written via MERGE during a replay
-    # (landing_writer._merge_landing, curated_writer._merge_curated) - this property would
-    # make every replay fail. It is listed here only because it is a real, sometimes-useful
-    # property in general Delta usage; there is no table this framework creates where
-    # setting it is currently safe.
+    # DO NOT SET THIS ON ANY LAYER TABLE: every layer is written via MERGE during a replay,
+    # and this property would make every replay fail. It is listed here only because it is a
+    # real, sometimes-useful property in general Delta usage; there is no table this
+    # framework creates where setting it is currently safe.
     # delta.appendOnly: "true"
-
-  # --- STREAMING ----------------------------------------------------------------------
-  # Prefix for the Spark-managed consumer group, so this consumer is identifiable in
-  # broker-side monitoring. Replays automatically get a distinct suffix.
-  consumer_group_prefix: "dbx-{topic_key}"
-
-  # FIRST RUN ONLY. Once a checkpoint exists it always wins and this is ignored.
-  starting_offsets: earliest
-
-  # Drain everything available, then stop - the right shape for a once-daily job and the
-  # only trigger under which a Workflows run has a natural end.
-  trigger: availableNow
-
-  # Fail loudly when Kafka has aged out records we never consumed. Overriding this to
-  # false means silently accepting gaps and needs explicit domain sign-off.
-  fail_on_data_loss: true
-
-  # Required for the ce_* CloudEvent columns to populate - they come from Kafka headers.
-  include_headers: true
-
-  # --- TABLE LAYOUT -------------------------------------------------------------------
-  # Delta allows PARTITIONED BY or CLUSTER BY, never both. See docs/DESIGN.md.
-  # Both layers are one table per topic, so `topic` is constant inside each and worthless
-  # as a partition key.
-  # landing: ingest_date - bounds partition growth and makes retention a partition drop.
-  # curated: event_date - the date of ce_time, falling back to kafka_timestamp.
-  landing_partition_by: [ingest_date]
-  curated_partition_by: [event_date]
-
-  # Which column orders the within-batch dedup. Only relevant when a topic sets
-  # curated_dedup_keys.
-  curated_dedup_order_by: kafka_timestamp
-
-  # --- DESERIALIZATION ----------------------------------------------------------------
-  # The curated payload struct's SHAPE follows the subject's latest registered version.
-  # Each record is still DECODED with its own writer schema from the wire header - that is
-  # what makes a mixed-version microbatch work.
-  reader_schema_mode: registry_latest
-
-  # Platform default: a record that cannot be parsed fails the batch loudly. Support can
-  # flip this to 'quarantine' via the control table to unblock a stuck stream - no deploy.
-  on_deser_error: fail

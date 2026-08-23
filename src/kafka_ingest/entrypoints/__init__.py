@@ -32,7 +32,7 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--config-root",
         required=True,
-        help="Directory holding clusters.yaml, registries.yaml and topics/ "
+        help="Directory holding clusters.yaml, registries.yaml and sources/ "
              "(a /Workspace path deployed by DAB, or a UC Volume path).",
     )
     parser.add_argument("--topic-key", required=True, help="Config key, e.g. vector_patient_events")

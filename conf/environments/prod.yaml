@@ -1,19 +1,25 @@
 # =====================================================================================
 # ENVIRONMENT: prod        Layer 2 of 5 - overrides conf/defaults.yaml
 #
-# conf/defaults.yaml already carries the production-safe values (FAILFAST,
-# fail_on_data_loss, earliest, availableNow), so this file only supplies what is
-# genuinely environment-specific: the catalog, the broker endpoints and the secret scopes.
+# conf/defaults.yaml and conf/defaults/<source_type>.yaml already carry the
+# production-safe values (fail_on_data_loss, earliest, availableNow), so this file only
+# supplies what is genuinely environment-specific: the catalog, the broker endpoints and
+# the secret scopes.
 #
-# If a change here would also be correct in preprod, put it in conf/defaults.yaml instead.
+# If a change here would also be correct in preprod, put it in the defaults instead.
 # =====================================================================================
 
 vars:
   catalog: platform_prod
 
-# Empty on purpose - production behaviour IS the default in conf/defaults.yaml. Anything
-# added here silently diverges prod from what preprod rehearsed.
-topic_defaults: {}
+# Intentionally empty: production behaviour IS the default in conf/defaults.yaml and
+# conf/defaults/<source_type>.yaml. Anything added here silently diverges prod from what
+# preprod rehearsed.
+#
+# `defaults:` applies to every source type; `defaults_by_type: <type>:` applies to one.
+# See conf/environments/dev.yaml for a worked example of the second.
+defaults: {}
+defaults_by_type: {}
 
 clusters:
   confluent_cloud_shared:

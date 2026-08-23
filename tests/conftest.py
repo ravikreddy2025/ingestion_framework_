@@ -250,23 +250,37 @@ def secrets():
 def config_root(tmp_path: Path) -> str:
     """A minimal but valid structural config tree with all five layers represented.
 
-    Mirrors the shipped shape: defaults.yaml + environments/{dev,prod}.yaml +
-    clusters/registries registers + one topic file. `dev` deliberately overrides several
-    defaults so the layering tests have something to assert against.
+    Mirrors the shipped shape: defaults.yaml + defaults/kafka.yaml +
+    environments/{dev,prod}.yaml + clusters/registries registers + one source file. `dev`
+    deliberately overrides several defaults so the layering tests have something to assert
+    against.
     """
-    (tmp_path / "topics").mkdir()
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "defaults").mkdir()
     (tmp_path / "environments").mkdir()
 
+    # Layer 1: common to every source of every type.
     (tmp_path / "defaults.yaml").write_text(
         textwrap.dedent(
             """
-            topic_defaults:
+            defaults:
+              audit_table: "{catalog}.audit.stream_audit"
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    # Layer 1b: common to every Kafka source. Everything Kafka-shaped lives here, so an
+    # Oracle or file source in the same tree never sees it.
+    (tmp_path / "defaults" / "kafka.yaml").write_text(
+        textwrap.dedent(
+            """
+            defaults:
               landing_table: "{catalog}.landing.{topic_table}"
               curated_table: "{catalog}.curated.{topic_table}"
               quarantine_table: "{catalog}.landing.{topic_table}_quarantine"
-              audit_table: "{catalog}.audit.stream_audit"
               checkpoint_root: "/Volumes/{catalog}/ingestion/checkpoints"
-              consumer_group_prefix: "dbx-{topic_key}"
+              consumer_group_prefix: "dbx-{source_key}"
               starting_offsets: earliest
               trigger: availableNow
               fail_on_data_loss: true
@@ -286,9 +300,11 @@ def config_root(tmp_path: Path) -> str:
             """
             vars:
               catalog: cat_dev
-            topic_defaults:
-              max_offsets_per_trigger: 100
-              starting_offsets: latest
+            defaults: {}
+            defaults_by_type:
+              kafka:
+                max_offsets_per_trigger: 100
+                starting_offsets: latest
             clusters:
               cc_shared:
                 bootstrap_servers: "dev-broker:9092"
@@ -307,7 +323,8 @@ def config_root(tmp_path: Path) -> str:
             """
             vars:
               catalog: cat_prod
-            topic_defaults: {}
+            defaults: {}
+            defaults_by_type: {}
             clusters:
               cc_shared:
                 bootstrap_servers: "prod-broker:9092"
@@ -363,16 +380,165 @@ def config_root(tmp_path: Path) -> str:
         encoding="utf-8",
     )
 
-    (tmp_path / "topics" / "demo_topic.yaml").write_text(
+    (tmp_path / "sources" / "demo_topic.yaml").write_text(
         textwrap.dedent(
             """
-            topic:
+            source_type: kafka
+
+            source:
               topic: demo.events.v1
               domain: demo
               cluster: cc_shared
               registry: sr_shared
               subject: demo.events.v1-value
               consumer_group_prefix: dbx-demo
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+    return str(tmp_path)
+
+
+# --------------------------------------------------------------------------------------
+# Framework fixtures - a SYNTHETIC source type.
+#
+# The framework's config tests deliberately use a made-up source type rather than kafka,
+# oracle or file. Two reasons, and both matter:
+#   * it proves the loader is spec-driven, because nothing about "demo" exists anywhere in
+#     framework/ - if a test passes here it passed on the spec alone;
+#   * it keeps these tests stable while Stages 3-5 fill the real specs in.
+# --------------------------------------------------------------------------------------
+
+
+def _demo_spec():
+    """Imported lazily so conftest itself stays importable with nothing installed."""
+    from kafka_ingest.framework.contracts import SourceSpec
+
+    return SourceSpec(
+        source_type="demo",
+        required_keys=frozenset({"object_name", "widget"}),
+        structural_keys=frozenset(
+            {
+                "object_name",
+                "widget",
+                "audit_table",
+                "landing_table",
+                "partition_by",
+                "trigger",
+                "batch_limit",
+                "failure_mode",
+                "cursor_column",
+                "full_refresh",
+            }
+        ),
+        # `trigger`, `batch_limit` and `failure_mode` are settable in BOTH places - the
+        # normal case. `reset_id` is operational ONLY (a YAML value would re-apply an
+        # incident bypass on every future deploy), and `partition_by` / `landing_table` /
+        # `object_name` are structural ONLY (they describe what is already on disk).
+        operational_keys=frozenset({"trigger", "batch_limit", "failure_mode", "reset_id"}),
+        mutually_exclusive=(("cursor_column", "full_refresh"),),
+        layers=("landing",),
+    )
+
+
+@pytest.fixture
+def demo_spec():
+    return _demo_spec()
+
+
+@pytest.fixture
+def demo_config_root(tmp_path: Path) -> str:
+    """A complete conf/ tree for one synthetic source type, with every layer represented."""
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "defaults").mkdir()
+    (tmp_path / "environments").mkdir()
+
+    # Layer 1: every source of every type. failure_mode is set here AND in the per-type
+    # file, so the tests can prove which wins.
+    (tmp_path / "defaults.yaml").write_text(
+        textwrap.dedent(
+            """
+            defaults:
+              audit_table: "{catalog}.audit.ingest_audit"
+              failure_mode: QUARANTINE
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    # Layer 1b: every source of THIS type.
+    (tmp_path / "defaults" / "demo.yaml").write_text(
+        textwrap.dedent(
+            """
+            defaults:
+              landing_table: "{catalog}.landing.{source_key}"
+              partition_by: [ingest_date]
+              trigger: availableNow
+              batch_limit: 1000
+              failure_mode: FAILFAST
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    (tmp_path / "environments" / "dev.yaml").write_text(
+        textwrap.dedent(
+            """
+            vars:
+              catalog: cat_dev
+            defaults:
+              audit_table: "{catalog}.audit.dev_audit"
+            defaults_by_type:
+              demo:
+                batch_limit: 10
+            widgets:
+              main:
+                endpoint: "dev-endpoint:1521"
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    (tmp_path / "environments" / "prod.yaml").write_text(
+        textwrap.dedent(
+            """
+            vars:
+              catalog: cat_prod
+            defaults: {}
+            defaults_by_type: {}
+            widgets:
+              main:
+                endpoint: "prod-endpoint:1521"
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    # A register: what exists, plus the secret KEY names. Never a secret value.
+    (tmp_path / "widgets.yaml").write_text(
+        textwrap.dedent(
+            """
+            widgets:
+              main:
+                auth_mode: basic
+                password_key: widget-pw
+                wallet_path: "/Volumes/{catalog}/certs/wallet"
+              spare:
+                auth_mode: none
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    (tmp_path / "sources" / "demo_source.yaml").write_text(
+        textwrap.dedent(
+            """
+            source_type: demo
+
+            source:
+              domain: demo
+              object_name: WIDGET_EVENTS
+              widget: main
             """
         ).strip(),
         encoding="utf-8",
