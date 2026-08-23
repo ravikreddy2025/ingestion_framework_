@@ -133,7 +133,7 @@ TBLPROPERTIES (
 );
 
 -- -------------------------------------------------------------------------------------
--- QUARANTINE - per topic, only used when on_deser_error = quarantine.
+-- QUARANTINE - per topic, only used when failure_mode = QUARANTINE.
 -- Template; repeat per topic with the name from the topic YAML.
 -- Grants follow the data's sensitivity: a quarantined record still holds the payload.
 -- -------------------------------------------------------------------------------------
