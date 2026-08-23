@@ -306,3 +306,34 @@ code must change -- see "If it fails").
 - **If it fails:** Fix the specific YAML/CLI error `validate` reports -- do not guess at a fix
   and move on without re-running it.
 - **Status:** OPEN
+
+### VB-14 -- Does the target workspace actually run DBR 16.4 LTS, and is its Python 3.12?
+- **Stage / file:** `pyproject.toml` (`requires-python`, `[tool.mypy] python_version`),
+  `resources/*.yml` (`spark_version`), and the local `.venv`. Added in Stage 1.
+- **Why it matters:** `requires-python = ">=3.12,<3.13"` is pinned to the runtime rather than
+  to whatever is installed locally, so that the wheel we build is a wheel the cluster can
+  import. If the workspace is on a different DBR, the pin is wrong in one of two ways: too
+  narrow, and `pip install` of the wheel fails on the cluster outright (loud, fixed in a
+  minute); or matching a runtime nobody is actually using, in which case the local
+  environment quietly stops representing the cluster and every Spark-marked test written from
+  Stage 3 onward validates against the wrong Spark. The Spark version rides along with it --
+  the local `.venv` pins `pyspark==3.5.2` for the same reason. Note also that
+  `resources/job_ingest_primary.yml` still carries a commented `spark_version:
+  "15.4.x-scala2.12"` from before this decision; whichever answer is right, those two files
+  must agree.
+- **How to check:** In the target workspace, on the cluster the jobs will actually use:
+  ```python
+  import sys, pyspark
+  print(sys.version)            # expect 3.12.x
+  print(pyspark.__version__)    # expect 3.5.2
+  print(spark.conf.get("spark.databricks.clusterUsageTags.sparkVersion"))
+  ```
+  Or, without a cluster: `databricks clusters spark-versions` and the DBR release notes for
+  whichever version the job clusters are pinned to.
+- **Expected:** Python 3.12.x and Spark 3.5.2, i.e. DBR 16.4 LTS.
+- **If it fails:** Set `requires-python` and `[tool.mypy] python_version` in `pyproject.toml`
+  to the runtime's actual minor version, set `spark_version` in `resources/*.yml` to match,
+  rebuild the local `.venv` on that Python, and reinstall `pyspark` at the runtime's Spark
+  version. All four must move together -- changing one alone is what produces a local
+  environment that disagrees with the cluster without saying so.
+- **Status:** OPEN

@@ -1,10 +1,9 @@
 # Stage 1 Report -- Framework spine and config model
 
-Branch `stage-1-spine`, branched from `stage-0-orientation` rather than `main`. `main` is
-still at `183d7d5` and does not carry Stage 0's `docs/build_log/` or
-`docs/VERIFICATION_BACKLOG.md`, which CORE section 2 requires this stage to read. Stacking
-on the open Stage 0 PR was the only way to keep them; if Stage 0 merges first this branch
-rebases cleanly onto `main`.
+Branch `stage-1-spine`, cut from `stage-0-orientation` rather than `main`, because at the
+time `main` did not yet carry Stage 0's `docs/build_log/` or `docs/VERIFICATION_BACKLOG.md`,
+which CORE section 2 requires this stage to read. Stage 0 (PR #1) has since merged, so these
+commits sit directly on `main` and the PR targets it.
 
 ---
 
@@ -331,4 +330,32 @@ can follow; a base method called from nowhere visible is not.
 **Test count:** 189 passed, 34 deselected before -> **263 passed, 34 deselected** after
 (`pytest -m "not spark" -q`). 74 tests added, none removed.
 
-**New VB entries this stage:** none.
+**New VB entries this stage:** VB-14 (see the addendum below).
+
+---
+
+## Addendum -- local environment, added after the PR was opened
+
+Stage 0 ran the gate against a bare system-wide Python 3.14 with `pyspark 4.2.0`, because
+that was the only interpreter on the machine. Neither matched the runtime. That is now
+fixed, and the fix is recorded here because it changes what "the gate passed" means:
+
+- **The runtime target was settled by the human: DBR 16.4 LTS -- Python 3.12, Spark 3.5.2.**
+  `requires-python` is `>=3.12,<3.13` and `[tool.mypy] python_version` follows it. The
+  pin tracks the runtime, not the local machine, so that the wheel we build is one the
+  cluster can import.
+- **A project `.venv` now exists on Python 3.12.10 with `pyspark==3.5.2`**, matching the
+  runtime's Spark rather than whatever `pip install pyspark` resolves to. `.venv/` was
+  already gitignored. There was never a venv inside the repository before this -- the 3.14
+  was a system-wide install and was left alone.
+- **The gate was re-run inside that venv** and is identical: `ruff check` clean,
+  `ruff format --check` at the same 22-file baseline, `pytest -m "not spark" -q` ->
+  263 passed, 34 deselected.
+- **VB-14** records the assumption, because the DBR version is not checkable from here.
+  `resources/job_ingest_primary.yml` still carries a commented `spark_version:
+  "15.4.x-scala2.12"` predating this decision; it is a Stage 6 file, so it is flagged
+  rather than edited here, and VB-14 names it.
+
+This does not change any Stage 1 code, test or config decision. It changes only which
+interpreter and which Spark the fast suite runs against - which matters from Stage 3, where
+Spark-marked tests first appear.
