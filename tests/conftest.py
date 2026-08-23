@@ -409,6 +409,7 @@ def config_root(tmp_path: Path) -> str:
 #   * it keeps these tests stable while Stages 3-5 fill the real specs in.
 # --------------------------------------------------------------------------------------
 
+
 def _demo_spec():
     """Imported lazily so conftest itself stays importable with nothing installed."""
     from kafka_ingest.framework.contracts import SourceSpec
