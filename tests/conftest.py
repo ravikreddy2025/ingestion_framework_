@@ -325,7 +325,8 @@ def config_root(tmp_path: Path) -> str:
         textwrap.dedent(
             """
             defaults:
-              audit_table: "{catalog}.audit.stream_audit"
+              audit_table: "{catalog}.audit.ingest_audit"
+              control_table: "{ops_catalog}.ingestion.ingest_control"
             """
         ).strip(),
         encoding="utf-8",
@@ -361,6 +362,7 @@ def config_root(tmp_path: Path) -> str:
             """
             vars:
               catalog: cat_dev
+              ops_catalog: ops_dev
             defaults: {}
             defaults_by_type:
               kafka:
@@ -384,6 +386,7 @@ def config_root(tmp_path: Path) -> str:
             """
             vars:
               catalog: cat_prod
+              ops_catalog: ops_prod
             defaults: {}
             defaults_by_type: {}
             clusters:

@@ -33,7 +33,8 @@ resources:
       name: "[${bundle.target}] Kafka Ingest - Primary"
       description: >-
         Daily Kafka -> landing/curated ingestion. Trigger.AvailableNow, one run per day.
-        Behaviour per topic is controlled by ${var.control_table}; structure by conf/ in Git.
+        Behaviour per topic is controlled by the control table named in conf/defaults.yaml;
+        structure by conf/ in Git.
 
       schedule:
         # 02:15 UTC daily. Trigger.AvailableNow drains whatever has accumulated and stops.
@@ -47,8 +48,6 @@ resources:
       parameters:
         - name: config_root
           default: ${workspace.file_path}/conf
-        - name: control_table
-          default: ${var.control_table}
         - name: environment
           # Selects conf/environments/<env>.yaml. Defaulted from the bundle target, so
           # dev/preprod/prod is declared once in databricks.yml and never typed again.
@@ -91,7 +90,6 @@ resources:
             entry_point: ingest-primary
             named_parameters:
               config-root: "{{job.parameters.config_root}}"
-              control-table: "{{job.parameters.control_table}}"
               environment: "{{job.parameters.environment}}"
               topic-key: vector_patient_events
               job-run-id: "{{job.run_id}}"
@@ -107,7 +105,6 @@ resources:
             entry_point: ingest-primary
             named_parameters:
               config-root: "{{job.parameters.config_root}}"
-              control-table: "{{job.parameters.control_table}}"
               environment: "{{job.parameters.environment}}"
               topic-key: rcm_claim_status
               job-run-id: "{{job.run_id}}"
@@ -123,7 +120,6 @@ resources:
             entry_point: ingest-primary
             named_parameters:
               config-root: "{{job.parameters.config_root}}"
-              control-table: "{{job.parameters.control_table}}"
               environment: "{{job.parameters.environment}}"
               topic-key: antifraud_txn_alerts
               job-run-id: "{{job.run_id}}"

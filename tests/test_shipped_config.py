@@ -52,6 +52,13 @@ def _resolve(topic_key, environment="prod"):
                                 "ops.ingestion.control", environment)
 
 
+@pytest.fixture
+def topic_key_any():
+    """Any one shipped source: these settings come from conf/defaults.yaml, so every source
+    resolves the same value and testing all of them would assert the same thing N times."""
+    return TOPIC_KEYS[0]
+
+
 def test_conf_directory_is_present_and_populated():
     assert CONF_ROOT.is_dir(), f"conf/ not found at {CONF_ROOT}"
     assert (CONF_ROOT / "defaults.yaml").is_file()
@@ -268,3 +275,39 @@ def test_vector_patient_events_environment_override_resolves_as_documented():
     assert _resolve("vector_patient_events", "dev").max_offsets_per_trigger == 100000
     assert _resolve("vector_patient_events", "preprod").max_offsets_per_trigger == 2000000
     assert _resolve("vector_patient_events", "prod").max_offsets_per_trigger == 5000000
+
+
+# --------------------------------------------------------------------------------------
+# The framework's own three tables
+#
+# audit, state and control are named ONCE, in conf/defaults.yaml, from vars.catalog and
+# vars.ops_catalog. They used to be named twice - once there and once as a bundle variable
+# passed in as a job parameter - and the copy was still pointing at a table that had been
+# renamed. These two tests are what stops that coming back.
+# --------------------------------------------------------------------------------------
+
+FRAMEWORK_TABLES = ("audit_table", "state_table", "control_table")
+
+
+@pytest.mark.parametrize("environment", ENVIRONMENTS)
+@pytest.mark.parametrize("setting", FRAMEWORK_TABLES)
+def test_the_framework_tables_resolve_to_legal_names(topic_key_any, environment, setting):
+    """Resolved through the real conf/, in every environment. A placeholder that does not
+    resolve, or a two-part name, fails here rather than on a cluster."""
+    from kafka_ingest.framework.tables import validate_name
+
+    settings = load_structural(str(CONF_ROOT), topic_key_any, environment)
+    validate_name(settings[setting], f"conf/defaults.yaml {setting} [{environment}]")
+
+
+def test_the_bundle_does_not_also_name_the_control_table():
+    """One name in one place. A bundle variable holding a table name the code derives is a
+    variable that drifts - and the one this replaced was pointing at a table Stage 2
+    renamed, which nothing would have caught."""
+    bundle = _bundle()
+    declared = set(bundle["variables"])
+    for target in bundle["targets"].values():
+        declared |= set(target.get("variables") or {})
+    assert "control_table" not in declared, (
+        "databricks.yml declares control_table again - it is named in conf/defaults.yaml, "
+        "and two names for one table is how the two stop agreeing")

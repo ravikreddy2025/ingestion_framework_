@@ -719,13 +719,14 @@ OPERATIONAL_RUN_FIELDS = {
 }
 
 
-def load_operational(spark, control_table: str, topic_key: str) -> Dict[str, Any]:
+def load_operational(spark, control_table: Optional[str], topic_key: str) -> Dict[str, Any]:
     """Read the single control row for this topic, if one exists.
 
     Returns {} when the table has no row for the topic - see module docstring for why
-    that is a valid, non-error state.
+    that is a valid, non-error state. Also returns {} when no control table is configured
+    at all, which is the same statement one layer up: nobody has overridden anything.
     """
-    if not spark.catalog.tableExists(control_table):
+    if not control_table or not spark.catalog.tableExists(control_table):
         # A fresh environment where the support table has not been created yet still runs.
         return {}
     # topic_key is validated against a strict charset before interpolation - it is a
@@ -756,7 +757,7 @@ def resolve_topic_config(
     spark,
     config_root: str,
     topic_key: str,
-    control_table: str,
+    control_table: Optional[str],
     environment: str,
     run_type: str = RUN_TYPE_PRIMARY,
     overrides: Optional[Dict[str, Any]] = None,
@@ -770,10 +771,16 @@ def resolve_topic_config(
     They win over the control table so an urgent one-off replay does not require an UPDATE
     statement first - but the control table remains the durable place to park a setting
     that should persist across runs.
+
+    `control_table` may be None, which is the normal case: the name comes from
+    conf/defaults.yaml along with the audit and state tables.
     """
     overrides = {k: v for k, v in (overrides or {}).items() if v not in (None, "")}
     structural = load_structural(config_root, topic_key, environment)
-    operational = load_operational(spark, control_table, topic_key)
+    # The control table is named ONCE, in conf/defaults.yaml, like the audit and state
+    # tables. An explicit argument stays available to point one run at a different table,
+    # but nothing has to pass one, so no job definition duplicates the name.
+    operational = load_operational(spark, control_table or structural.get("control_table"), topic_key)
 
     cluster: KafkaClusterProfile = structural.pop("_cluster_profile")
     registry: SchemaRegistryProfile = structural.pop("_registry_profile")

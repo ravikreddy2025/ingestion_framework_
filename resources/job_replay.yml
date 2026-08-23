@@ -43,8 +43,6 @@ resources:
           default: ""
         - name: config_root
           default: ${workspace.file_path}/conf
-        - name: control_table
-          default: ${var.control_table}
         - name: environment
           # Selects conf/environments/<env>.yaml. Defaulted from the bundle target, so the
           # environment is never typed twice and a replay cannot be aimed at the wrong one.
@@ -69,7 +67,6 @@ resources:
             entry_point: replay-kafka
             named_parameters:
               config-root: "{{job.parameters.config_root}}"
-              control-table: "{{job.parameters.control_table}}"
               environment: "{{job.parameters.environment}}"
               topic-key: "{{job.parameters.topic_key}}"
               rerun-id: "{{job.parameters.rerun_id}}"
@@ -102,8 +99,6 @@ resources:
           default: ""
         - name: config_root
           default: ${workspace.file_path}/conf
-        - name: control_table
-          default: ${var.control_table}
         - name: environment
           # Selects conf/environments/<env>.yaml. Defaulted from the bundle target, so the
           # environment is never typed twice and a replay cannot be aimed at the wrong one.
@@ -126,7 +121,6 @@ resources:
             entry_point: replay-curated
             named_parameters:
               config-root: "{{job.parameters.config_root}}"
-              control-table: "{{job.parameters.control_table}}"
               environment: "{{job.parameters.environment}}"
               topic-key: "{{job.parameters.topic_key}}"
               rerun-id: "{{job.parameters.rerun_id}}"

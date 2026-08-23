@@ -329,6 +329,7 @@ def test_environment_cannot_invent_a_cluster_profile(config_root, tmp_path):
             """
             vars:
               catalog: cat_typo
+              ops_catalog: ops_typo
             defaults: {}
             defaults_by_type: {}
             clusters:
@@ -531,3 +532,24 @@ def test_primary_run_carries_no_replay_metadata(config_root):
     assert cfg.run.run_type == RUN_TYPE_PRIMARY
     assert cfg.run.rerun_id is None
     assert cfg.group_id_prefix == "dbx-demo"
+
+
+def test_the_control_table_is_read_from_configuration_when_no_argument_is_given(config_root):
+    """No job definition passes a control-table name any more: it is named once, in
+    conf/defaults.yaml, alongside the audit and state tables. If this fallback broke, every
+    run would silently read no operational overrides at all - an emergency stop set in the
+    control table would simply not take effect, and nothing would say so."""
+    spark = FakeSpark(
+        existing_tables={"ops_prod.ingestion.ingest_control"},
+        control_rows=[{"topic_key": "demo_topic", "enabled": False}],
+    )
+    cfg = resolve_topic_config(spark, config_root, "demo_topic", None, "prod")
+    assert cfg.control_table == "ops_prod.ingestion.ingest_control"
+    assert cfg.enabled is False
+
+
+def test_an_explicit_control_table_argument_still_wins(config_root):
+    """Kept so one run can be pointed at a different table during an incident."""
+    spark = FakeSpark(existing_tables={"other.ingestion.control"}, control_rows=[])
+    cfg = resolve_topic_config(spark, config_root, "demo_topic", "other.ingestion.control", "prod")
+    assert cfg.enabled is True

@@ -44,9 +44,11 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--control-table",
-        required=True,
-        help="3-tier name of the operational control table, "
-             "e.g. ops_prod.ingestion.ingestion_topic_control",
+        default=None,
+        help="OPTIONAL override of the operational control table. Normally omitted: the "
+             "table is named once, in conf/defaults.yaml, as {ops_catalog}.ingestion."
+             "ingest_control, and the loader reads it from there. Pass this only to point "
+             "one run at a different table.",
     )
     parser.add_argument("--job-run-id", default=None, help="Databricks job run id, for audit correlation")
 
