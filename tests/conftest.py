@@ -7,10 +7,47 @@ pytest.importorskip("pyspark") at module level.
 
 from __future__ import annotations
 
+import re
 import textwrap
 from pathlib import Path
 
 import pytest
+
+# --------------------------------------------------------------------------------------
+# DDL readers - shared by every test that asserts a table's columns.
+#
+# Three definitions of every framework table exist and must agree: the DDL string that
+# creates it, the StructType that builds the DataFrame written into it, and the CREATE
+# TABLE in sql/ that provisions it ahead of the first run. These two helpers are how that
+# agreement is asserted rather than left to a comment saying "keep these in step".
+# --------------------------------------------------------------------------------------
+
+
+def ddl_column_names(ddl: str) -> list:
+    """Pull column names out of a DDL column list, ignoring types, comments and nesting."""
+    names, depth = [], 0
+    for raw_line in ddl.strip().splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        # Skip continuation lines inside a nested type such as ARRAY<STRUCT<...>>.
+        if depth == 0:
+            match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+\S", line)
+            if match:
+                names.append(match.group(1))
+        depth += line.count("<") - line.count(">")
+    return names
+
+
+def sql_table_columns(sql: str, table_suffix: str) -> list:
+    """Column names, in order, from the CREATE TABLE whose name ends with `table_suffix`."""
+    pattern = re.compile(
+        r"CREATE TABLE IF NOT EXISTS\s+\S*" + re.escape(table_suffix) + r"\s*\((.*?)\n\)",
+        re.DOTALL | re.IGNORECASE,
+    )
+    match = pattern.search(sql)
+    assert match, f"no CREATE TABLE ending in '{table_suffix}' found"
+    return ddl_column_names(match.group(1))
 
 
 class FakeSecrets:
@@ -57,15 +94,33 @@ class FakeConf:
 
 
 class FakeSpark:
-    """Minimal SparkSession stand-in for config resolution tests."""
+    """Minimal SparkSession stand-in for config, control, state and table-DDL tests.
 
-    def __init__(self, control_rows=None, existing_tables=(), conf=None):
+    Records rather than executes: `sql_statements` and `created_frames` are what the
+    framework's DDL and state writes are asserted against. Nothing here simulates Spark
+    semantics - the assertions are about what the framework HANDS to Spark, which is
+    exactly the part that has to be right.
+    """
+
+    def __init__(self, control_rows=None, existing_tables=(), conf=None, rows_by_table=None):
         self.catalog = FakeCatalog(existing_tables)
         self._control_rows = control_rows or []
+        self._rows_by_table = dict(rows_by_table or {})
         self.conf = FakeConf(conf)
+        self.sql_statements = []
+        self.created_frames = []
 
     def table(self, name):
-        return FakeDataFrame(self._control_rows)
+        return FakeDataFrame(self._rows_by_table.get(name, self._control_rows))
+
+    def sql(self, statement):
+        self.sql_statements.append(statement)
+        return FakeDataFrame([])
+
+    def createDataFrame(self, data, schema=None):  # noqa: N802 - mirrors the Spark API
+        rows = list(data)
+        self.created_frames.append((rows, schema))
+        return RecordingDataFrame(rows)
 
 
 class FakeRow:
@@ -79,9 +134,15 @@ class FakeRow:
 class FakeDataFrame:
     def __init__(self, rows):
         self._rows = rows
+        self.filters = []
 
     def where(self, _condition):
         return self
+
+    def filter(self, condition):
+        """Records the predicate instead of applying it - see FakeSpark's docstring."""
+        self.filters.append(condition)
+        return FakeDataFrame(self._rows)
 
     def limit(self, _n):
         return self
@@ -460,6 +521,7 @@ def demo_config_root(tmp_path: Path) -> str:
             """
             defaults:
               audit_table: "{catalog}.audit.ingest_audit"
+              state_table: "{ops_catalog}.ingestion.ingest_state"
               failure_mode: QUARANTINE
             """
         ).strip(),
@@ -486,6 +548,7 @@ def demo_config_root(tmp_path: Path) -> str:
             """
             vars:
               catalog: cat_dev
+              ops_catalog: ops_dev
             defaults:
               audit_table: "{catalog}.audit.dev_audit"
             defaults_by_type:
@@ -504,6 +567,7 @@ def demo_config_root(tmp_path: Path) -> str:
             """
             vars:
               catalog: cat_prod
+              ops_catalog: ops_prod
             defaults: {}
             defaults_by_type: {}
             widgets:

@@ -6,20 +6,25 @@ Three kinds of drift are cheap to introduce and expensive to discover in product
   * a writer's projection stops matching its table DDL
 Each is asserted here rather than left to a comment saying "keep these in step".
 
-`ddl_column_names` also serves test_curated_writer.py - it is the shared way to read a
-column list out of a DDL string.
+`ddl_column_names` moved to conftest.py in Stage 2 and is re-exported here, because
+test_curated_writer.py imports it from this module. It is the shared way to read a column
+list out of a DDL string.
+
+THE SHARED AUDIT TABLE IS NO LONGER TESTED HERE. Stage 2 moved it to framework/audit.py,
+where one table serves every source type; its three-way agreement test lives in
+tests/test_framework_audit.py. What remains in this module is the LEGACY Kafka audit
+writer, which Stage 3 removes along with kafka_ingest/audit.py itself.
 """
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
 
 pytest.importorskip("pyspark", reason="audit/tables import pyspark")
 
-from conftest import FakeSpark
+from conftest import FakeSpark, ddl_column_names, sql_table_columns
 from kafka_ingest.audit import (
     AUDIT_SCHEMA,
     LAYER_CURATED,
@@ -35,22 +40,6 @@ from kafka_ingest.tables import (
     LANDING_DDL_COLUMNS,
     QUARANTINE_DDL_COLUMNS,
 )
-
-
-def ddl_column_names(ddl: str) -> list:
-    """Pull column names out of a DDL column list, ignoring types, comments and nesting."""
-    names, depth = [], 0
-    for raw_line in ddl.strip().splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        # Skip continuation lines inside a nested type such as ARRAY<STRUCT<...>>.
-        if depth == 0:
-            match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s+\S", line)
-            if match:
-                names.append(match.group(1))
-        depth += line.count("<") - line.count(">")
-    return names
 
 
 @pytest.fixture
@@ -204,17 +193,6 @@ def test_audit_row_round_trips_through_the_declared_schema(spark, cfg):
 SQL_PATH = Path(__file__).resolve().parent.parent / "sql" / "02_layer_tables.sql"
 
 
-def sql_table_columns(sql: str, table_suffix: str) -> list:
-    """Column names, in order, from the CREATE TABLE whose name ends with `table_suffix`."""
-    pattern = re.compile(
-        r"CREATE TABLE IF NOT EXISTS\s+\S*" + re.escape(table_suffix) + r"\s*\((.*?)\n\)",
-        re.DOTALL | re.IGNORECASE,
-    )
-    match = pattern.search(sql)
-    assert match, f"no CREATE TABLE ending in '{table_suffix}' found in {SQL_PATH.name}"
-    return ddl_column_names(match.group(1))
-
-
 @pytest.fixture(scope="module")
 def layer_sql() -> str:
     assert SQL_PATH.is_file(), f"{SQL_PATH} is missing"
@@ -223,9 +201,8 @@ def layer_sql() -> str:
 
 @pytest.mark.parametrize("table_suffix, ddl_constant, label", [
     ("landing.{topic_table}", LANDING_DDL_COLUMNS, "landing"),
-    ("audit.stream_audit", AUDIT_DDL_COLUMNS, "audit"),
     ("_quarantine", QUARANTINE_DDL_COLUMNS, "quarantine"),
-], ids=["landing", "audit", "quarantine"])
+], ids=["landing", "quarantine"])
 def test_provisioning_sql_matches_the_python_ddl(layer_sql, table_suffix, ddl_constant, label):
     """A column present in one and not the other fails on the first append, on a cluster."""
     assert sql_table_columns(layer_sql, table_suffix) == ddl_column_names(ddl_constant), (

@@ -214,10 +214,10 @@ def _bundle() -> dict:
     return yaml.safe_load(BUNDLE_PATH.read_text(encoding="utf-8"))
 
 
-def _declared_data_catalog(bundle: dict, target: str) -> str:
-    """The bundle variable's value for one target: the per-target override, else the default."""
-    override = (bundle["targets"][target].get("variables") or {}).get("data_catalog")
-    return override or bundle["variables"]["data_catalog"]["default"]
+def _declared_variable(bundle: dict, target: str, name: str) -> str:
+    """A bundle variable's value for one target: the per-target override, else the default."""
+    override = (bundle["targets"][target].get("variables") or {}).get(name)
+    return override or bundle["variables"][name]["default"]
 
 
 @pytest.mark.parametrize("environment", ENVIRONMENTS)
@@ -230,9 +230,23 @@ def test_bundle_data_catalog_matches_the_environment_file(environment):
     from kafka_ingest.config import _read_yaml
 
     conf_catalog = _read_yaml(str(CONF_ROOT / "environments" / f"{environment}.yaml"))["vars"]["catalog"]
-    assert _declared_data_catalog(bundle, environment) == conf_catalog, (
+    assert _declared_variable(bundle, environment, "data_catalog") == conf_catalog, (
         f"{environment}: databricks.yml data_catalog and conf/environments/{environment}.yaml "
         f"vars.catalog disagree. The maintenance job would run against the wrong catalog.")
+
+
+@pytest.mark.parametrize("environment", ENVIRONMENTS)
+def test_bundle_ops_catalog_matches_the_environment_file(environment):
+    """Same duplication, same risk, one layer down: `vars.ops_catalog` names the catalog
+    holding the control and state tables, and databricks.yml declares it too because
+    sql/01_operational_config.sql is rendered from the bundle. A mismatch points the job at
+    a control table nobody edits and a state table nobody can see."""
+    from kafka_ingest.config import _read_yaml
+
+    conf_ops = _read_yaml(str(CONF_ROOT / "environments" / f"{environment}.yaml"))["vars"]["ops_catalog"]
+    assert _declared_variable(_bundle(), environment, "ops_catalog") == conf_ops, (
+        f"{environment}: databricks.yml ops_catalog and conf/environments/{environment}.yaml "
+        f"vars.ops_catalog disagree.")
 
 
 def test_every_bundle_target_has_an_environment_file():
