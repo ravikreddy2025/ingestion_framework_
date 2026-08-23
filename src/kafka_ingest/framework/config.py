@@ -30,7 +30,9 @@ source in dev and rejected there as an unknown key.
 {placeholder} tokens in layers 1-3 resolve from the environment's `vars:`, plus
 {source_key} and {domain} for source settings. Register values get vars ONLY - a profile
 is shared by many sources, so substituting {source_key} into a cert path would silently
-produce a per-source path. An unresolved placeholder is a hard error.
+produce a per-source path. An unresolved placeholder is a hard error, with ONE declared
+exception: the tokens a source type lists in SOURCE_SPEC.target_tokens are left for the
+source itself to fill, because only it knows them. See framework/tables.py.
 
 VALIDATION IS DATA-DRIVEN. There is no `if source_type == ...` in this module, and there
 must never be one. Everything comes from the source's SOURCE_SPEC (framework/contracts.py):
@@ -212,29 +214,39 @@ def read_source_type(config_root: str, source_key: str) -> str:
 # --------------------------------------------------------------------------------------
 
 
-def _substitute(value: Any, scope: Mapping[str, Any], where: str) -> Any:
+def _substitute(value: Any, scope: Mapping[str, Any], where: str, deferred: frozenset[str] = frozenset()) -> Any:
     """Resolve {placeholder} tokens in strings, recursing into lists and dicts.
 
     An unresolved placeholder is a hard error naming the setting and the offending token.
     Letting it through would produce a table literally called `{catalog}.landing...`, which
     fails much later and much less clearly.
+
+    `deferred` is the exception, and it is a short, declared list: a source type's
+    SOURCE_SPEC.target_tokens names the placeholders only the SOURCE can fill, because they
+    come from data the configuration does not have - a Kafka topic name, a database table
+    name. Those are passed through untouched for framework/tables.py to fill at run time.
+    A token NOT in that list is still an error, which is what keeps a typo a startup
+    failure rather than a table with a brace in its name.
     """
     if isinstance(value, str):
 
         def _replace(match: re.Match) -> str:
             name = match.group(1)
+            if name in deferred:
+                return match.group(0)
             if name not in scope:
                 raise ConfigError(
                     f"{where}: '{value}' uses {{{name}}}, which is not defined. Available: "
-                    f"{sorted(scope)}. Add it under `vars:` in the environment file."
+                    f"{sorted(scope)}. Add it under `vars:` in the environment file, or - if "
+                    "only the source can supply it - to that source's SOURCE_SPEC.target_tokens."
                 )
             return str(scope[name])
 
         return _PLACEHOLDER.sub(_replace, value)
     if isinstance(value, list):
-        return [_substitute(item, scope, where) for item in value]
+        return [_substitute(item, scope, where, deferred) for item in value]
     if isinstance(value, dict):
-        return {k: _substitute(v, scope, where) for k, v in value.items()}
+        return {k: _substitute(v, scope, where, deferred) for k, v in value.items()}
     return value
 
 
@@ -314,12 +326,19 @@ def _load_registers(
 # --------------------------------------------------------------------------------------
 
 
-def load_structural(config_root: str, source_key: str, environment: str) -> dict[str, Any]:
+def load_structural(
+    config_root: str, source_key: str, environment: str, deferred: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     """Merge and substitute layers 1-3 for one source in one environment.
 
     Returns the merged settings. Spec-free on purpose: `resolve_config` validates, and
     keeping the merge separate means a caller that only wants to see what the YAML says
     (a notebook, a config dump) does not need a spec to get it.
+
+    `deferred` is that rule's one concession - a caller that HAS a spec passes
+    `spec.target_tokens` so a target pattern naming a source-derived value survives the
+    merge instead of failing on it. A caller with no spec passes nothing and gets the
+    strict behaviour, which is the right default for a config dump.
     """
     env_path = os.path.join(config_root, "environments", f"{environment}.yaml")
     if not os.path.exists(env_path):
@@ -361,7 +380,7 @@ def load_structural(config_root: str, source_key: str, environment: str) -> dict
         "source_key": source_key,
         "domain": merged.get("domain", ""),
     }
-    return _substitute(merged, scope, f"sources/{source_key}.yaml [{environment}]")
+    return _substitute(merged, scope, f"sources/{source_key}.yaml [{environment}]", deferred)
 
 
 def _source_environment_override(
@@ -552,7 +571,7 @@ def resolve_config(
         )
 
     origin = f"sources/{source_key}.yaml"
-    settings = load_structural(config_root, source_key, environment)
+    settings = load_structural(config_root, source_key, environment, spec.target_tokens)
     _validate_structural(spec, settings, origin)
 
     settings = apply_overrides(spec, settings, control or {}, "the control table")

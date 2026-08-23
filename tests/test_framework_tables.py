@@ -15,6 +15,9 @@ recording stand-in tests exactly the thing that matters.
 
 from __future__ import annotations
 
+import dataclasses
+from pathlib import Path
+
 import pytest
 
 from conftest import FakeSpark
@@ -176,3 +179,86 @@ def test_a_quote_in_a_property_is_rejected_rather_than_escaped():
 def test_a_quote_in_the_comment_is_rejected_too():
     with pytest.raises(ConfigError, match="single quote"):
         tables.ensure_table(FakeSpark(), "cat.a.b", "a INT", "don't")
+
+
+# --------------------------------------------------------------------------------------
+# Tokens only the source can fill
+#
+# A target pattern like `{catalog}.landing.{topic_table}` names one thing configuration
+# knows and one thing it cannot: the second comes from a Kafka topic name, or an Oracle
+# SCHEMA and TABLE. The source type declares those in SOURCE_SPEC.target_tokens, config.py
+# leaves them alone, and the source renders them at the top of its run.
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def deferred_spec(demo_spec):
+    """The demo source, with a target pattern only the source can finish."""
+    return dataclasses.replace(demo_spec, target_tokens=frozenset({"object_table"}))
+
+
+@pytest.fixture
+def deferred_config_root(demo_config_root):
+    layer_defaults = f"{demo_config_root}/defaults/demo.yaml"
+    with open(layer_defaults, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    with open(layer_defaults, "w", encoding="utf-8") as handle:
+        handle.write(text.replace("{catalog}.landing.{source_key}", "{catalog}.landing.{object_table}"))
+    return demo_config_root
+
+
+def test_a_declared_token_survives_configuration_load(deferred_config_root, deferred_spec):
+    """Without this the whole pattern is unusable: config.py's unresolved-placeholder error
+    would fire on a token that is not missing, only not known yet."""
+    cfg = resolve_config(deferred_config_root, "demo_source", "prod", deferred_spec)
+    assert cfg.get("landing_table") == "cat_prod.landing.{object_table}"
+    assert tables.is_deferred(cfg.get("landing_table"))
+
+
+def test_an_undeclared_token_is_still_a_hard_error(deferred_config_root, demo_spec):
+    """The declaration is what separates "the source fills this" from "somebody typo'd a
+    var name". Same file, same pattern, spec that does not declare it."""
+    with pytest.raises(ConfigError, match=r"uses \{object_table\}"):
+        resolve_config(deferred_config_root, "demo_source", "prod", demo_spec)
+
+
+def test_the_source_renders_and_the_result_is_validated(deferred_config_root, deferred_spec):
+    cfg = resolve_config(deferred_config_root, "demo_source", "prod", deferred_spec)
+    assert tables.target(cfg, "landing", {"object_table": "widget_events"}) == ("cat_prod.landing.widget_events")
+
+
+def test_a_token_the_source_forgot_to_supply_names_itself(deferred_config_root, deferred_spec):
+    cfg = resolve_config(deferred_config_root, "demo_source", "prod", deferred_spec)
+    with pytest.raises(ConfigError, match=r"uses \{object_table\}"):
+        tables.target(cfg, "landing", {})
+
+
+def test_a_rendered_name_that_is_illegal_in_unity_catalog_is_rejected(deferred_config_root, deferred_spec):
+    """The whole point of deferring: the token's value comes from the source system, where
+    `ORDER$` is a perfectly ordinary table name."""
+    cfg = resolve_config(deferred_config_root, "demo_source", "prod", deferred_spec)
+    with pytest.raises(ConfigError, match="not a legal"):
+        tables.target(cfg, "landing", {"object_table": "ORDER$"})
+
+
+def test_the_runner_skips_a_deferred_name_and_says_so(deferred_config_root, deferred_spec, caplog):
+    """It cannot validate a name it cannot yet know. Skipping silently would be the same
+    mistake as validating a string with a brace in it."""
+    cfg = resolve_config(deferred_config_root, "demo_source", "prod", deferred_spec)
+    with caplog.at_level("INFO"):
+        names = tables.validate_targets(cfg)
+    assert "landing" not in names
+    assert "audit_table" in names
+    assert "the source renders and validates it" in caplog.text
+
+
+def test_the_shipped_kafka_spec_declares_the_token_its_defaults_use():
+    """conf/defaults/kafka.yaml names all three targets `{catalog}.<layer>.{topic_table}`.
+    If the spec stopped declaring it, every Kafka source would fail to resolve."""
+    from kafka_ingest.sources.kafka import SOURCE_SPEC
+
+    conf = Path(__file__).resolve().parent.parent / "conf" / "defaults" / "kafka.yaml"
+    text = conf.read_text(encoding="utf-8")
+    for layer in SOURCE_SPEC.layers:
+        assert "{topic_table}" in text, f"{layer}_table no longer uses the declared token"
+    assert "topic_table" in SOURCE_SPEC.target_tokens

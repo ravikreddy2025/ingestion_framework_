@@ -23,4 +23,10 @@ SOURCE_SPEC = SourceSpec(
     # Kafka is the only source with all three layers: raw wire bytes land, the payload is
     # parsed into curated, and records that cannot be parsed go to quarantine.
     layers=("landing", "curated", "quarantine"),
+    # NOT a stub. conf/defaults/kafka.yaml already names all three targets
+    # `{catalog}.<layer>.{topic_table}`, and {topic_table} is the topic name with dots and
+    # hyphens turned into underscores - a value only this source can compute. Declaring it
+    # here is what lets that pattern survive configuration load; framework/tables.py
+    # renders it when Stage 3 supplies the token.
+    target_tokens=frozenset({"topic_table"}),
 )

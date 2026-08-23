@@ -162,7 +162,8 @@ def _read_control(
     it before they are merged again with the overrides applied. Two passes over a few small
     YAML files is the price of having exactly one mechanism - conf/ - for naming things.
     """
-    control_table = load_structural(config_root, source_key, environment).get("control_table")
+    structural = load_structural(config_root, source_key, environment, spec.target_tokens)
+    control_table = structural.get("control_table")
     if not control_table:
         return {}
     return control_module.read_control(spark, control_table, source_key, spec)

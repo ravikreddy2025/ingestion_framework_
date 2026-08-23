@@ -3,9 +3,9 @@
 Two jobs, and nothing else belongs here:
 
   NAMING   which table does this source write for this layer? The answer is always a
-           configured pattern, never a name built in code. `render()` fills a pattern's
-           {tokens} from values the caller supplies; `targets()` reads the resolved names
-           back out of the configuration by the one convention below.
+           configured pattern, never a name built in code. `target()` renders one and
+           validates the result; `targets()` does it for every layer the source type has;
+           `render()` is the substitution underneath both.
 
   CREATION `ensure_table()` - CREATE TABLE IF NOT EXISTS with the configured
            TBLPROPERTIES and exactly one physical layout clause.
@@ -17,12 +17,22 @@ A source's target table for layer L is the setting `<L>_table`. `landing` -> lan
 from the source's SOURCE_SPEC, so this module resolves targets for any source type without
 knowing one exists - and framework/config.py accepts those keys for the same reason.
 
-WHY NAMES ARE VALIDATED AT CONFIG LOAD
---------------------------------------
-`validate_name()` runs during run start-up, before anything connects, because the failure
-it catches is a name that is perfectly legal in the system being read and illegal in Unity
-Catalog - a table with a `$` or a `#` in it, or a two-part name. Discovering that at write
-time means discovering it after the read has already cost an hour.
+WHY NAMES ARE VALIDATED BEFORE ANYTHING CONNECTS
+------------------------------------------------
+`validate_name()` runs at run start-up because the failure it catches is a name that is
+perfectly legal in the system being read and illegal in Unity Catalog - a table with a `$`
+or a `#` in it, or a two-part name. Discovering that at write time means discovering it
+after the read has already cost an hour.
+
+There are two moments, not one, and the difference is who knows the name:
+
+  the runner        `validate_targets(cfg)`, for every name configuration fully resolved.
+  the source        `target(cfg, layer, tokens)`, at the top of run() and still before any
+                    read, for a name whose pattern carries a token only the source can
+                    fill - a Kafka topic turned into an identifier, a database SCHEMA and
+                    TABLE. The token survived configuration load because that source type
+                    DECLARED it in SOURCE_SPEC.target_tokens; anything undeclared already
+                    failed in config.py.
 
 WHAT IS NOT HERE
 ----------------
@@ -113,17 +123,39 @@ def validate_name(name: Any, where: str) -> str:
     return name
 
 
-def targets(cfg: Any) -> dict[str, str]:
+def is_deferred(name: Any) -> bool:
+    """Does this configured name still carry a token only the source can fill?
+
+    A `{token}` can only survive configuration load if the source type DECLARED it in
+    SOURCE_SPEC.target_tokens - config.py fails on any other one - so a brace here is
+    never a typo that slipped through. It means "the source has not rendered this yet".
+    """
+    return isinstance(name, str) and bool(_TOKEN.search(name))
+
+
+def target(cfg: Any, layer: str, tokens: Mapping[str, Any] | None = None) -> str:
+    """The final table name for one layer: render the pattern, then validate the result.
+
+    THIS is what a source calls, once, at the top of run() - before it reads anything - for
+    a target whose name it has to complete itself. `tokens` are the values it derived:
+    {"topic_table": "vector_patient_events_v1"}, {"source_table": "employees"}. A source
+    whose pattern has no tokens can call it with none and get the same validation.
+    """
+    setting = f"{layer}_table"
+    where = f"source '{cfg.source_key}' setting '{setting}'"
+    pattern = cfg.get(setting)
+    if pattern is None:
+        raise ConfigError(f"{where}: not set. Every layer a source type declares needs one.")
+    return validate_name(render(pattern, tokens or {}, where), where)
+
+
+def targets(cfg: Any, tokens: Mapping[str, Any] | None = None) -> dict[str, str]:
     """Layer -> validated table name, for every layer this source type has.
 
     `cfg` is a framework/config.py ResolvedConfig. The layers come from its spec, so this
     returns one entry per layer with no knowledge of which source type is running.
     """
-    resolved: dict[str, str] = {}
-    for layer in cfg.layers:
-        setting = f"{layer}_table"
-        resolved[layer] = validate_name(cfg.get(setting), f"source '{cfg.source_key}' setting '{setting}'")
-    return resolved
+    return {layer: target(cfg, layer, tokens) for layer in cfg.layers}
 
 
 # The framework's own tables. audit and state are REQUIRED of every configuration: a run
@@ -139,8 +171,25 @@ def validate_targets(cfg: Any) -> dict[str, str]:
 
     Called by the runner immediately after configuration resolves. Returns the names purely
     so a caller can log them; the value is the validation.
+
+    A layer whose pattern still carries a source-supplied token is SKIPPED here and
+    validated by `target()` when the source renders it, at the top of run() and still
+    before any read. That is the honest boundary: the framework cannot check a name it
+    cannot yet know, and pretending otherwise would mean either validating a string with a
+    brace in it or making the source hand its tokens to the runner - which would put a
+    source's own vocabulary into framework/.
     """
-    names = targets(cfg)
+    names = {}
+    for layer in cfg.layers:
+        pattern = cfg.get(f"{layer}_table")
+        if is_deferred(pattern):
+            LOG.info(
+                "Target for layer '%s' is '%s'; the source renders and validates it at the start of its run.",
+                layer,
+                pattern,
+            )
+            continue
+        names[layer] = target(cfg, layer)
     for setting in REQUIRED_FRAMEWORK_TABLES:
         names[setting] = validate_name(cfg.get(setting), f"source '{cfg.source_key}' setting '{setting}'")
     for setting in OPTIONAL_FRAMEWORK_TABLES:
