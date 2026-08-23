@@ -1,0 +1,25 @@
+# =====================================================================================
+# FILE DEFAULTS - layer 1b of 5. Applies to EVERY file source, in EVERY environment.
+#
+# Merged immediately after conf/defaults.yaml and before conf/environments/<env>.yaml.
+# Read only when a source file declares `source_type: file`, so nothing here is ever
+# applied to a Kafka or Oracle source.
+#
+# EMPTY UNTIL STAGE 5. Deliberately: a key written here before the file source reads it is
+# a key that silently does nothing, which is the single worst outcome this project can
+# produce. Stage 5 fills it in alongside sources/file/spec.py, and the two must agree - a
+# default for a key the spec does not list is rejected as an unknown key.
+#
+# What is expected to land here (from CORE section 11 - none of it is settled, and none of
+# it is written as config until the code that reads it exists):
+#   * the schemaLocation root - a checkpoint-like resource with its own lifecycle
+#   * the landing target-name pattern
+#   * rescued-data and file-metadata column behaviour, which varies by format - see VB-06
+#
+# PLACEHOLDERS
+#   {catalog}      and any other key under `vars:` in the environment file
+#   {source_key}   the source's config filename without .yaml
+#   {domain}       the source's `domain:` value
+# =====================================================================================
+
+defaults: {}

@@ -11,10 +11,14 @@
 vars:
   catalog: platform_preprod
 
-# Intentionally empty: preprod inherits production behaviour from conf/defaults.yaml.
-# If you find yourself adding tuning here, ask whether prod needs the same change -
-# otherwise preprod stops being a valid rehearsal of prod.
-topic_defaults: {}
+# Intentionally empty: preprod inherits production behaviour from conf/defaults.yaml and
+# conf/defaults/<source_type>.yaml. If you find yourself adding tuning here, ask whether
+# prod needs the same change - otherwise preprod stops being a valid rehearsal of prod.
+#
+# `defaults:` applies to every source type; `defaults_by_type: <type>:` applies to one.
+# See conf/environments/dev.yaml for a worked example of the second.
+defaults: {}
+defaults_by_type: {}
 
 clusters:
   confluent_cloud_shared:

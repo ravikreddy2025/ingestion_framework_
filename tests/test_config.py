@@ -150,7 +150,7 @@ def test_environment_overrides_defaults(config_root):
 
 def test_topic_overrides_environment_and_defaults(config_root):
     """Layer 3 beats layers 2 and 1."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  starting_offsets: earliest\n  on_deser_error: quarantine\n")
     dev = _resolve(config_root, "dev")
     assert dev.starting_offsets == "earliest"        # beats the dev environment override
@@ -161,7 +161,7 @@ def test_checkpoint_reset_id_is_rejected_in_topic_yaml(config_root):
     """Control-table-only: a value checked into Git would silently re-apply the bypass on
     every future deploy, long after the incident that justified it - see config.py's
     load_structural rejection and RUNBOOK_SUPPORT.md 5.4a."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  checkpoint_reset_id: INC12345\n")
     with pytest.raises(ConfigError, match="checkpoint_reset_id.*control-table-only"):
         _resolve(config_root, "dev")
@@ -170,14 +170,14 @@ def test_checkpoint_reset_id_is_rejected_in_topic_yaml(config_root):
 # --------------------------------------------------------------------------------------
 # Topic-level environment overrides: topic:.environments.<env>
 #
-# A fourth structural sub-layer, still inside topics/<key>.yaml, for the topic whose
+# A fourth structural sub-layer, still inside sources/<key>.yaml, for the topic whose
 # tuning genuinely needs to differ in exactly one environment. Precedence:
 #     defaults -> environment topic_defaults -> topic -> topic.environments.<env>
 # --------------------------------------------------------------------------------------
 
 
 def test_topic_environment_override_beats_the_bare_topic_value(config_root):
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write(
             "\n  max_offsets_per_trigger: 500000\n"
             "  environments:\n"
@@ -189,7 +189,7 @@ def test_topic_environment_override_beats_the_bare_topic_value(config_root):
 
 def test_topic_environment_override_applies_only_to_that_environment(config_root):
     """The whole point: dev must be untouched by a setting written for prod."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write(
             "\n  max_offsets_per_trigger: 500000\n"
             "  environments:\n"
@@ -203,7 +203,7 @@ def test_topic_environment_override_applies_only_to_that_environment(config_root
 def test_topic_environment_override_still_beats_the_environment_layer(config_root):
     """Confirms the full order for the environment that HAS an override: env-defaults is
     beaten by the bare topic value, which is in turn beaten by the topic+env value."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  environments:\n    dev:\n      max_offsets_per_trigger: 7\n")
     # dev/environments.yaml sets max_offsets_per_trigger: 100 at the environment layer.
     assert _resolve(config_root, "dev").max_offsets_per_trigger == 7
@@ -211,7 +211,7 @@ def test_topic_environment_override_still_beats_the_environment_layer(config_roo
 
 def test_topic_environment_override_can_use_placeholders(config_root):
     """{catalog} etc. must resolve inside an override exactly as it does everywhere else."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write(
             "\n  environments:\n"
             "    prod:\n"
@@ -223,21 +223,21 @@ def test_topic_environment_override_can_use_placeholders(config_root):
 def test_topic_environment_block_naming_an_unknown_environment_is_rejected(config_root):
     """A typo here would otherwise be silently unused - it only takes effect when THAT
     environment happens to be the one being resolved, so nothing would ever catch it."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  environments:\n    staging:\n      max_offsets_per_trigger: 1\n")
     with pytest.raises(ConfigError, match=r"environments block names \['staging'\]"):
         _resolve(config_root, "dev")
 
 
 def test_topic_environment_block_must_be_a_mapping(config_root):
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  environments: not-a-mapping\n")
     with pytest.raises(ConfigError, match="must be a mapping"):
         _resolve(config_root, "dev")
 
 
 def test_one_topic_environment_value_must_itself_be_a_mapping(config_root):
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  environments:\n    dev: not-a-mapping\n")
     with pytest.raises(ConfigError, match=r"environments\.dev must be a mapping"):
         _resolve(config_root, "dev")
@@ -246,7 +246,7 @@ def test_one_topic_environment_value_must_itself_be_a_mapping(config_root):
 def test_topic_environment_override_never_leaks_as_an_unknown_key(config_root):
     """The `environments:` key itself must not reach the "unknown top-level key" check -
     only the settings written INSIDE it should be validated as topic settings."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  environments:\n    prod:\n      on_deser_error: quarantine\n")
     cfg = _resolve(config_root, "dev")   # dev has no override; must still resolve cleanly
     assert cfg.on_deser_error == "fail"
@@ -255,7 +255,7 @@ def test_topic_environment_override_never_leaks_as_an_unknown_key(config_root):
 def test_an_unknown_key_inside_a_topic_environment_override_is_still_rejected(config_root):
     """The override is real topic config, so it goes through the same typo protection as
     every other topic setting - just one layer later."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  environments:\n    prod:\n      on_deser_eror: quarantine\n")
     with pytest.raises(ConfigError, match="unknown keys"):
         _resolve(config_root, "prod")
@@ -297,8 +297,8 @@ def test_environment_overrides_cluster_and_registry_endpoints(config_root):
 
 def test_placeholders_resolve_in_certificate_paths_too(config_root):
     """Cert paths contain {catalog}, so they must be substituted per environment."""
-    content = open(f"{config_root}/topics/demo_topic.yaml", encoding="utf-8").read()
-    open(f"{config_root}/topics/demo_topic.yaml", "w", encoding="utf-8").write(
+    content = open(f"{config_root}/sources/demo_topic.yaml", encoding="utf-8").read()
+    open(f"{config_root}/sources/demo_topic.yaml", "w", encoding="utf-8").write(
         content.replace("cluster: cc_shared", "cluster: onprem_mtls")
                .replace("registry: sr_shared", "registry: sr_mtls"))
     cfg = _resolve(config_root, "prod")
@@ -314,7 +314,7 @@ def test_unknown_environment_lists_the_valid_ones(config_root):
 def test_unresolved_placeholder_is_a_hard_error(config_root):
     """A {token} with no matching var would otherwise create a table literally named
     '{region}.landing...' and fail much later, much less clearly."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write('\n  curated_table: "{region}.curated.demo"\n')
     with pytest.raises(ConfigError, match=r"uses \{region\}, which is not defined"):
         _resolve(config_root)
@@ -329,7 +329,8 @@ def test_environment_cannot_invent_a_cluster_profile(config_root, tmp_path):
             """
             vars:
               catalog: cat_typo
-            topic_defaults: {}
+            defaults: {}
+            defaults_by_type: {}
             clusters:
               cc_shard:                      # typo: should be cc_shared
                 bootstrap_servers: "nope:9092"
@@ -349,7 +350,7 @@ def test_landing_partitioning_cannot_be_emptied(config_root):
     STRUCTURAL, so it is deliberately not in the set of fields the control table or a job
     parameter can change. Changing a table's physical layout needs a PR.
     """
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  landing_partition_by: []\n")
     with pytest.raises(ConfigError, match="must name at least one"):
         resolve_topic_config(FakeSpark(), config_root, "demo_topic", "ops.ingestion.control", "prod")
@@ -380,7 +381,7 @@ def test_a_topic_file_can_override_the_derived_name(config_root):
     """The escape hatch for a topic whose derived name collides or reads badly. It overrides
     the NAME only - catalog and schema still come from defaults.yaml, so a topic file still
     never contains a catalog."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  table_name: patient_events\n")
     cfg = _resolve(config_root)
     assert cfg.table_name == "patient_events"
@@ -391,7 +392,7 @@ def test_a_topic_file_can_override_the_derived_name(config_root):
 
 def test_an_override_applies_in_every_environment(config_root):
     """An override that only took effect in one environment would be worse than none."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  table_name: patient_events\n")
     assert _resolve(config_root, "dev").landing_table == "cat_dev.landing.patient_events"
     assert _resolve(config_root, "prod").landing_table == "cat_prod.landing.patient_events"
@@ -400,7 +401,7 @@ def test_an_override_applies_in_every_environment(config_root):
 def test_an_underivable_topic_name_fails_loudly(config_root):
     """A name that cannot become a legal identifier must say so, not produce a mangled table
     that fails much later with a confusing Delta error."""
-    path = f"{config_root}/topics/demo_topic.yaml"
+    path = f"{config_root}/sources/demo_topic.yaml"
     content = open(path, encoding="utf-8").read().replace("topic: demo.events.v1", "topic: 9demo.events")
     open(path, "w", encoding="utf-8").write(content)
     with pytest.raises(ConfigError, match="cannot derive a table name"):
@@ -452,14 +453,14 @@ def test_duplicate_control_rows_are_rejected(config_root):
 
 def test_unknown_yaml_key_is_rejected(config_root):
     """A typo in structural config is silent misconfiguration - fail at load."""
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  curated_tabel: cat.curated.typo\n")
     with pytest.raises(ConfigError, match="unknown keys"):
         resolve_topic_config(FakeSpark(), config_root, "demo_topic", "ops.ingestion.control", "prod")
 
 
 def test_unknown_cluster_reference_names_the_known_ones(config_root):
-    path = f"{config_root}/topics/demo_topic.yaml"
+    path = f"{config_root}/sources/demo_topic.yaml"
     content = open(path, encoding="utf-8").read().replace("cluster: cc_shared", "cluster: nope")
     open(path, "w", encoding="utf-8").write(content)
     with pytest.raises(ConfigError, match="known: \\['cc_shared', 'onprem_mtls'\\]"):
@@ -467,7 +468,7 @@ def test_unknown_cluster_reference_names_the_known_ones(config_root):
 
 
 def test_three_tier_table_names_are_enforced(config_root):
-    with open(f"{config_root}/topics/demo_topic.yaml", "a", encoding="utf-8") as handle:
+    with open(f"{config_root}/sources/demo_topic.yaml", "a", encoding="utf-8") as handle:
         handle.write("\n  curated_table: curated.demo\n")   # missing the catalog
     with pytest.raises(ConfigError, match="3-tier UC name"):
         _resolve(config_root)

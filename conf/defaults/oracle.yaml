@@ -1,0 +1,25 @@
+# =====================================================================================
+# ORACLE DEFAULTS - layer 1b of 5. Applies to EVERY Oracle source, in EVERY environment.
+#
+# Merged immediately after conf/defaults.yaml and before conf/environments/<env>.yaml.
+# Read only when a source file declares `source_type: oracle`, so nothing here is ever
+# applied to a Kafka or file source.
+#
+# EMPTY UNTIL STAGE 4. Deliberately: a key written here before the Oracle source reads it
+# is a key that silently does nothing, which is the single worst outcome this project can
+# produce. Stage 4 fills it in alongside sources/oracle/spec.py, and the two must agree -
+# a default for a key the spec does not list is rejected as an unknown key.
+#
+# What is expected to land here (from CORE section 11 - none of it is settled, and none of
+# it is written as config until the code that reads it exists):
+#   * fetchsize          Oracle JDBC defaults to TEN ROWS. Not setting it is a catastrophe.
+#   * the target-name pattern for landing, derived from source_schema / source_table
+#   * read parallelism   partitionColumn / numPartitions shape - see VB-01
+#
+# PLACEHOLDERS
+#   {catalog}      and any other key under `vars:` in the environment file
+#   {source_key}   the source's config filename without .yaml
+#   {domain}       the source's `domain:` value
+# =====================================================================================
+
+defaults: {}

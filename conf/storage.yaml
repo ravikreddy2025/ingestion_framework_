@@ -1,0 +1,25 @@
+# =====================================================================================
+# CLOUD STORAGE REGISTER
+#
+# THE REGISTER PATTERN - identical to conf/clusters.yaml and conf/registries.yaml, and
+# deliberately so. There is one mechanism for "what exists out there", not one per source
+# type:
+#
+#   * This file records WHAT EXISTS and what is TRUE IN EVERY ENVIRONMENT: the auth mode,
+#     the secret KEY NAMES. Never an account key, never a SAS token.
+#   * conf/environments/<env>.yaml overrides NAMED PROFILES in this file with what differs
+#     per environment: the storage account, the container, the secret SCOPE.
+#   * A profile named in an environment file that does not exist here is a hard error
+#     listing the profiles that do. That is what keeps this file the single answer to
+#     "which storage do we read from?" - a typo cannot quietly create a new profile.
+#   * A source file references a profile BY NAME. It never contains an account URL.
+#
+# The top-level key must match the filename (`storage.yaml` holds `storage:`). The
+# framework discovers registers by listing conf/*.yaml, so adding one is a new file and no
+# code change at all.
+#
+# EMPTY UNTIL STAGE 5. Profiles are added when sources/file/ can read them - a profile here
+# that nothing reads is indistinguishable from one that is wired up.
+# =====================================================================================
+
+storage: {}

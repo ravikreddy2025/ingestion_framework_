@@ -3,10 +3,12 @@
 FIVE LAYERS. Later always wins on a per-key basis; absent keys fall through.
 
   STRUCTURAL (YAML in Git, PR-reviewed, deployed by DAB)
-    1. conf/defaults.yaml            topic_defaults common to every topic, every environment
-    2. conf/environments/<env>.yaml  vars (e.g. catalog), per-environment topic_defaults,
-                                     and per-environment cluster/registry overrides
-    3. conf/topics/<key>.yaml        only what is unique to this topic
+    1. conf/defaults.yaml            defaults common to every source of every type
+       conf/defaults/kafka.yaml      defaults common to every Kafka source
+    2. conf/environments/<env>.yaml  vars (e.g. catalog), per-environment defaults
+                                     (`defaults:` and `defaults_by_type: kafka:`), and
+                                     per-environment cluster/registry overrides
+    3. conf/sources/<key>.yaml        only what is unique to this topic
          3a. topic:.environments.<env>  OPTIONAL, within the same file - what is unique to
                                      this topic IN ONE environment. Rare: most topics never
                                      need it. See below.
@@ -23,8 +25,8 @@ FIVE LAYERS. Later always wins on a per-key basis; absent keys fall through.
 and domain for topic settings. An unresolved placeholder is a hard error.
 
 FULL PRECEDENCE, LATER ALWAYS WINS:
-    defaults.yaml -> environments/<env>.yaml -> topics/<key>.yaml
-        -> topics/<key>.yaml: environments.<env> -> control table -> job parameters
+    defaults.yaml -> environments/<env>.yaml -> sources/<key>.yaml
+        -> sources/<key>.yaml: environments.<env> -> control table -> job parameters
 
 topic:.environments.<env> is still layer 3 - still Git, still PR-reviewed, still deployed by
 DAB. It exists for the topic that needs ONE setting to differ in ONE environment (a batch
@@ -48,7 +50,7 @@ TABLE NAMING - both layers are named from the Kafka topic, with dots and hyphens
 into underscores because neither is legal in an unquoted Unity Catalog identifier:
     vector.patient.events.v1  ->  <catalog>.landing.vector_patient_events_v1
                                   <catalog>.curated.vector_patient_events_v1
-The pattern lives in defaults.yaml as {catalog}.<layer>.{topic_table}. A topic that needs a
+The pattern lives in defaults/kafka.yaml as {catalog}.<layer>.{topic_table}. A topic that needs a
 different name sets `table_name:` in its own file; everything else derives. See
 table_name_for().
 
@@ -403,7 +405,7 @@ class TopicConfig:
 
     # Deliberate override of guard_against_checkpoint_reset (pipeline.py). Control-table
     # ONLY - see the rejection in load_structural() - because it is a one-way safety bypass,
-    # not a tunable, and a value checked into topics/<key>.yaml would apply on every future
+    # not a tunable, and a value checked into sources/<key>.yaml would apply on every future
     # deploy with no incident behind it. Setting it also changes the primary run's Delta
     # txnAppId (see _make_txn_app_id), which is what makes the restart actually safe rather
     # than just silencing the guard: a fresh identity has no prior committed versions to
@@ -558,10 +560,10 @@ def available_environments(config_root: str) -> List[str]:
 def load_structural(config_root: str, topic_key: str, environment: str) -> Dict[str, Any]:
     """Merge the structural layers for one topic in one environment.
 
-        1. defaults.yaml                    topic_defaults, common to everything
-        2. environments/<env>.yaml          vars + topic_defaults + cluster/registry overrides
-        3. topics/<key>.yaml                what is unique to this topic
-        3a. topics/<key>.yaml: environments.<env>   what is unique to this topic in ONE
+        1. defaults.yaml + defaults/kafka.yaml   common to everything / to Kafka
+        2. environments/<env>.yaml          vars + defaults + cluster/registry overrides
+        3. sources/<key>.yaml                what is unique to this topic
+        3a. sources/<key>.yaml: environments.<env>   what is unique to this topic in ONE
                                              environment - optional, most topics omit it
 
     Later layers win per key; absent keys fall through. {placeholder} tokens are then
@@ -578,14 +580,25 @@ def load_structural(config_root: str, topic_key: str, environment: str) -> Dict[
             f"Available: {available_environments(config_root)}"
         )
 
-    defaults = _read_yaml(os.path.join(config_root, "defaults.yaml")).get("topic_defaults", {}) or {}
+    # Layer 1 is a pair: what is common to every source type, then what is common to every
+    # Kafka source. This loader is Kafka-only, so it reads defaults/kafka.yaml by name; the
+    # generic, spec-driven equivalent is framework/config.py, which resolves the file from
+    # the source's declared source_type.
+    defaults = {
+        **(_read_yaml(os.path.join(config_root, "defaults.yaml")).get("defaults", {}) or {}),
+        **(_read_yaml(os.path.join(config_root, "defaults", "kafka.yaml")).get("defaults", {}) or {}),
+    }
     env_doc = _read_yaml(env_path)
     env_vars = env_doc.get("vars", {}) or {}
-    topic_doc = _read_yaml(os.path.join(config_root, "topics", f"{topic_key}.yaml"))
+    env_defaults = {
+        **(env_doc.get("defaults") or {}),
+        **((env_doc.get("defaults_by_type") or {}).get("kafka") or {}),
+    }
+    topic_doc = _read_yaml(os.path.join(config_root, "sources", f"{topic_key}.yaml"))
 
-    topic_raw = topic_doc.get("topic")
+    topic_raw = topic_doc.get("source")
     if not isinstance(topic_raw, dict):
-        raise ConfigError(f"topics/{topic_key}.yaml: expected a top-level 'topic:' mapping")
+        raise ConfigError(f"sources/{topic_key}.yaml: expected a top-level 'source:' mapping")
 
     # 3a. Optional per-environment override, nested inside the same topic file. Popped out
     # before the main merge so it never reaches the "unknown top-level key" check as a key
@@ -593,7 +606,7 @@ def load_structural(config_root: str, topic_key: str, environment: str) -> Dict[
     topic_env_overrides = topic_raw.pop("environments", None) or {}
     if not isinstance(topic_env_overrides, dict):
         raise ConfigError(
-            f"topics/{topic_key}.yaml: 'environments:' must be a mapping of environment name "
+            f"sources/{topic_key}.yaml: 'environments:' must be a mapping of environment name "
             "-> override settings, e.g. 'environments: {prod: {max_offsets_per_trigger: ...}}'"
         )
     # Every key must name a real environment - this is the one place a typo here would
@@ -603,20 +616,20 @@ def load_structural(config_root: str, topic_key: str, environment: str) -> Dict[
     unknown_envs = set(topic_env_overrides) - known_envs
     if unknown_envs:
         raise ConfigError(
-            f"topics/{topic_key}.yaml: environments block names {sorted(unknown_envs)}, which "
+            f"sources/{topic_key}.yaml: environments block names {sorted(unknown_envs)}, which "
             f"{'is' if len(unknown_envs) == 1 else 'are'} not in Available: {sorted(known_envs)}"
         )
     this_env_override = topic_env_overrides.get(environment) or {}
     if not isinstance(this_env_override, dict):
         raise ConfigError(
-            f"topics/{topic_key}.yaml: environments.{environment} must be a mapping of "
+            f"sources/{topic_key}.yaml: environments.{environment} must be a mapping of "
             "settings to override, not a scalar"
         )
 
     # Layers 1 -> 2 -> 3 -> 3a. Shallow per key: a list or scalar replaces wholesale rather
     # than merging, which is what makes an override predictable to read.
     merged: Dict[str, Any] = {
-        **defaults, **(env_doc.get("topic_defaults") or {}), **topic_raw, **this_env_override,
+        **defaults, **env_defaults, **topic_raw, **this_env_override,
     }
     merged.setdefault("topic_key", topic_key)
 
@@ -625,7 +638,7 @@ def load_structural(config_root: str, topic_key: str, environment: str) -> Dict[
         # 4), never in Git: a value here would silently re-apply on every future deploy long
         # after the incident that justified it, defeating the guard for good.
         raise ConfigError(
-            f"topics/{topic_key}.yaml: 'checkpoint_reset_id' is a control-table-only override "
+            f"sources/{topic_key}.yaml: 'checkpoint_reset_id' is a control-table-only override "
             "and must not be set in topic YAML - see docs/RUNBOOK_SUPPORT.md 5.4a"
         )
 
@@ -637,11 +650,11 @@ def load_structural(config_root: str, topic_key: str, environment: str) -> Dict[
     merged["table_name"] = topic_table
     topic_scope = {
         **env_vars,
-        "topic_key": topic_key,
+        "source_key": topic_key,
         "domain": merged.get("domain", ""),
         "topic_table": topic_table,
     }
-    merged = _substitute(merged, topic_scope, f"topics/{topic_key}.yaml [{environment}]")
+    merged = _substitute(merged, topic_scope, f"sources/{topic_key}.yaml [{environment}]")
 
     clusters = _overlay_profiles(
         _read_yaml(os.path.join(config_root, "clusters.yaml")).get("clusters", {}),
@@ -742,7 +755,7 @@ def resolve_topic_config(
 ) -> TopicConfig:
     """Full five-layer resolution.
 
-        defaults.yaml -> environments/<env>.yaml -> topics/<key>.yaml  (structural, PR)
+        defaults.yaml -> environments/<env>.yaml -> sources/<key>.yaml  (structural, PR)
             -> operational control table row -> job parameters          (operational)
 
     `overrides` are the job parameters a support engineer typed into the Workflows UI.
@@ -794,7 +807,7 @@ def resolve_topic_config(
     unknown = set(merged) - known
     if unknown:
         raise ConfigError(
-            f"topics/{topic_key}.yaml contains unknown keys {sorted(unknown)}. "
+            f"sources/{topic_key}.yaml contains unknown keys {sorted(unknown)}. "
             "Typos here are silent misconfiguration - fix the YAML or extend TopicConfig."
         )
 

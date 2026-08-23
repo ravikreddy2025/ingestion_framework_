@@ -12,7 +12,9 @@
 # notebooks/02_check_connectivity checks this in about thirty seconds.
 # =====================================================================================
 
-topic:
+source_type: kafka
+
+source:
 
   # -------------------------------------------------------------------- MUST CHANGE --
   topic: antifraud.txn.alerts.v1
