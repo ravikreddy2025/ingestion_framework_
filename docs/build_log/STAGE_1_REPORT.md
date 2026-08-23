@@ -340,10 +340,11 @@ Stage 0 ran the gate against a bare system-wide Python 3.14 with `pyspark 4.2.0`
 that was the only interpreter on the machine. Neither matched the runtime. That is now
 fixed, and the fix is recorded here because it changes what "the gate passed" means:
 
-- **The runtime target was settled by the human: DBR 16.4 LTS -- Python 3.12, Spark 3.5.2.**
-  `requires-python` is `>=3.12,<3.13` and `[tool.mypy] python_version` follows it. The
-  pin tracks the runtime, not the local machine, so that the wheel we build is one the
-  cluster can import.
+- **The runtime target was settled by the human: DBR 16.4 LTS or later -- Python 3.12,
+  Spark 3.5.2.** `requires-python` is `>=3.12`, a floor with no ceiling, because "or later"
+  means a newer runtime must keep working without a release here. `[tool.mypy]
+  python_version` is 3.12, the floor, so type checking runs against the oldest interpreter
+  we support. Both follow the runtime, not the local machine.
 - **A project `.venv` now exists on Python 3.12.10 with `pyspark==3.5.2`**, matching the
   runtime's Spark rather than whatever `pip install pyspark` resolves to. `.venv/` was
   already gitignored. There was never a venv inside the repository before this -- the 3.14

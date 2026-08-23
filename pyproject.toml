@@ -7,12 +7,14 @@ name = "kafka-ingest"
 version = "0.2.0"
 description = "Config-driven Kafka -> Databricks landing/curated ingestion framework"
 
-# Pinned to the runtime, not to what happens to be installed locally. The target is
-# DBR 16.4 LTS, which ships Python 3.12 and Spark 3.5.2; a wheel built against a
-# different minor version is a wheel that may not import on the cluster. Move this only
-# together with the runtime, and update resources/*.yml's spark_version with it.
-# Confirmation against the workspace is VB-14.
-requires-python = ">=3.12,<3.13"
+# Floor, not a pin, and set by the runtime rather than by whatever is installed locally.
+# The target is DBR 16.4 LTS or later; 16.4 LTS ships Python 3.12 and Spark 3.5.2, so 3.12
+# is the oldest interpreter this code has to run on. There is deliberately NO upper bound:
+# "or later" means a newer runtime must keep working without a release here.
+#
+# RAISE the floor when the oldest supported runtime moves, and move
+# resources/*.yml's spark_version with it. Confirmation against the workspace is VB-14.
+requires-python = ">=3.12"
 
 # Runtime deps that are NOT already on DBR. PySpark / delta-spark are provided by
 # the runtime and are deliberately NOT pinned here (pinning them fights the runtime).
@@ -109,6 +111,6 @@ known-first-party = ["kafka_ingest", "conftest"]
 # --------------------------------------------------------------------------------------
 [tool.mypy]
 files = ["src"]
-python_version = "3.12"   # keep in step with requires-python above
+python_version = "3.12"   # the requires-python FLOOR - check against the oldest we support
 ignore_missing_imports = true   # pyspark and delta ship no stubs on this runtime
 warn_unused_ignores = true
