@@ -164,6 +164,37 @@ Provisioned once per environment, then once per new Kafka cluster.
 Storage accounts, external locations and metastore wiring are handled by your Databricks
 deployment; the code never references them.
 
+### Unity Catalog privileges
+
+**Provisioned via Terraform, outside this repository.** Neither the framework code nor the
+SQL scripts under `sql/` issue a `GRANT` - the identities below are environment-specific
+and a job that can grant privileges is a job that can grant itself more. This table is the
+specification for whoever writes that Terraform, not a suggestion: it is exactly what the
+(now-removed) `GRANT` statements used to say, moved here so it is reviewable without
+reading SQL.
+
+Three schemas live under the ops catalog (`{ops_catalog}`), split by purpose rather than by
+data-vs-operational - `{audit_schema}` / `{control_schema}` / `{logs_schema}` are each an
+environment variable, defaulting to `audit` / `ingestion` / `logs` respectively:
+
+| Catalog / schema | Principal | Privileges |
+|---|---|---|
+| `{ops_catalog}` | Ingestion service principal | `USE CATALOG` |
+| `{ops_catalog}` | Support group | `USE CATALOG` |
+| `{ops_catalog}.{control_schema}` (`ingest_control`, `ingest_state`) | Ingestion service principal | `USE SCHEMA`; `SELECT` on `ingest_control`; `SELECT, MODIFY` on `ingest_state`; `CREATE TABLE` on the schema, so a freshly provisioned environment can bootstrap `ingest_state` on its first run (see VB-16) |
+| `{ops_catalog}.{control_schema}` | Support group | `USE SCHEMA`; `SELECT, MODIFY` on `ingest_control`; `SELECT` only on `ingest_state` - a hand-edited watermark is a silent data-loss incident |
+| `{ops_catalog}.{audit_schema}` (`ingest_audit`) | Ingestion service principal | `USE SCHEMA`, `CREATE TABLE`, `SELECT, MODIFY` |
+| `{ops_catalog}.{audit_schema}` | Support group | `USE SCHEMA`, `SELECT` |
+| `{ops_catalog}.{logs_schema}` | - | Reserved. Nothing is written here yet, so nothing needs granting until structured logging ships |
+| `{data_catalog}` | Ingestion service principal | `USE CATALOG` |
+| `{data_catalog}.landing`, `{data_catalog}.curated` (one schema per layer, one table per topic) | Ingestion service principal | `USE SCHEMA`, `CREATE TABLE`, `SELECT, MODIFY` per topic table |
+| `{data_catalog}.landing`, `{data_catalog}.curated` | Support group / data consumers | `SELECT` |
+
+The split within `{control_schema}` is the load-bearing one: the ingestion job can never
+disable itself (it only reads `ingest_control`), and support can never hand-move a
+watermark (it only reads `ingest_state`). See VB-16 for what remains to confirm once a
+workspace exists to check it against.
+
 ### Two prerequisites that are commonly missed
 
 **Executor visibility of certificates (mTLS topics only).** Keystores and truststores are
