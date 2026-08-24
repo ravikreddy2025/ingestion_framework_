@@ -257,6 +257,17 @@ def _layout_clause(name: str, partition_by: list[str] | None, cluster_by: list[s
     return ""
 
 
+def effective_properties(properties: Mapping[str, Any] | None) -> dict[str, Any]:
+    """What a table actually gets: the configured map, or the fallback when none is set.
+
+    Exposed separately from `properties_clause` so a caller that needs to ADD one more
+    property on top of whatever configuration would otherwise produce - framework/state.py
+    does, for deletion vectors - starts from the same answer `properties_clause` renders,
+    rather than re-deciding the fallback itself.
+    """
+    return dict(properties) if properties else dict(_FALLBACK_TABLE_PROPERTIES)
+
+
 def properties_clause(properties: Mapping[str, Any] | None) -> str:
     """Render TBLPROPERTIES from configuration.
 
@@ -264,7 +275,7 @@ def properties_clause(properties: Mapping[str, Any] | None) -> str:
     the statement, so it is rejected rather than escaped - a Delta property name containing
     a quote is a typo, not a use case.
     """
-    effective = dict(properties) if properties else dict(_FALLBACK_TABLE_PROPERTIES)
+    effective = effective_properties(properties)
     return ", ".join(
         f"'{_quotable(key, 'table_properties key')}' = '{_quotable(value, 'table_properties value')}'"
         for key, value in effective.items()

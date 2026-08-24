@@ -155,18 +155,31 @@ class StateStore:
         return self.table
 
 
+_DELETION_VECTORS_PROPERTY = {"delta.enableDeletionVectors": "true"}
+
+
 def ensure_state_table(spark: Any, cfg: Any, table: str) -> None:
     """Create the state table if it does not exist yet. A no-op afterwards.
 
-    Not partitioned and not clustered: it holds a handful of rows per source_key, and any
-    physical layout on it would cost more to maintain than it could ever save.
+    PARTITIONED BY (source_key) (docs/build_log/DECISIONS.md D-04). A run sequence is
+    allocated on EVERY run of every source, so with many sources on the same schedule this
+    table takes concurrent MERGEs from different sources. Delta detects conflicts at file
+    granularity, so partitioning by source_key puts each source's rows in disjoint files and
+    those concurrent MERGEs stop conflicting with each other. Deletion vectors are enabled
+    for the same reason CLUSTER BY is not used here: this table's whole shape is small,
+    frequent, single-row MERGE updates, which deletion vectors make cheaper than rewriting a
+    file per update.
+
+    Small-file growth from the partitioning is not a concern: a handful of rows per source,
+    and the maintenance job already covers this framework's tables.
     """
     tables.ensure_table(
         spark,
         table,
         STATE_DDL_COLUMNS,
         "Durable ingestion state: watermarks and run sequences. Written by the ingestion job only.",
-        properties=cfg.get("table_properties"),
+        properties={**tables.effective_properties(cfg.get("table_properties")), **_DELETION_VECTORS_PROPERTY},
+        partition_by=["source_key"],
     )
 
 
