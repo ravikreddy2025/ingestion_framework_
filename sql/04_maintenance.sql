@@ -23,6 +23,13 @@
 -- Note this file uses SQL :parameters, not the {placeholder} convention of sql/01-03. Those
 -- three are provisioning scripts a human renders and runs once; this one is executed by a
 -- job, which can bind parameters directly. Rendering it would just add a manual step.
+--
+-- :ops_catalog locates the audit table, which lives under the ops catalog, not :catalog
+-- (docs/build_log/DECISIONS.md D-06). Its schema is the literal 'audit' rather than a
+-- third bound parameter, because every environment uses that name (see
+-- conf/environments/<env>.yaml vars.audit_schema) and this file already carries enough
+-- parameters. NOT YET WIRED: resources/job_maintenance.yml does not pass :ops_catalog
+-- today (Stage 6) - see docs/build_log/STAGE_2b_REPORT.md.
 -- =====================================================================================
 
 -- -------------------------------------------------------------------------------------
@@ -36,7 +43,7 @@ OPTIMIZE IDENTIFIER(:landing_table)
 
 -- The audit table is shared by every topic, so this repeats across per-topic tasks. That is
 -- harmless: OPTIMIZE on already-compacted files is close to a no-op.
-OPTIMIZE IDENTIFIER(:catalog || '.audit.ingest_audit')
+OPTIMIZE IDENTIFIER(:ops_catalog || '.audit.ingest_audit')
   WHERE audit_date >= current_date() - INTERVAL 7 DAYS;
 
 -- -------------------------------------------------------------------------------------
@@ -45,7 +52,7 @@ OPTIMIZE IDENTIFIER(:catalog || '.audit.ingest_audit')
 --    concurrent reader. If you think you need that, you want a different fix.
 -- -------------------------------------------------------------------------------------
 VACUUM IDENTIFIER(:landing_table) RETAIN :vacuum_retention_hours HOURS;
-VACUUM IDENTIFIER(:catalog || '.audit.ingest_audit')   RETAIN :vacuum_retention_hours HOURS;
+VACUUM IDENTIFIER(:ops_catalog || '.audit.ingest_audit')   RETAIN :vacuum_retention_hours HOURS;
 
 -- -------------------------------------------------------------------------------------
 -- 3. LANDING RETENTION - deliberately NOT enabled.

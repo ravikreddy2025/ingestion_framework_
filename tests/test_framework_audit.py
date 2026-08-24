@@ -92,7 +92,7 @@ def test_the_provisioning_sql_agrees_with_both():
     """sql/02 provisions the table ahead of the first run. A column present in one and not
     the other fails on the first append, on a cluster."""
     sql = SQL_PATH.read_text(encoding="utf-8")
-    assert sql_table_columns(sql, "audit.ingest_audit") == ddl_column_names(AUDIT_DDL_COLUMNS)
+    assert sql_table_columns(sql, "ingest_audit") == ddl_column_names(AUDIT_DDL_COLUMNS)
 
 
 def test_the_position_columns_say_on_themselves_that_they_mean_three_things():
@@ -168,10 +168,10 @@ def test_a_failed_row_carries_error_detail_and_truncates_it(audit):
     assert len(row["error_message"]) == 4000
 
 
-def test_a_batch_id_defaults_to_minus_one(audit):
+def test_a_txn_version_defaults_to_minus_one(audit):
     """A bounded read outside a microbatch has no batch identity, and recording 0 would be
     indistinguishable from the first microbatch of a streaming run."""
-    assert audit.build_row(LAYER_RUN, STATUS_COMPLETED)["batch_id"] == -1
+    assert audit.build_row(LAYER_RUN, STATUS_COMPLETED)["txn_version"] == -1
 
 
 # --------------------------------------------------------------------------------------

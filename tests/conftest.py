@@ -502,6 +502,15 @@ def _demo_spec():
         operational_keys=frozenset({"trigger", "batch_limit", "failure_mode", "reset_id"}),
         mutually_exclusive=(("cursor_column", "full_refresh"),),
         layers=("landing",),
+        # Mirrors sources/kafka/spec.py's shape (docs/build_log/DECISIONS.md D-01): three
+        # of the four operational keys get their own prefixed control-table column.
+        # `trigger` deliberately does NOT - not every operational key needs one, and a test
+        # exercises that it simply cannot be set from the control table without one.
+        control_columns={
+            "demo_failure_mode": "failure_mode",
+            "demo_batch_limit": "batch_limit",
+            "demo_reset_id": "reset_id",
+        },
     )
 
 

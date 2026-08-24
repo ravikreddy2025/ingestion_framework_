@@ -343,85 +343,114 @@ code must change -- see "If it fails").
 
 ---
 
-### VB-15 -- Does the `ingest_state` MERGE actually upsert, and is one-run-per-source_key true?
-- **Stage / file:** Stage 2, `framework/state.py` (`StateStore.write_state`,
-  `next_run_sequence`), `sql/01_operational_config.sql`.
+### VB-15 -- Does the `ingest_state` MERGE actually upsert, is one-run-per-source_key true, and does partitioning isolate concurrent sources?
+- **Stage / file:** Stage 2, extended in the decisions-and-stage2-followup pass,
+  `framework/state.py` (`StateStore.write_state`, `next_run_sequence`),
+  `sql/01_operational_config.sql`.
 - **Why it matters:** `next_run_sequence` reads the current value, adds one and MERGEs it
   back, and the number it returns becomes the Delta `txnVersion` for every append a batch
-  source makes. Two things are assumed and neither can be checked here. First, that the
+  source makes. Three things are assumed and none can be checked here. First, that the
   MERGE upserts -- if the `whenMatchedUpdateAll` branch silently did nothing, every run
   would read the same value, take the same `txnVersion`, and Delta would drop every append
   after the first as a duplicate. That failure looks exactly like a source with no new data:
   a green job, an audit row saying N rows were presented, and nothing in the table. Second,
   that only one run per `source_key` is ever in flight -- two concurrent runs would both
-  read N and both take N+1, and the second's writes would be dropped the same way.
+  read N and both take N+1, and the second's writes would be dropped the same way. Third
+  (docs/build_log/DECISIONS.md D-04, added in this pass): that `PARTITIONED BY (source_key)`
+  plus deletion vectors actually gives Delta file-level conflict isolation between
+  DIFFERENT sources' concurrent MERGEs -- this is a distinct claim from the second one
+  above (same source vs different sources), and neither the partitioning nor the deletion
+  vectors have run against a real concurrent workload anywhere yet.
 - **How to check:** In the target workspace, against a real state table:
   ```sql
   -- after provisioning with sql/01, then running one source twice
   SELECT source_key, state_key, state_value, updated_by_run, updated_at
-  FROM {ops_catalog}.ingestion.ingest_state
+  FROM {ops_catalog}.{control_schema}.ingest_state
   WHERE state_key = 'run_sequence' ORDER BY source_key;
 
-  DESCRIBE HISTORY {ops_catalog}.ingestion.ingest_state;   -- expect MERGE, not INSERT
+  DESCRIBE HISTORY {ops_catalog}.{control_schema}.ingest_state;   -- expect MERGE, not INSERT
   ```
-  For the concurrency half: confirm in Workflows that the ingestion job for one
+  For the same-source concurrency half: confirm in Workflows that the ingestion job for one
   `source_key` has `max_concurrent_runs: 1`, and that no second schedule targets the same
-  source.
+  source. For the cross-source partitioning half: trigger two DIFFERENT sources' jobs at the
+  same time against the same table and confirm neither MERGE fails with a Delta concurrent-
+  modification exception; `DESCRIBE HISTORY` should show both commits landing without a
+  retry, and `numTargetFilesAdded` / `numTargetFilesRemoved` should each stay scoped to one
+  source's partition.
 - **Expected:** exactly ONE row per (source_key, 'run_sequence'), whose `state_value`
   increments by one per run and whose `updated_by_run` is the latest run's id. `DESCRIBE
   HISTORY` shows MERGE operations, and `numTargetRowsUpdated` is 1 from the second run on.
+  Two different sources' concurrent MERGEs both commit cleanly, touching disjoint files.
 - **If it fails:** If the MERGE does not update, the condition or the `whenMatchedUpdateAll`
   branch in `StateStore.write_state` is wrong -- fix it there, not by adding a DELETE and an
-  INSERT, which would not be atomic. If concurrent runs are real, `next_run_sequence` needs
-  a genuinely atomic allocation and the docstring's stated assumption must be retracted.
+  INSERT, which would not be atomic. If same-source concurrent runs are real,
+  `next_run_sequence` needs a genuinely atomic allocation and the docstring's stated
+  assumption must be retracted. If cross-source concurrent MERGEs still conflict despite the
+  partitioning, deletion vectors may need to be paired with a retry/backoff around
+  `write_state`, or the state table may need to move off a single shared table entirely --
+  both are larger changes than this pass, so treat a failure here as a blocker for D-04, not
+  something to patch quietly.
 - **Status:** OPEN
 
 ### VB-16 -- Can the ingestion service principal create the audit and state tables?
 - **Stage / file:** Stage 2, `framework/runner.py` (`_ensure_framework_tables`),
-  `framework/tables.py`, `sql/01_operational_config.sql` (the `GRANT CREATE TABLE` line).
+  `framework/tables.py`. Grants themselves moved out of `sql/` in the
+  decisions-and-stage2-followup pass (docs/build_log/DECISIONS.md D-02) -- see
+  `docs/RUNBOOK_CLIENT_IT.md`'s "Unity Catalog privileges" table.
 - **Why it matters:** every run issues `CREATE TABLE IF NOT EXISTS` for the audit table and
   the state table before it dispatches, so a fresh environment works without anyone running
-  the provisioning SQL first. That needs `CREATE TABLE` on `{catalog}.audit` and on
-  `{ops_catalog}.ingestion`, plus `USE SCHEMA` on both. If the grant is absent the run fails
-  at start-up -- loud, and fixed in minutes, which is why this is here rather than designed
-  around. What must NOT happen is the opposite: the framework does not issue GRANTs itself,
-  deliberately, because a job that can grant is a job that can grant itself more.
+  the provisioning SQL first. That needs `CREATE TABLE` on `{ops_catalog}.{audit_schema}`
+  and on `{ops_catalog}.{control_schema}`, plus `USE SCHEMA` on both. If the grant is absent
+  the run fails at start-up -- loud, and fixed in minutes, which is why this is here rather
+  than designed around. What must NOT happen is the opposite: the framework does not issue
+  GRANTs itself, deliberately, because a job that can grant is a job that can grant itself
+  more.
+- **No longer a blocker.** D-02 settled that grants are Terraform-owned and recorded the
+  exact privilege list the ingestion service principal and the support group need; this
+  entry is now "confirm Terraform granted what that list says" rather than an open design
+  question.
 - **How to check:** As the job's service principal, in the target workspace:
   ```sql
-  SHOW GRANTS `sp-kafka-ingestion` ON SCHEMA {ops_catalog}.ingestion;
-  SHOW GRANTS `sp-kafka-ingestion` ON SCHEMA {catalog}.audit;
+  SHOW GRANTS `sp-kafka-ingestion` ON SCHEMA {ops_catalog}.{control_schema};
+  SHOW GRANTS `sp-kafka-ingestion` ON SCHEMA {ops_catalog}.{audit_schema};
   ```
   Then run one source end to end in a freshly provisioned environment.
 - **Expected:** `USE SCHEMA` and `CREATE TABLE` on both schemas, and `SELECT`/`MODIFY` on
-  `ingest_state` and the audit table but `SELECT` only on `ingest_control`.
-- **If it fails:** Either add the grants (they are already written in
-  `sql/01_operational_config.sql` and `sql/02_layer_tables.sql`), or decide that the job
-  should NOT create its own tables -- in which case drop the `_ensure_framework_tables` call
-  from `framework/runner.py` and make running the provisioning SQL a prerequisite, stated in
-  the runbook.
+  `ingest_state` and the audit table but `SELECT` only on `ingest_control` -- matching
+  `docs/RUNBOOK_CLIENT_IT.md`'s privilege table exactly.
+- **If it fails:** Either the Terraform did not grant what the privilege list says (fix the
+  Terraform, not the code), or a decision is needed that the job should NOT create its own
+  tables -- in which case drop the `_ensure_framework_tables` call from `framework/runner.py`
+  and make running the provisioning SQL a prerequisite, stated in the runbook.
 - **Status:** OPEN
 
 ### VB-17 -- Do `sql/01_operational_config.sql` and `sql/02_layer_tables.sql` execute as written?
 - **Stage / file:** Stage 2, both SQL files.
 - **Why it matters:** these are the provisioning scripts for every environment and nothing
-  here can execute a single statement of them. Three things in them are assumed: that Delta
-  accepts the named `CONSTRAINT ... CHECK` clauses inside `CREATE TABLE` (`failure_mode`,
-  `source_key_present`, `state_key_present`), that `NOT NULL` on a column inside
-  `CREATE TABLE` is accepted alongside them, and that the `{ops_catalog}` / `{catalog}`
-  placeholders are rendered before the file is run -- an unrendered one fails with a parse
-  error, which is the good case. A wrong CHECK constraint is the bad case: the table is
-  created without it and the rule it was meant to enforce silently is not enforced.
+  here can execute a single statement of them. Four things in them are assumed: that Delta
+  accepts the named `CONSTRAINT ... CHECK` clauses inside `CREATE TABLE`
+  (`kafka_failure_mode_valid`, `source_key_present`, `state_key_present`), that `NOT NULL`
+  on a column inside `CREATE TABLE` is accepted alongside them, that `PARTITIONED BY
+  (source_key)` combined with `'delta.enableDeletionVectors' = 'true'` in the same
+  `CREATE TABLE` is accepted (added for `ingest_state` in the decisions-and-stage2-followup
+  pass, D-04), and that the `{ops_catalog}` / `{catalog}` / `{audit_schema}` /
+  `{control_schema}` / `{logs_schema}` placeholders are rendered before the file is run --
+  an unrendered one fails with a parse error, which is the good case. A wrong CHECK
+  constraint is the bad case: the table is created without it and the rule it was meant to
+  enforce silently is not enforced.
 - **How to check:** Render both files for one environment (see
   `notebooks/00_validate_config`, section "Render the provisioning SQL") and run them in a
   SQL warehouse against a scratch catalog. Then:
   ```sql
-  DESCRIBE EXTENDED {ops_catalog}.ingestion.ingest_control;   -- constraints listed?
-  DESCRIBE EXTENDED {ops_catalog}.ingestion.ingest_state;
-  DESCRIBE EXTENDED {catalog}.audit.ingest_audit;
+  DESCRIBE EXTENDED {ops_catalog}.{control_schema}.ingest_control;   -- constraints listed?
+  DESCRIBE EXTENDED {ops_catalog}.{control_schema}.ingest_state;     -- PARTITIONED BY (source_key)?
+  DESCRIBE EXTENDED {ops_catalog}.{audit_schema}.ingest_audit;
   ```
-- **Expected:** every statement succeeds, and the CHECK constraints appear in
-  `DESCRIBE EXTENDED`. Inserting a control row with `failure_mode = 'nonsense'` is rejected.
+- **Expected:** every statement succeeds, and the CHECK constraints and the partitioning
+  both appear in `DESCRIBE EXTENDED`. Inserting a control row with
+  `kafka_failure_mode = 'nonsense'` is rejected.
 - **If it fails:** Fix the exact statement the warehouse rejects. Do NOT drop a constraint to
-  make the script run -- if `failure_mode` cannot be constrained in DDL, the equivalent check
-  belongs in `framework/control.py` where the column is read, and this file must say so.
+  make the script run -- if `kafka_failure_mode` cannot be constrained in DDL, the
+  equivalent check belongs in `framework/control.py` where the column is read, and this
+  file must say so.
 - **Status:** OPEN

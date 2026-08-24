@@ -35,6 +35,13 @@ KNOWN CAVEAT - read before trusting record_count
 `record_count` is the number of rows PRESENTED to the write, not the number the target
 actually inserted. If Delta skips a write as a duplicate (see the txnAppId/txnVersion
 markers in framework/writers.py), this column still reports the presented count.
+
+`txn_version` (docs/build_log/DECISIONS.md D-03) CARRIES THE DELTA txnVersion
+-------------------------------------------------------------------------------
+Whatever produced it: a streaming source's microbatch id, a batch source's `run_sequence`,
+or -1 when neither applies. One column, one name that says what it is, for every source
+type - the column used to be called `batch_id`, which read as Kafka vocabulary sitting in a
+table every source shares.
 """
 
 from __future__ import annotations
@@ -71,7 +78,7 @@ STATUS_NO_DATA = "NO_DATA"
 
 # A run with no microbatch id. Kafka's foreachBatch supplies a real one; a bounded batch
 # read supplies its run_sequence; anything else records that it had neither.
-NO_BATCH_ID = -1
+NO_TXN_VERSION = -1
 
 # Error text is truncated before it reaches the table: a Spark stack trace can be
 # megabytes, and an audit table is not a log aggregator.
@@ -82,9 +89,9 @@ _ERROR_MESSAGE_LIMIT = 4000
 # A test asserts all three agree, because drift surfaces as a confusing Delta schema error
 # on the first append and nowhere earlier.
 AUDIT_DDL_COLUMNS = """
-    audit_id              STRING    COMMENT 'run_id::batch_id::layer::status - unique per row',
+    audit_id              STRING    COMMENT 'run_id::txn_version::layer::status - unique per row',
     run_id                STRING    COMMENT 'One value per job execution; also stamped on data rows',
-    batch_id              BIGINT    COMMENT 'Streaming microbatch id, or the run_sequence for a batch source, or -1',
+    txn_version           BIGINT    COMMENT 'Delta txnVersion: a microbatch id, a batch source run_sequence, or -1',
     source_type           STRING    COMMENT 'Which source implementation ran',
     source_key            STRING    COMMENT 'Matches conf/sources/<source_key>.yaml and ingest_control.source_key',
     source_ref            STRING    COMMENT 'Source-side identifier: topic name, SCHEMA.TABLE, or path glob',
@@ -112,7 +119,7 @@ AUDIT_SCHEMA = StructType(
     [
         StructField("audit_id", StringType()),
         StructField("run_id", StringType()),
-        StructField("batch_id", LongType()),
+        StructField("txn_version", LongType()),
         StructField("source_type", StringType()),
         StructField("source_key", StringType()),
         StructField("source_ref", StringType()),
@@ -171,7 +178,7 @@ class AuditWriter:
         self.job_run_id = job_run_id
         self.source_ref: str | None = None
 
-    def emit(self, layer: str, status: str, batch_id: int = NO_BATCH_ID, **details: Any) -> None:
+    def emit(self, layer: str, status: str, txn_version: int = NO_TXN_VERSION, **details: Any) -> None:
         """Write one audit row. Never raises.
 
         Accepted `details` keys are AUDIT_SCHEMA field names: record_count,
@@ -179,7 +186,7 @@ class AuditWriter:
         error_class, error_message.
         """
         try:
-            row = self.build_row(layer, status, batch_id, **details)
+            row = self.build_row(layer, status, txn_version, **details)
             # Positional tuple in AUDIT_SCHEMA order, not the dict: createDataFrame with an
             # explicit StructType does not reorder dict keys, and a KeyError here would be
             # a better failure than a value landing silently in the wrong column.
@@ -201,14 +208,14 @@ class AuditWriter:
                 "Failed to write audit row (%s/%s run %s): %s", layer, status, self.run_id, traceback.format_exc()
             )
 
-    def build_row(self, layer: str, status: str, batch_id: int = NO_BATCH_ID, **kw: Any) -> dict[str, Any]:
+    def build_row(self, layer: str, status: str, txn_version: int = NO_TXN_VERSION, **kw: Any) -> dict[str, Any]:
         cfg, now = self._cfg, datetime.now(timezone.utc)
         message = kw.get("error_message")
         detail = kw.get("source_detail")
         return {
-            "audit_id": f"{self.run_id}::{batch_id}::{layer}::{status}",
+            "audit_id": f"{self.run_id}::{txn_version}::{layer}::{status}",
             "run_id": self.run_id,
-            "batch_id": int(batch_id),
+            "txn_version": int(txn_version),
             "source_type": cfg.source_type,
             "source_key": cfg.source_key,
             "source_ref": self.source_ref,
