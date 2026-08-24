@@ -41,6 +41,18 @@ defaults:
   # catalog still comes from {catalog}, so a source file never contains a catalog name.
   landing_table: "{catalog}.oracle_{source_schema}.{source_table}"
 
+  # --- TABLE LAYOUT -------------------------------------------------------------------
+  # Delta allows PARTITIONED BY or CLUSTER BY, never both. See docs/DESIGN.md.
+  # ingest_date - the date a row was WRITTEN here, not the date it changed in Oracle -
+  # bounds partition growth over years of daily runs and makes retention a partition drop.
+  #
+  # It is deliberately NOT a date derived from the cursor: a cursor is optional, its column
+  # differs per source, and a partition column that exists for some sources and not others
+  # is a table layout nobody can reason about. The cost is that a landing MERGE cannot be
+  # bounded to a partition - see the `true` predicate in sources/oracle/run.py, which says
+  # so at the call site.
+  landing_partition_by: [ingest_date]
+
   # --- EXTRACTION SHAPE ---------------------------------------------------------------
   # full | cursor | filter. The platform default is `full` deliberately: a source that
   # forgets to declare its mode re-extracts the whole table, which is visible in the row

@@ -162,6 +162,36 @@ def _cursor_predicates(cfg: OracleConfig, last_watermark: str | None, run_high_w
     return predicates
 
 
+def high_water_query(cfg: OracleConfig) -> str:
+    """The upper bound of this run's interval: `MAX(cursor)` over what the run can see.
+
+    OVER THE FILTERED SET, not the whole table, and that matters: a source that extracts
+    only open claims must not take its watermark from a closed one, or the next run starts
+    past rows it never read.
+
+    The cursor predicate itself is deliberately absent - the point of this query is to find
+    the boundary BEFORE the interval is known. See `_cursor_predicates` for why the interval
+    is closed at all.
+    """
+    if not cfg.cursor_column:
+        raise ConfigError(
+            f"source '{cfg.source_key}': a high-water mark was asked for, but no cursor_column "
+            "is configured. Only incremental_mode 'cursor' has a watermark."
+        )
+    return f"SELECT MAX({cfg.cursor_column}) AS high_water FROM ({_filtered_query(cfg)}) hw"
+
+
+def _filtered_query(cfg: OracleConfig) -> str:
+    """The extract WITHOUT its incremental predicate: base, static filter, dynamic window.
+
+    Shared by the high-water probe, which needs to see the same rows the extract will see
+    minus the interval it does not know yet.
+    """
+    predicates = [*_static_filter(cfg), *_dynamic_date_filter(cfg)]
+    base = _base(cfg, bool(predicates))
+    return base if not predicates else f"{base} WHERE {' AND '.join(predicates)}"
+
+
 def bounds_query(cfg: OracleConfig, query: str) -> str:
     """MIN and MAX of the partition column, over the query this run is about to extract.
 

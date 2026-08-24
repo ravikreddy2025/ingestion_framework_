@@ -64,6 +64,7 @@ _STRUCTURAL = frozenset(
         "cursor_column",
         "cursor_type",
         "merge_keys",
+        "landing_partition_by",
         "partition_column",
         "num_partitions",
         "fetch_size",

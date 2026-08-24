@@ -1,8 +1,8 @@
 # Stage 4 Report -- Oracle source
 
 Branch `stage-4-oracle`, cut from `main` after Stage 3 (PR #5) merged. **One section per
-sub-step**, written as each sub-step's exit gate goes green. Sub-steps 4c (watermark
-lifecycle) and 4d (operationalise) are not started.
+sub-step**, written as each sub-step's exit gate goes green. Sub-step 4d (operationalise)
+is not started.
 
 ---
 
@@ -482,3 +482,211 @@ additions to the two existing ones.
 
 **New VB entries this sub-step:** VB-21 (the bounds probe), VB-22 (the JDBC driver and its
 version), VB-23 (`customSchema` semantics), VB-24 (`sessionInitStatement` semantics).
+
+
+---
+
+# Sub-step 4c -- the watermark lifecycle
+
+`run(ctx)` exists now, and with it the ordering the whole source is built around:
+
+    capture the high water -> read the closed interval -> write -> THEN advance
+
+Everything in this sub-step is either that order or a case where one of its steps must NOT
+happen. All of it ran: a source is handed a RunContext and nothing else, so the lifecycle is
+testable end to end against stand-ins, with no database and no JVM.
+
+## What was built
+
+```
+sources/oracle/
+  run.py       the lifecycle. The only place the ordering lives.
+  landing.py   the provenance columns, as SQL expression strings (so: no PySpark import)
+  tables.py    the landing DDL, built from the schema the read resolved
+  config.py    + merge_on, update_matched_rows, landing_partition_by
+  query.py     + high_water_query()
+conf/defaults/oracle.yaml   landing_partition_by, and why it is not a cursor-derived date
+```
+
+## 1. Done and verified
+
+- **The order, asserted directly.** `test_the_watermark_is_written_after_the_write_and_never_before`
+  records the write and the state write into one list and asserts `["write", "state"]`. A
+  state write that landed first would mean a crash during the write silently skipped the
+  interval it claimed to have read.
+- **A failed write leaves the watermark where it was.** The next run re-extracts the same
+  interval, which the MERGE key absorbs. Proof:
+  `test_a_failed_write_leaves_the_watermark_where_it_was`.
+- **A replay never writes `ingest_state` - and never reads it either.** Its bounds come from
+  the operator, so a re-extraction cannot strand production state at a bound somebody typed
+  once. An unbounded replay ("from there to now") still gets a real upper bound. Proof:
+  `test_a_replay_never_writes_state`, `test_a_replay_reads_no_stored_watermark_at_all`,
+  `test_an_unbounded_replay_still_gets_a_real_upper_bound`.
+- **A full run does not touch the watermark, and says so naming the mode** (D-09). Clearing
+  it would make the switch back to delta re-read the entire table. Proof:
+  `test_a_full_run_does_not_touch_the_watermark`.
+- **An extract with no cursor values reads nothing at all.** One probe, no extract, no write,
+  no advance - an empty table or a filter matching nothing is an ordinary Tuesday, not an
+  error. Proof: `test_an_extract_with_no_cursor_values_reads_nothing_and_advances_nothing`.
+- **THE MERGE KEY INCLUDES THE CURSOR COLUMN**, and that is the most consequential decision
+  in this sub-step. `(CLAIM_ID, LAST_UPDATE_DT)` identifies a VERSION of a claim rather than
+  the claim, which is what keeps landing the retained mirror D-07 depends on instead of
+  collapsing it to current state - and it makes the key STABLE across D-09's mode switch. A
+  full run keyed on the business key alone would match every historical version of a claim
+  with one source row and overwrite all of them. Proof:
+  `test_a_source_with_merge_keys_merges_on_the_key_and_the_cursor`,
+  `test_the_merge_key_does_not_change_when_the_mode_does`,
+  `test_a_source_with_no_cursor_updates_matched_rows`.
+- **The landing MERGE passes `partition_predicate="true"`, deliberately.** Landing is
+  partitioned by the date a row was WRITTEN, so a re-extracted row carries today's while its
+  target twin carries the day it first arrived; any bound derived from the frame would match
+  NOTHING and insert duplicates. This is the second use of `framework/writers.merge()`'s
+  declared escape hatch, and it is the same argument Stage 3 made for Kafka's landing. Proof:
+  `test_the_landing_merge_declares_that_no_partition_bound_is_derivable`.
+- **A source that waived merge keys appends with the Delta idempotency markers**
+  (`ingest::oracle::<source_key>` + the durable `run_sequence`), and gets a WARN on EVERY run
+  naming the boundary rows it can lose. A serial read gets one too. Both are legal, deliberate
+  and invisible in a row count, which is the only kind of thing worth warning about every
+  time. Proof: `test_a_source_that_waived_merge_keys_appends_with_idempotency_markers`,
+  `test_the_waived_boundary_risk_is_warned_about_on_every_run`,
+  `test_a_serial_read_is_warned_about`.
+- **The extract is evaluated once.** Without the cache, `count()` and the write are two
+  actions over a JDBC source - two full reads of the source table, and two chances for them to
+  disagree about what Oracle held. Released in a `finally`, so the failure path does not pin a
+  large extract until the executor is recycled. Proof:
+  `test_the_extract_is_evaluated_once_and_released_afterwards`,
+  `test_the_cache_is_released_on_the_failure_path_too`.
+- **The landing table is created explicitly**, from the schema the read resolved, with the
+  platform's TBLPROPERTIES and `PARTITIONED BY (ingest_date)` - an implicitly created table
+  would be the only one people query without auto-compaction. Proof:
+  `test_the_landing_table_is_created_from_the_resolved_schema_before_the_write`.
+- **Schema drift stops the run before it writes**, and the framework's own seven provenance
+  columns are excluded from the comparison - without that, every run after the first would
+  fail. Proof: `test_a_type_change_against_the_existing_table_stops_the_run`,
+  `test_the_frameworks_own_columns_are_not_mistaken_for_drift`,
+  `test_a_column_the_driver_could_not_map_stops_the_run_before_any_write`.
+- **The projection and the DDL agree, column for column, in order.** Two definitions of
+  landing's provenance columns exist and a drift between them surfaces as a confusing Delta
+  error on the first append and nowhere earlier. Proof:
+  `test_the_projection_and_the_ddl_name_the_same_columns_in_the_same_order`.
+- **An Oracle column that would shadow a provenance column is refused**, with the column name
+  and the fix - the error Delta gives for a duplicate column names neither this framework nor
+  the source table. Proof: `test_a_source_column_that_would_shadow_a_provenance_column_is_refused`.
+- **The audit row carries the query the run actually ran**, which is the first question of
+  every Oracle incident and is not reconstructable from configuration once a dynamic window
+  and a watermark are involved. `pending_work` is NULL, because knowing it would take another
+  round trip and a confident zero is the claim a lagging feed makes falsely. Proof:
+  `test_the_audit_row_carries_the_query_this_run_actually_ran`,
+  `test_pending_work_is_null_because_this_source_cannot_know_it`.
+- **CORE section 7 grep returns nothing.**
+- **Exit gate, all three commands run:**
+  ```
+  $ python -m ruff check src tests
+  All checks passed!
+
+  $ python -m ruff format --check src tests
+  71 files already formatted
+
+  $ python -m pytest -m "not spark" -q
+  745 passed, 6 skipped, 36 deselected in 22.69s
+  ```
+- **Fifteen mutations run, each restored afterwards.** Fourteen failed a test immediately:
+
+  | Mutation | Result |
+  |---|---|
+  | the watermark advances BEFORE the write | 2 failed |
+  | a replay advances the watermark | 1 failed |
+  | an unbounded replay loses its upper bound | 1 failed |
+  | an empty extract still reads and writes | 1 failed |
+  | the extract cache is never released | 2 failed |
+  | the extract is not cached (read twice) | 1 failed |
+  | the landing merge is bounded to today | 1 failed |
+  | provenance columns compared as drift | 1 failed |
+  | an unmapped column allowed through | 1 failed |
+  | the cursor dropped from the merge key | 4 failed |
+  | matched rows always rewritten | 1 failed |
+  | a shadowing source column allowed | 2 failed |
+  | an unchecked literal reaches the projection | 1 failed |
+  | the full-run case stops being named in the log | 1 failed |
+
+  **The fifteenth survived, and it changed the code.** Deleting the `if not cfg.is_cursor:
+  return` guard from `_advance_watermark()` failed nothing, because a non-cursor run reaches
+  it with `high_water=None` anyway - the guard was unreachable protection, and an unreachable
+  guard is a comment that looks like code. The two cases were collapsed into ONE guard whose
+  logged reason names which case it was, and a test now asserts that reason. Both mutations of
+  the collapsed form fail.
+
+## 2. Done but not verifiable here
+
+- **No JDBC read was executed.** Every read in these tests is recorded, not performed.
+- **VB-25 (new)** -- the one gap a closed interval does NOT close: a transaction already open
+  when the high-water mark is captured, carrying a cursor value below it, that commits after
+  the extract has read past that value. It is never seen, and nothing downstream can detect
+  it. How much it matters is a property of the SOURCE application (does it stamp the cursor at
+  statement time or at commit?), which is why the entry's "how to check" is a conversation
+  with the source team plus a reconciliation query rather than a code change. The module
+  docstring says the same thing at the top of `run.py`.
+- **VB-15** (does the `ingest_state` MERGE actually upsert?) now has the watermark depending
+  on it as well as the run sequence.
+- **VB-09** (Delta MERGE schema evolution) is reached by this source's landing MERGE the
+  first time an Oracle table gains a column.
+
+## 3. Not reproduced
+
+- **The stage file's `txnAppId` is used as written** (`ingest::oracle::{source_key}`), with no
+  fork for a replay - see 4b decision 2. `run_sequence` is monotonic across run types, so a
+  replay always carries a higher version and cannot collide.
+- **The high-water mark is `MAX(cursor)`, never the database clock.** The stage file offers
+  both. A clock reading is ahead of every committed row by definition, so it would move the
+  watermark past rows still in flight; `MAX(cursor)` at least never claims to have read past
+  the last row it saw. Neither closes VB-25.
+- **`landing_partition_by` is `ingest_date`, not a cursor-derived date.** A cursor is optional
+  and its column differs per source, so a partition column that exists for some sources and
+  not others is a layout nobody can reason about. The cost is the `true` merge predicate,
+  which is stated at the call site.
+- **One existing test changed.** `test_framework_runner.py::test_the_shipped_source_stubs_
+  refuse_to_pretend` derived its list as "everything except kafka"; Oracle is now implemented,
+  so the list is `_SOURCES` minus an explicit implemented set. Stage 5 empties it.
+
+## 4. Blocked
+
+- Nothing. Two things deliberately not done, one sentence each per CORE rule 8:
+  - **No safety lag on the high-water mark** - it is VB-25's first remedy, it needs a number
+    only the source team has, and applying one without `merge_keys` would trade silent loss
+    for silent duplication.
+  - **No reconciliation or row-count-check utility** - the stage file's "do not build" list
+    rules out a schema-migration or reconciliation utility, and VB-25's check is a query a
+    human runs once per table at onboarding.
+
+## 5. Decisions for the human
+
+1. **The merge key is `merge_keys + cursor_column`, so landing keeps every version of a row.**
+   The alternative - merging on the business key alone - makes landing a current-state mirror,
+   which is smaller and faster and destroys the history replay depends on. It would also make
+   D-09's full/delta switch destructive on a table that already holds several versions.
+   *What would change it:* a source table where version history is genuinely unwanted and
+   storage matters more - at which point the honest form is a documented per-source setting,
+   not a silent change of meaning.
+2. **The landing MERGE scans the whole table (`partition_predicate="true"`).** Correct, and
+   not free: a daily delta into a large landing table rewrites nothing but must SCAN
+   everything to find its matches. The alternative is a cursor-derived partition column, which
+   only exists for timestamp cursors.
+   *What would change it:* a landing table where the merge scan is itself the incident. The
+   fix would then be a partition column derived from the cursor for the sources that have one,
+   and it should be a decision here rather than an optimisation somebody applies quietly.
+3. **A source with merge keys and no cursor UPDATES matched rows.** With no cursor the key
+   identifies the row rather than a version, so a match means the source row changed and the
+   mirror goes stale unless it is rewritten. That is the one path where landing overwrites
+   what it previously recorded.
+   *What would change it:* wanting snapshot history for full-load sources too, which needs a
+   snapshot date in the key rather than an update.
+4. **VB-25 is a limitation, not a bug, and the code says so out loud.** It is at the top of
+   `run.py` and in the backlog with three remedies costed. It should be raised with the source
+   team at onboarding rather than discovered during a reconciliation six months in.
+
+---
+
+**Test count:** 708 passed, 6 skipped before -> **745 passed, 6 skipped, 36 deselected**
+after (`pytest -m "not spark" -q`). Net +37 across two new test files.
+
+**New VB entries this sub-step:** VB-25 (rows committed below the high-water mark).

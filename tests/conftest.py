@@ -926,7 +926,60 @@ def make_oracle_cfg(config_root, source_key="demo_oracle", environment="dev", ru
     return oracle_config.build(resolved, run_type, tables)
 
 
-def make_oracle_ctx(config_root, source_key="demo_oracle", environment="dev", run_type="primary", **job_parameters):
+class RecordingState:
+    """Stands in for framework/state.py's StateStore, recording every read and write.
+
+    The Oracle source's correctness is an ORDERING - read, write, commit, then advance -
+    so what a test needs is not a state table but a record of when state was written
+    relative to everything else. `writes` is that record, and it is empty for every case
+    where the watermark must NOT move.
+    """
+
+    def __init__(self, values=None, on_write=None):
+        self.values = dict(values or {})
+        self.reads = []
+        self.writes = []
+        self._on_write = on_write
+
+    def read_state(self, source_key, state_key):
+        self.reads.append((source_key, state_key))
+        return self.values.get((source_key, state_key))
+
+    def write_state(self, source_key, state_key, value, value_type, run_id):
+        if self._on_write is not None:
+            self._on_write()
+        self.writes.append(
+            {
+                "source_key": source_key,
+                "state_key": state_key,
+                "value": value,
+                "value_type": value_type,
+                "run_id": run_id,
+            }
+        )
+        self.values[(source_key, state_key)] = value
+
+    def next_run_sequence(self, source_key):
+        return 1
+
+    @property
+    def watermark(self):
+        """The value the LAST write left, or None if the watermark never moved."""
+        writes = [w for w in self.writes if w["state_key"] == "watermark"]
+        return writes[-1]["value"] if writes else None
+
+
+def make_oracle_ctx(
+    config_root,
+    source_key="demo_oracle",
+    environment="dev",
+    run_type="primary",
+    spark=None,
+    state=None,
+    existing_tables=(),
+    run_sequence=1,
+    **job_parameters,
+):
     """A RunContext of stand-ins, built through the real config resolution path.
 
     A source is handed a RunContext and nothing else, so this is how one is tested without
@@ -940,15 +993,15 @@ def make_oracle_ctx(config_root, source_key="demo_oracle", environment="dev", ru
     cfg = resolve_config(config_root, source_key, environment, oracle.SOURCE_SPEC, job_parameters=job_parameters)
     return RunContext(
         cfg=cfg,
-        spark=FakeSpark(),
+        spark=spark if spark is not None else FakeJdbcSpark(),
         audit=RecordingAudit(run_type=run_type),
-        state=None,
+        state=state if state is not None else RecordingState(),
         writers=RecordingWriters(),
-        tables=RecordingTables(),
+        tables=RecordingTables(existing_tables),
         log=RecordingLog(),
         run_id=f"{source_key}-{run_type}-test",
         run_type=run_type,
-        run_sequence=1,
+        run_sequence=run_sequence,
     )
 
 
@@ -956,6 +1009,31 @@ def make_oracle_ctx(config_root, source_key="demo_oracle", environment="dev", ru
 def oracle_cfg(oracle_config_root):
     """The default source: a full extract of CLAIMS.CLAIM_HEADER."""
     return make_oracle_cfg(oracle_config_root)
+
+
+# --------------------------------------------------------------------------------------
+# A Spark schema, without Spark. sources/oracle/types.py reads `.fields`, `.name` and
+# `.dataType.simpleString()` by duck typing precisely so this is possible.
+# --------------------------------------------------------------------------------------
+
+
+class FakeType:
+    def __init__(self, name):
+        self._name = name
+
+    def simpleString(self):  # noqa: N802 - mirrors the Spark API
+        return self._name
+
+
+class FakeField:
+    def __init__(self, name, type_name):
+        self.name = name
+        self.dataType = FakeType(type_name)
+
+
+class FakeSchema:
+    def __init__(self, columns):
+        self.fields = [FakeField(name, type_name) for name, type_name in columns.items()]
 
 
 # --------------------------------------------------------------------------------------
@@ -989,15 +1067,43 @@ class RecordingJdbcReader:
 
     def load(self):
         self._spark.reads.append(self)
-        return self._spark.next_frame()
+        # Kept so a test can assert on the frame this read returned - specifically that it
+        # was cached and released, which is what stops a JDBC extract running twice.
+        self.load_result = self._spark.next_frame()
+        return self.load_result
 
 
 class LoadedFrame:
-    """What a recorded read returns: rows and a schema, both supplied by the test."""
+    """What a recorded read returns: rows and a schema, both supplied by the test.
+
+    Records the projection and the cache lifecycle instead of performing either. Between
+    them those are what an Oracle run does to a frame, and both matter: the projection is
+    landing's provenance columns, and an extract that is not cached is read from the source
+    TWICE (once to count, once to write).
+    """
 
     def __init__(self, rows=(), schema=None):
         self.rows = [FakeRow(row) if isinstance(row, dict) else row for row in rows]
-        self.schema = schema
+        self.schema = schema if schema is not None else FakeSchema({})
+        self.projections = []
+        self.persisted = 0
+        self.unpersisted = 0
+
+    @property
+    def columns(self):
+        return [field.name for field in self.schema.fields]
+
+    def selectExpr(self, *expressions):  # noqa: N802 - mirrors the Spark API
+        self.projections.append(list(expressions))
+        return self
+
+    def persist(self, _level=None):
+        self.persisted += 1
+        return self
+
+    def unpersist(self):
+        self.unpersisted += 1
+        return self
 
     def collect(self):
         return list(self.rows)
@@ -1014,42 +1120,31 @@ class FakeJdbcSpark(FakeSpark):
     about how the two DIFFER.
     """
 
-    def __init__(self, frames=None, **kwargs):
+    def __init__(self, frames=None, frames_by_table=None, **kwargs):
         super().__init__(**kwargs)
         self.reads = []
-        self._frames = list(frames or [])
+        # `_load_frames`, not `_frames`: FakeSpark already uses that name for the frames it
+        # hands back from `table()`, and one name for two things is how a fake starts lying.
+        self._load_frames = list(frames or [])
+        # What `spark.table(name).schema` returns - i.e. what the landing table already
+        # holds, which is the other half of the schema-drift check.
+        self._frames_by_table = dict(frames_by_table or {})
 
     @property
     def read(self):
         return RecordingJdbcReader(self)
 
     def next_frame(self):
-        return self._frames.pop(0) if self._frames else LoadedFrame()
+        return self._load_frames.pop(0) if self._load_frames else LoadedFrame()
+
+    def table(self, name):
+        """An existing Delta table, for the schema-drift comparison.
+
+        A table a test did not describe gets an EMPTY schema, which reads as "nothing to
+        compare against" rather than as drift - so a test about the write path does not
+        have to restate the schema it is not testing.
+        """
+        return self._frames_by_table.setdefault(name, LoadedFrame())
 
     def options_for(self, index):
         return self.reads[index].options_used
-
-
-# --------------------------------------------------------------------------------------
-# A Spark schema, without Spark. sources/oracle/types.py reads `.fields`, `.name` and
-# `.dataType.simpleString()` by duck typing precisely so this is possible.
-# --------------------------------------------------------------------------------------
-
-
-class FakeType:
-    def __init__(self, name):
-        self._name = name
-
-    def simpleString(self):  # noqa: N802 - mirrors the Spark API
-        return self._name
-
-
-class FakeField:
-    def __init__(self, name, type_name):
-        self.name = name
-        self.dataType = FakeType(type_name)
-
-
-class FakeSchema:
-    def __init__(self, columns):
-        self.fields = [FakeField(name, type_name) for name, type_name in columns.items()]

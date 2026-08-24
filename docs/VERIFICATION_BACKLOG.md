@@ -665,3 +665,40 @@ code must change -- see "If it fails").
   `_check_session_init()` plus the `session_init` key should be removed rather than left as a
   lever that does nothing.
 - **Status:** OPEN
+
+### VB-25 -- How often does Oracle commit a row whose cursor value is already below the watermark?
+- **Stage / file:** Stage 4c. `sources/oracle/run.py`, `sources/oracle/query.py`
+  `_cursor_predicates()`.
+- **Why it matters:** This is the one gap a closed interval does NOT close, and it is a
+  property of cursor extraction rather than a bug in this code. The high-water mark is
+  `MAX(cursor)` as of the start of the run. A transaction that was already open at that
+  moment, carrying a `LAST_UPDATE_DT` below it, and that commits after the extract has read
+  past that value, is never seen: the interval containing it has been read, and the
+  watermark has moved past. Nothing downstream can detect it - the row simply is not there,
+  the run reported success, and the counts look ordinary.
+
+  How much this matters is entirely a property of the SOURCE application: a system that sets
+  `LAST_UPDATE_DT` at the start of a long transaction loses rows regularly; one that sets it
+  on commit loses none. That is a question for the source team, not an assumption to make.
+- **How to check:** With the source team, for each table onboarded:
+  1. Ask when the cursor column is assigned - at statement time (`SYSDATE` in a trigger at
+     the start of the transaction) or effectively at commit.
+  2. Measure the exposure:
+     ```sql
+     -- longest-running transactions touching the source table
+     SELECT s.sid, s.username, t.start_time, t.status
+       FROM v$transaction t JOIN v$session s ON s.saddr = t.ses_addr;
+     ```
+     The longest transaction duration IS the size of the window rows can be lost in.
+  3. Reconcile: for a completed day, count rows in Oracle with
+     `LAST_UPDATE_DT` in that day against the landing table's count for the same range.
+- **Expected:** Either the cursor is assigned at commit (no exposure), or the longest
+  transaction is far shorter than the run interval and the reconciliation matches.
+- **If it fails:** In increasing order of cost: (a) subtract a safety lag from the high-water
+  mark - i.e. extract only up to `MAX(cursor) - <longest transaction>` - which is one change
+  in `_capture_high_water()` and needs `merge_keys` set so the resulting overlap dedupes;
+  (b) switch that table to `incremental_mode: full` if it is small; (c) move to a real
+  change-tracking mechanism (SCN, Flashback Query, or CDC), which is a different source type
+  and not a tweak to this one. Do NOT widen the interval without merge keys - that trades
+  silent loss for silent duplication.
+- **Status:** OPEN

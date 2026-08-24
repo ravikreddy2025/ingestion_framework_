@@ -249,6 +249,7 @@ class OracleConfig:
     cursor_type: str | None
     merge_keys: tuple[str, ...]
 
+    landing_partition_by: tuple[str, ...]
     partition_column: str | None
     num_partitions: int
     fetch_size: int
@@ -292,6 +293,44 @@ class OracleConfig:
         marker work at all: one writer, one identity, forever.
         """
         return f"ingest::oracle::{self.source_key}"
+
+    @property
+    def merge_on(self) -> tuple[str, ...]:
+        """The columns a MERGE matches on: the business key, PLUS the cursor column.
+
+        The cursor is in the key whenever the source HAS one, and that is independent of
+        the mode this particular run happens to be in. Two things follow, and both are the
+        point:
+
+        LANDING KEEPS EVERY VERSION. `(CLAIM_ID, LAST_UPDATE_DT)` identifies one VERSION of
+        a claim rather than the claim, so a row that changed in Oracle lands as a new row
+        beside its predecessor. That is what makes landing the retained mirror replay and
+        historical reprocessing depend on (see DECISIONS.md D-07); merging on the business
+        key alone would collapse the table to current state.
+
+        THE KEY IS STABLE ACROSS A MODE SWITCH. Support can move a source between delta and
+        full without a deploy (D-09), and if the key depended on the current mode, a full
+        run over a table holding several versions of a claim would match ALL of them with
+        one source row and overwrite every one. Keying on the cursor as well means a full
+        run re-reading unchanged rows matches each version to itself and changes nothing -
+        which is exactly the "switching to full is free where merge_keys are set" claim the
+        control table's comment makes.
+        """
+        if not self.merge_keys:
+            return ()
+        return (*self.merge_keys, *((self.cursor_column,) if self.cursor_column else ()))
+
+    @property
+    def update_matched_rows(self) -> bool:
+        """Does a matched MERGE row get rewritten, or left as it arrived?
+
+        The answer follows what the key IDENTIFIES. With the cursor in the key a match means
+        an IDENTICAL version - so there is nothing to update, and leaving the row untouched
+        preserves the arrival record (run id, ingest timestamp) that makes landing auditable.
+        Without a cursor the key identifies the ROW, so a match means the source row CHANGED
+        and the mirror goes stale unless it is rewritten.
+        """
+        return not self.cursor_column
 
     @property
     def merge_on_write(self) -> bool:
@@ -344,6 +383,7 @@ def build(cfg: Any, run_type: str, tables: Any) -> OracleConfig:
         cursor_column=_optional_identifier(cfg, "cursor_column"),
         cursor_type=_lower(cfg.get("cursor_type")),
         merge_keys=_identifiers(cfg, "merge_keys"),
+        landing_partition_by=_identifiers(cfg, "landing_partition_by"),
         partition_column=_optional_identifier(cfg, "partition_column"),
         num_partitions=_positive_int(cfg.get("num_partitions"), "num_partitions", cfg.source_key),
         fetch_size=_positive_int(cfg.get("fetch_size"), "fetch_size", cfg.source_key),
