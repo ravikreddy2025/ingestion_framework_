@@ -1,11 +1,15 @@
 """End-to-end: Kafka rows -> landing projection -> curated + quarantine.
 
-These are the tests for the framework's central claim: a single microbatch containing
+THESE NEED A REAL SPARK SESSION AND THE spark-avro CONNECTOR, so they are all
+`@pytest.mark.spark` and are deselected by the local gate (`pytest -m "not spark"`). They
+are written to be run on a machine or cluster that has both - see VB-10.
+
+They are the tests for this framework's central claim: a single microbatch containing
 records written under DIFFERENT schema versions parses correctly, because each record is
 resolved by the writer_schema_id in its own wire header.
 
-They also pin the two shape decisions that the developer team is most likely to want to
-change later, so a change is a deliberate test edit rather than a silent regression:
+They also pin the two shape decisions a future team is most likely to want to change, so a
+change is a deliberate test edit rather than a silent regression:
   * the payload stays NESTED in one struct column
   * CloudEvent attributes are promoted from Kafka headers to typed columns
 
@@ -23,11 +27,12 @@ from datetime import datetime
 
 import pytest
 
+from conftest import ddl_column_names, make_kafka_cfg
+
 pytest.importorskip("pyspark", reason="needs pyspark")
 
-from conftest import FakeSpark
-from kafka_ingest.config import resolve_topic_config
-from kafka_ingest.schema_resolver import SchemaResolutionError
+from kafka_ingest.sources.kafka import wire as wire_module
+from kafka_ingest.sources.kafka.registry import SchemaResolutionError
 
 # --------------------------------------------------------------------------------------
 # Minimal Avro binary encoder
@@ -68,23 +73,31 @@ def wire(schema_id: int, payload: bytes) -> bytes:
 SCHEMA_V1_ID = 101
 SCHEMA_V2_ID = 202
 
-SCHEMA_V1 = json.dumps({
-    "type": "record", "name": "Demo", "namespace": "kafka_ingest.test",
-    "fields": [{"name": "event_id", "type": "long"}],
-})
+SCHEMA_V1 = json.dumps(
+    {
+        "type": "record",
+        "name": "Demo",
+        "namespace": "kafka_ingest.test",
+        "fields": [{"name": "event_id", "type": "long"}],
+    }
+)
 
 # v2 adds a field WITH a default - the FORWARD_TRANSITIVE-compatible change that makes a
 # mixed-version microbatch legal in the first place.
-SCHEMA_V2 = json.dumps({
-    "type": "record", "name": "Demo", "namespace": "kafka_ingest.test",
-    "fields": [
-        {"name": "event_id", "type": "long"},
-        {"name": "source_system", "type": "string", "default": "unknown"},
-    ],
-})
+SCHEMA_V2 = json.dumps(
+    {
+        "type": "record",
+        "name": "Demo",
+        "namespace": "kafka_ingest.test",
+        "fields": [
+            {"name": "event_id", "type": "long"},
+            {"name": "source_system", "type": "string", "default": "unknown"},
+        ],
+    }
+)
 
-V1_RECORD = avro_long(7)                                # {event_id: 7}
-V2_RECORD = avro_long(8) + avro_string("rcm-gateway")   # {event_id: 8, source_system: ...}
+V1_RECORD = avro_long(7)  # {event_id: 7}
+V2_RECORD = avro_long(8) + avro_string("rcm-gateway")  # {event_id: 8, source_system: ...}
 
 
 class FakeRegistryClient:
@@ -155,29 +168,27 @@ def kafka_rows(spark, records):
 
 
 def make_cfg(config_root, **overrides):
-    """Resolve the demo topic, applying operational-tier overrides (on_deser_error etc.)."""
-    return resolve_topic_config(FakeSpark(), config_root, "demo_topic", "ops.ingestion.control", "prod",
-                                overrides=overrides)
+    """The resolved Kafka config, through the real five-layer path."""
+    return make_kafka_cfg(config_root, environment="prod", **overrides)
 
 
 def with_structural(cfg, **fields):
     """Set STRUCTURAL fields directly.
 
-    Fields like curated_dedup_keys and the partition lists are deliberately NOT in the
-    operational override set - changing them is a PR, not a runtime toggle - so a test that
-    needs them has to set them on the resolved config rather than pass them as overrides.
+    Dedup keys and the partition lists are deliberately NOT operationally overridable -
+    changing them is a PR, not a runtime toggle - so a test that needs them sets them on the
+    resolved config rather than passing them as overrides, which would be ignored.
     """
     return replace(cfg, **fields)
 
 
 def run_parse(spark, cfg, records, client=None, reader=(SCHEMA_V2_ID, SCHEMA_V2)):
-    from kafka_ingest.curated_writer import parse_batch
-    from kafka_ingest.landing_writer import project_landing
+    from kafka_ingest.sources.kafka import landing
+    from kafka_ingest.sources.kafka.curated import parse_batch
 
-    landing = project_landing(kafka_rows(spark, records), cfg, batch_id=0, run_id="run-1")
-    result = parse_batch(spark, landing, cfg, client or FakeRegistryClient(), 0, "run-1",
-                         reader_schema=reader)
-    return landing, result
+    landing_df = landing.project(kafka_rows(spark, records), cfg, 0, "run-1")
+    result = parse_batch(spark, landing_df, cfg, client or FakeRegistryClient(), 0, "run-1", reader_schema=reader)
+    return landing_df, result
 
 
 # --------------------------------------------------------------------------------------
@@ -194,10 +205,7 @@ def test_one_microbatch_with_two_writer_schema_versions_parses_correctly(spark, 
     'latest' schema for the whole stream would either fail on the v1 bytes or mis-read them.
     """
     cfg = make_cfg(config_root)
-    _, result = run_parse(spark, cfg, [
-        (wire(SCHEMA_V1_ID, V1_RECORD), []),
-        (wire(SCHEMA_V2_ID, V2_RECORD), []),
-    ])
+    _, result = run_parse(spark, cfg, [(wire(SCHEMA_V1_ID, V1_RECORD), []), (wire(SCHEMA_V2_ID, V2_RECORD), [])])
 
     assert result.quarantine_df is None
     assert sorted(result.writer_schema_ids) == [SCHEMA_V1_ID, SCHEMA_V2_ID]
@@ -218,9 +226,12 @@ def test_one_microbatch_with_two_writer_schema_versions_parses_correctly(spark, 
 def test_each_writer_schema_is_fetched_once_per_batch(spark, config_root):
     """Registry lookups are per distinct schema id, not per record."""
     client = FakeRegistryClient()
-    run_parse(spark, make_cfg(config_root),
-              [(wire(SCHEMA_V1_ID, V1_RECORD), [])] * 5 + [(wire(SCHEMA_V2_ID, V2_RECORD), [])] * 5,
-              client=client)
+    run_parse(
+        spark,
+        make_cfg(config_root),
+        [(wire(SCHEMA_V1_ID, V1_RECORD), [])] * 5 + [(wire(SCHEMA_V2_ID, V2_RECORD), [])] * 5,
+        client=client,
+    )
     assert sorted(client.requested) == [SCHEMA_V1_ID, SCHEMA_V2_ID]
 
 
@@ -233,11 +244,10 @@ def test_each_writer_schema_is_fetched_once_per_batch(spark, config_root):
 def test_payload_stays_nested_and_is_not_exploded(spark, config_root):
     """Curated is 1:1 with Kafka records and keeps the payload in one struct column.
 
-    Exploding would break the (topic, kafka_partition, kafka_offset) merge key that makes
+    Exploding would break the (topic, kafka_partition, kafka_offset) merge key that makes a
     replay idempotent. Fan-out belongs downstream, not here.
     """
-    cfg = make_cfg(config_root)
-    _, result = run_parse(spark, cfg, [(wire(SCHEMA_V2_ID, V2_RECORD), [])])
+    _, result = run_parse(spark, make_cfg(config_root), [(wire(SCHEMA_V2_ID, V2_RECORD), [])])
     row = result.curated_df.collect()[0]
 
     assert result.curated_df.count() == 1
@@ -250,8 +260,7 @@ def test_payload_stays_nested_and_is_not_exploded(spark, config_root):
 @pytest.mark.spark
 def test_curated_column_order_matches_the_ddl(spark, config_root):
     """Projection and the documented DDL must agree - a test, not a comment."""
-    from kafka_ingest.tables import CURATED_FIXED_COLUMNS
-    from test_audit_and_tables import ddl_column_names
+    from kafka_ingest.sources.kafka.tables import CURATED_FIXED_COLUMNS
 
     _, result = run_parse(spark, make_cfg(config_root), [(wire(SCHEMA_V2_ID, V2_RECORD), [])])
     assert result.curated_df.columns == ddl_column_names(CURATED_FIXED_COLUMNS) + ["payload"]
@@ -264,15 +273,18 @@ def test_curated_column_order_matches_the_ddl(spark, config_root):
 
 @pytest.mark.spark
 def test_cloudevent_attributes_are_promoted_from_kafka_headers(spark, config_root):
-    cfg = make_cfg(config_root)
     headers = ce_headers(
-        ce_id="evt-123", ce_source="/rcm/gateway", ce_type="com.acme.claim.updated",
-        ce_subject="claim/987", ce_time="2026-08-11T09:30:00Z", ce_specversion="1.0",
+        ce_id="evt-123",
+        ce_source="/rcm/gateway",
+        ce_type="com.acme.claim.updated",
+        ce_subject="claim/987",
+        ce_time="2026-08-11T09:30:00Z",
+        ce_specversion="1.0",
     ) + [("content-type", b"application/avro")]
 
-    landing, result = run_parse(spark, cfg, [(wire(SCHEMA_V2_ID, V2_RECORD), headers)])
+    landing_df, result = run_parse(spark, make_cfg(config_root), [(wire(SCHEMA_V2_ID, V2_RECORD), headers)])
 
-    for frame in (landing, result.curated_df):
+    for frame in (landing_df, result.curated_df):
         row = frame.collect()[0]
         assert row["ce_id"] == "evt-123"
         assert row["ce_source"] == "/rcm/gateway"
@@ -288,9 +300,17 @@ def test_cloudevent_attributes_are_promoted_from_kafka_headers(spark, config_roo
 @pytest.mark.spark
 def test_header_matching_is_case_insensitive(spark, config_root):
     """Brokers and client libraries disagree about header casing."""
-    _, result = run_parse(spark, make_cfg(config_root),
-                          [(wire(SCHEMA_V2_ID, V2_RECORD), ce_headers(CE_ID="evt-9"))])
+    _, result = run_parse(spark, make_cfg(config_root), [(wire(SCHEMA_V2_ID, V2_RECORD), ce_headers(CE_ID="evt-9"))])
     assert result.curated_df.collect()[0]["ce_id"] == "evt-9"
+
+
+@pytest.mark.spark
+def test_a_duplicated_header_key_takes_the_first_value_rather_than_erroring(spark, config_root):
+    """Kafka permits duplicate header keys. Array indexing would throw under ANSI mode and
+    a map construction would error on the duplicate, which is why neither is used."""
+    headers = [("ce_id", b"first"), ("ce_id", b"second")]
+    _, result = run_parse(spark, make_cfg(config_root), [(wire(SCHEMA_V2_ID, V2_RECORD), headers)])
+    assert result.curated_df.collect()[0]["ce_id"] == "first"
 
 
 @pytest.mark.spark
@@ -303,17 +323,21 @@ def test_topic_without_cloudevents_gets_nulls_not_an_error(spark, config_root):
 
 @pytest.mark.spark
 def test_event_date_prefers_ce_time_and_falls_back_to_kafka_timestamp(spark, config_root):
-    """event_date is the curated partition key, so it must never be NULL and never throw."""
-    cfg = make_cfg(config_root)
-    _, result = run_parse(spark, cfg, [
-        (wire(SCHEMA_V2_ID, V2_RECORD), ce_headers(ce_time="2026-07-04T23:00:00Z")),
-        (wire(SCHEMA_V2_ID, V2_RECORD), []),                                  # no ce_time
-        (wire(SCHEMA_V2_ID, V2_RECORD), ce_headers(ce_time="not-a-timestamp")),  # malformed
-    ])
+    """event_date is the curated partition key AND what bounds a curated replay's MERGE, so
+    it must never be NULL and must never throw."""
+    _, result = run_parse(
+        spark,
+        make_cfg(config_root),
+        [
+            (wire(SCHEMA_V2_ID, V2_RECORD), ce_headers(ce_time="2026-07-04T23:00:00Z")),
+            (wire(SCHEMA_V2_ID, V2_RECORD), []),  # no ce_time
+            (wire(SCHEMA_V2_ID, V2_RECORD), ce_headers(ce_time="not-a-timestamp")),  # malformed
+        ],
+    )
     by_offset = {r["kafka_offset"]: r["event_date"] for r in result.curated_df.collect()}
-    assert str(by_offset[1000]) == "2026-07-04"          # from ce_time
-    assert str(by_offset[1001]) == "2026-08-11"          # fell back to kafka_timestamp
-    assert str(by_offset[1002]) == "2026-08-11"          # malformed ce_time, no exception
+    assert str(by_offset[1000]) == "2026-07-04"  # from ce_time
+    assert str(by_offset[1001]) == "2026-08-11"  # fell back to kafka_timestamp
+    assert str(by_offset[1002]) == "2026-08-11"  # malformed ce_time, no exception
 
 
 # --------------------------------------------------------------------------------------
@@ -326,63 +350,123 @@ def test_landing_keeps_the_original_bytes_verbatim(spark, config_root):
     """Landing must be byte-identical to the wire, header included - that is what makes a
     curated replay possible after Kafka retention has expired."""
     original = wire(SCHEMA_V2_ID, V2_RECORD)
-    landing, _ = run_parse(spark, make_cfg(config_root), [(original, [])])
-    row = landing.collect()[0]
+    landing_df, _ = run_parse(spark, make_cfg(config_root), [(original, [])])
+    row = landing_df.collect()[0]
     assert bytes(row["value"]) == original
     assert row["writer_schema_id"] == SCHEMA_V2_ID
     assert row["wire_format_valid"] is True
+    assert row["malformed_reason"] is None
     assert row["payload_bytes"] == len(original)
     assert row["kafka_key_string"] == "k"
 
 
 @pytest.mark.spark
 def test_landing_column_order_matches_the_ddl(spark, config_root):
-    from kafka_ingest.tables import LANDING_DDL_COLUMNS
-    from test_audit_and_tables import ddl_column_names
+    from kafka_ingest.sources.kafka.tables import LANDING_DDL_COLUMNS
 
-    landing, _ = run_parse(spark, make_cfg(config_root), [(wire(SCHEMA_V2_ID, V2_RECORD), [])])
-    assert landing.columns == ddl_column_names(LANDING_DDL_COLUMNS)
+    landing_df, _ = run_parse(spark, make_cfg(config_root), [(wire(SCHEMA_V2_ID, V2_RECORD), [])])
+    assert landing_df.columns == ddl_column_names(LANDING_DDL_COLUMNS)
 
 
 # --------------------------------------------------------------------------------------
-# Failure handling
+# Malformed payload triage - three inputs, three reasons, three conversations
 # --------------------------------------------------------------------------------------
+
+TOMBSTONE = None
+TRUNCATED = b"\x00\x01\x02"  # under the 5-byte header
+BAD_MAGIC = b"\x99not-confluent"
 
 
 @pytest.mark.spark
-def test_failfast_raises_on_a_malformed_record_and_names_the_offsets(spark, config_root):
-    cfg = make_cfg(config_root, on_deser_error="fail")
-    with pytest.raises(SchemaResolutionError, match="wire-format header"):
-        run_parse(spark, cfg, [(wire(SCHEMA_V2_ID, V2_RECORD), []), (b"\x99not-confluent", [])])
+@pytest.mark.parametrize(
+    "payload, expected_reason",
+    [
+        (TOMBSTONE, wire_module.REASON_NULL_VALUE),
+        (TRUNCATED, wire_module.REASON_TRUNCATED),
+        (BAD_MAGIC, wire_module.REASON_BAD_MAGIC),
+    ],
+)
+def test_each_malformed_input_is_quarantined_under_its_own_reason(spark, config_root, payload, expected_reason):
+    """One `when()` chain, three distinct answers.
+
+    All three used to arrive as "malformed_wire_format", which is three different producing
+    -team conversations wearing one label: a compacted topic emitting tombstones, a producer
+    truncating, and a producer not using this framing at all. The label decides who gets
+    called, so it has to be right.
+
+    RAW BYTES ARE RETAINED in every case, which is what makes the record recoverable by a
+    curated replay once the cause is fixed. A tombstone has no bytes to retain, and NULL is
+    the honest record of that.
+    """
+    cfg = make_cfg(config_root, failure_mode="QUARANTINE")
+    _, result = run_parse(spark, cfg, [(payload, []), (wire(SCHEMA_V2_ID, V2_RECORD), [])])
+
+    # The good record in the same batch is unaffected - one bad record must not cost the batch.
+    assert result.curated_df.count() == 1
+
+    quarantined = result.quarantine_df.collect()
+    assert len(quarantined) == 1
+    row = quarantined[0]
+    assert row["quarantine_reason"] == expected_reason
+    assert row["writer_schema_id"] is None
+    assert row["quarantine_detail"] == wire_module.MALFORMED_DETAIL[expected_reason]
+    assert (None if row["value"] is None else bytes(row["value"])) == payload
+    # Provenance is retained too, or the row cannot be traced back to its landing row.
+    assert row["kafka_offset"] == 1000
+    assert row["topic"] == "demo.events.v1"
+
+
+@pytest.mark.spark
+def test_three_malformed_reasons_in_one_batch_are_separated(spark, config_root):
+    """The whole point: a batch carrying all three arrives as three groups, not one blob."""
+    cfg = make_cfg(config_root, failure_mode="QUARANTINE")
+    _, result = run_parse(spark, cfg, [(TOMBSTONE, []), (TRUNCATED, []), (BAD_MAGIC, [])])
+    reasons = sorted(r["quarantine_reason"] for r in result.quarantine_df.collect())
+    assert reasons == sorted(wire_module.MALFORMED_REASONS)
+    assert result.curated_df is None
+
+
+@pytest.mark.spark
+def test_failfast_raises_and_names_both_the_reasons_and_the_offsets(spark, config_root):
+    """The offsets are what an operator needs to look at the records; the reasons are what
+    tells them which producing team to call."""
+    cfg = make_cfg(config_root)
+    with pytest.raises(SchemaResolutionError) as exc:
+        run_parse(spark, cfg, [(wire(SCHEMA_V2_ID, V2_RECORD), []), (BAD_MAGIC, [])])
+    message = str(exc.value)
+    assert wire_module.REASON_BAD_MAGIC in message
+    assert "1001" in message
+    assert "QUARANTINE" in message, "the error must name the lever that unblocks the stream"
+
+
+# --------------------------------------------------------------------------------------
+# Other failure handling
+# --------------------------------------------------------------------------------------
 
 
 @pytest.mark.spark
 def test_quarantine_splits_bad_records_and_keeps_the_good_ones(spark, config_root):
-    cfg = make_cfg(config_root, on_deser_error="quarantine")
-    _, result = run_parse(spark, cfg, [
-        (wire(SCHEMA_V2_ID, V2_RECORD), []),
-        (b"\x99not-confluent", []),
-        (wire(SCHEMA_V1_ID, V1_RECORD), []),
-    ])
+    cfg = make_cfg(config_root, failure_mode="QUARANTINE")
+    _, result = run_parse(
+        spark,
+        cfg,
+        [(wire(SCHEMA_V2_ID, V2_RECORD), []), (BAD_MAGIC, []), (wire(SCHEMA_V1_ID, V1_RECORD), [])],
+    )
     assert result.curated_df.count() == 2
     quarantined = result.quarantine_df.collect()
     assert len(quarantined) == 1
-    assert quarantined[0]["quarantine_reason"] == "malformed_wire_format"
-    # Raw bytes retained, so the record is recoverable once the cause is fixed.
-    assert bytes(quarantined[0]["value"]) == b"\x99not-confluent"
-    assert quarantined[0]["writer_schema_id"] is None
+    assert bytes(quarantined[0]["value"]) == BAD_MAGIC
 
 
 @pytest.mark.spark
 def test_unregistered_schema_id_quarantines_that_group_only(spark, config_root):
     """The registry cannot say how those bytes were written, but the rest of the batch is
     perfectly parseable and must not be held hostage."""
-    cfg = make_cfg(config_root, on_deser_error="quarantine")
+    cfg = make_cfg(config_root, failure_mode="QUARANTINE")
     client = FakeRegistryClient(schemas={SCHEMA_V2_ID: SCHEMA_V2})  # v1 not registered
-    _, result = run_parse(spark, cfg, [
-        (wire(SCHEMA_V1_ID, V1_RECORD), []),
-        (wire(SCHEMA_V2_ID, V2_RECORD), []),
-    ], client=client)
+    _, result = run_parse(
+        spark, cfg, [(wire(SCHEMA_V1_ID, V1_RECORD), []), (wire(SCHEMA_V2_ID, V2_RECORD), [])], client=client
+    )
 
     assert result.curated_df.count() == 1
     assert result.writer_schema_ids == [SCHEMA_V2_ID]
@@ -392,10 +476,9 @@ def test_unregistered_schema_id_quarantines_that_group_only(spark, config_root):
 
 @pytest.mark.spark
 def test_unregistered_schema_id_fails_the_batch_under_failfast(spark, config_root):
-    cfg = make_cfg(config_root, on_deser_error="fail")
     client = FakeRegistryClient(schemas={SCHEMA_V2_ID: SCHEMA_V2})
     with pytest.raises(SchemaResolutionError, match="no schema registered under id"):
-        run_parse(spark, cfg, [(wire(SCHEMA_V1_ID, V1_RECORD), [])], client=client)
+        run_parse(spark, make_cfg(config_root), [(wire(SCHEMA_V1_ID, V1_RECORD), [])], client=client)
 
 
 @pytest.mark.spark
@@ -407,37 +490,25 @@ def test_empty_batch_produces_neither_frame(spark, config_root):
 
 
 @pytest.mark.spark
-def test_tombstone_record_is_treated_as_malformed_not_parsed(spark, config_root):
-    """A NULL value has no schema id and cannot be parsed; it must not become a null row."""
-    cfg = make_cfg(config_root, on_deser_error="quarantine")
-    _, result = run_parse(spark, cfg, [(None, []), (wire(SCHEMA_V2_ID, V2_RECORD), [])])
-    assert result.curated_df.count() == 1
-    assert result.quarantine_df.count() == 1
-
-
-@pytest.mark.spark
 def test_dedup_key_must_reference_the_payload_struct(spark, config_root):
     """A bare business-field name is a common mistake now that payload is nested - the error
     has to say so plainly."""
-    cfg = with_structural(make_cfg(config_root), curated_dedup_keys=["event_id"])
+    cfg = with_structural(make_cfg(config_root), curated_dedup_keys=("event_id",))
     with pytest.raises(ValueError, match="payload.<field>"):
         run_parse(spark, cfg, [(wire(SCHEMA_V2_ID, V2_RECORD), [])])
 
 
 @pytest.mark.spark
 def test_dedup_keeps_the_newest_record_per_business_key(spark, config_root):
-    cfg = with_structural(make_cfg(config_root), curated_dedup_keys=["payload.event_id"])
-    _, result = run_parse(spark, cfg, [
-        (wire(SCHEMA_V2_ID, V2_RECORD), []),
-        (wire(SCHEMA_V2_ID, V2_RECORD), []),
-    ])
+    cfg = with_structural(make_cfg(config_root), curated_dedup_keys=("payload.event_id",))
+    _, result = run_parse(spark, cfg, [(wire(SCHEMA_V2_ID, V2_RECORD), []), (wire(SCHEMA_V2_ID, V2_RECORD), [])])
     rows = result.curated_df.collect()
     assert len(rows) == 1
-    assert rows[0]["kafka_offset"] == 1001   # highest offset wins the tie
+    assert rows[0]["kafka_offset"] == 1001  # highest offset wins the tie
 
 
 # --------------------------------------------------------------------------------------
-# Curated table schema, derived before any data is read
+# The curated table's schema, derived before any data is read
 # --------------------------------------------------------------------------------------
 
 
@@ -445,9 +516,8 @@ def test_dedup_keeps_the_newest_record_per_business_key(spark, config_root):
 def test_curated_schema_matches_what_the_writer_produces(spark, config_root):
     """Derived from an EMPTY frame, so onboarding needs no manual DDL - and the table cannot
     disagree with the projection, because it IS the projection."""
-    from kafka_ingest.curated_writer import curated_schema
-    from kafka_ingest.tables import CURATED_FIXED_COLUMNS
-    from test_audit_and_tables import ddl_column_names
+    from kafka_ingest.sources.kafka.curated import curated_schema
+    from kafka_ingest.sources.kafka.tables import CURATED_FIXED_COLUMNS
 
     cfg = make_cfg(config_root)
     schema = curated_schema(spark, cfg, (SCHEMA_V2_ID, SCHEMA_V2))
@@ -461,7 +531,7 @@ def test_curated_schema_matches_what_the_writer_produces(spark, config_root):
 
 @pytest.mark.spark
 def test_curated_schema_keeps_the_payload_nested(spark, config_root):
-    from kafka_ingest.curated_writer import curated_schema
+    from kafka_ingest.sources.kafka.curated import curated_schema
 
     schema = curated_schema(spark, make_cfg(config_root), (SCHEMA_V2_ID, SCHEMA_V2))
     payload = schema["payload"].dataType
@@ -473,7 +543,7 @@ def test_curated_schema_makes_every_field_nullable(spark, config_root):
     """Avro declares non-optional fields and from_avro reports them NOT NULL. Baking that
     into the table would turn one bad record into a failed batch instead of a quarantined
     row - the Avro decode already enforces the contract at parse time."""
-    from kafka_ingest.curated_writer import curated_schema
+    from kafka_ingest.sources.kafka.curated import curated_schema
 
     schema = curated_schema(spark, make_cfg(config_root), (SCHEMA_V2_ID, SCHEMA_V2))
     assert all(f.nullable for f in schema.fields)
@@ -484,7 +554,7 @@ def test_curated_schema_makes_every_field_nullable(spark, config_root):
 @pytest.mark.spark
 def test_curated_schema_needs_no_data(spark, config_root):
     """It must work on a brand new topic that has never received a message."""
-    from kafka_ingest.curated_writer import curated_schema
+    from kafka_ingest.sources.kafka.curated import curated_schema
 
     schema = curated_schema(spark, make_cfg(config_root), (SCHEMA_V1_ID, SCHEMA_V1))
     assert schema["payload"].dataType.fields, "payload struct should still be derived"

@@ -109,9 +109,14 @@ class FakeSpark:
         self.conf = FakeConf(conf)
         self.sql_statements = []
         self.created_frames = []
+        self._frames = {}
 
     def table(self, name):
-        return FakeDataFrame(self._rows_by_table.get(name, self._control_rows))
+        """One frame per table name, kept, so a test can read back the predicates a query
+        was built with. A fresh frame per call would discard exactly that."""
+        if name not in self._frames:
+            self._frames[name] = FakeDataFrame(self._rows_by_table.get(name, self._control_rows))
+        return self._frames[name]
 
     def sql(self, statement):
         self.sql_statements.append(statement)
@@ -132,11 +137,21 @@ class FakeRow:
 
 
 class FakeDataFrame:
+    """Records predicates instead of applying them.
+
+    Nothing here simulates Spark semantics - the assertions are about what the framework
+    HANDS to Spark, which is exactly the part that has to be right. `conditions` is how a
+    test asserts on a WHERE clause whose correctness is the point (a query that must
+    exclude the current run, say) without building a query engine to prove it.
+    """
+
     def __init__(self, rows):
         self._rows = rows
         self.filters = []
+        self.conditions = []
 
-    def where(self, _condition):
+    def where(self, condition):
+        self.conditions.append(condition)
         return self
 
     def filter(self, condition):
@@ -294,12 +309,12 @@ def reset_from_avro_selfcheck():
 
     Imported lazily so conftest itself stays importable without PySpark.
     """
-    from kafka_ingest import curated_writer
+    from kafka_ingest.sources.kafka import curated
 
-    previous = curated_writer._SEMANTICS_CHECKED
-    curated_writer._SEMANTICS_CHECKED = False
+    previous = curated._SEMANTICS_CHECKED
+    curated._SEMANTICS_CHECKED = False
     yield
-    curated_writer._SEMANTICS_CHECKED = previous
+    curated._SEMANTICS_CHECKED = previous
 
 
 @pytest.fixture
@@ -346,12 +361,13 @@ def config_root(tmp_path: Path) -> str:
               starting_offsets: earliest
               trigger: availableNow
               fail_on_data_loss: true
-              include_headers: true
+              min_partitions: 32
+              max_offsets_per_trigger: 1000000
               landing_partition_by: [ingest_date]
               curated_partition_by: [event_date]
               curated_dedup_order_by: kafka_timestamp
               reader_schema_mode: registry_latest
-              on_deser_error: fail
+              failure_mode: FAILFAST
             """
         ).strip(),
         encoding="utf-8",
@@ -461,6 +477,176 @@ def config_root(tmp_path: Path) -> str:
         encoding="utf-8",
     )
     return str(tmp_path)
+
+
+# --------------------------------------------------------------------------------------
+# Kafka fixtures.
+#
+# A source is handed a RunContext and nothing else, so the way to test one without a
+# cluster is to hand it a RunContext of stand-ins and assert on what it did with them.
+# `kafka_ctx` is that context; `kafka_cfg` resolves the source's own frozen config through
+# the REAL five-layer path, because a hand-built config would prove only that the
+# hand-built config works.
+# --------------------------------------------------------------------------------------
+
+
+class RecordingAudit:
+    """Stands in for framework/audit.py's AuditWriter. Records rows instead of writing."""
+
+    def __init__(self, run_id="run-1", run_type="primary"):
+        self.run_id = run_id
+        self.run_type = run_type
+        self.source_ref = None
+        self.rerun_id = None
+        self.rows = []
+
+    def emit(self, layer, status, txn_version=-1, **details):
+        self.rows.append({"layer": layer, "status": status, "txn_version": txn_version, **details})
+
+    def statuses(self, layer):
+        return [row["status"] for row in self.rows if row["layer"] == layer]
+
+
+class RecordingLog:
+    """Stands in for framework/logs.py's RunLog."""
+
+    def __init__(self):
+        self.lines = []
+
+    def _record(self, level, event, **fields):
+        self.lines.append((level, event, fields))
+
+    def info(self, event, **fields):
+        self._record("INFO", event, **fields)
+
+    def warning(self, event, **fields):
+        self._record("WARNING", event, **fields)
+
+    def error(self, event, **fields):
+        self._record("ERROR", event, **fields)
+
+    def events(self, level=None):
+        return [event for lvl, event, _ in self.lines if level is None or lvl == level]
+
+    def fields(self, event):
+        return next(fields for _, name, fields in self.lines if name == event)
+
+
+class RecordingWriters:
+    """Stands in for framework/writers.py, recording every append and merge.
+
+    Deliberately does NOT simulate Delta. What has to be right is WHICH call the source
+    makes and WHAT it passes - append vs merge decides whether a replay duplicates, the
+    txn markers decide whether a retry does, and the partition predicate decides how much
+    of the table a replay rewrites. All three are visible from the call alone.
+    """
+
+    def __init__(self):
+        self.appends = []
+        self.merges = []
+
+    def append(self, df, table, **kwargs):
+        self.appends.append({"df": df, "table": table, **kwargs})
+
+    def merge(self, spark, df, table, keys, partition_predicate, **kwargs):
+        self.merges.append(
+            {
+                "df": df,
+                "table": table,
+                "keys": tuple(keys),
+                "partition_predicate": partition_predicate,
+                **kwargs,
+            }
+        )
+
+    def merge_into(self, table):
+        return next(m for m in self.merges if m["table"] == table)
+
+    def append_into(self, table):
+        return next(a for a in self.appends if a["table"] == table)
+
+
+class RecordingTables:
+    """Stands in for framework/tables.py. Real naming, recorded creation.
+
+    `target`/`targets`/`validate_name` delegate to the real module: rendering a target
+    pattern is exactly the behaviour a Kafka test wants exercised, not stubbed.
+    """
+
+    def __init__(self, existing=()):
+        self.created = []
+        self.existing = set(existing)
+
+    def ensure_table(self, spark, name, columns, comment, properties=None, partition_by=None, cluster_by=None):
+        self.created.append({"name": name, "columns": columns, "partition_by": partition_by})
+
+    def table_exists(self, spark, name):
+        return name in self.existing
+
+    def target(self, cfg, layer, tokens=None):
+        from kafka_ingest.framework import tables
+
+        return tables.target(cfg, layer, tokens)
+
+    def targets(self, cfg, tokens=None):
+        from kafka_ingest.framework import tables
+
+        return tables.targets(cfg, tokens)
+
+    def validate_name(self, name, where):
+        from kafka_ingest.framework import tables
+
+        return tables.validate_name(name, where)
+
+    def created_names(self):
+        return [entry["name"] for entry in self.created]
+
+
+def make_kafka_ctx(
+    config_root,
+    source_key="demo_topic",
+    environment="dev",
+    run_type="primary",
+    spark=None,
+    existing_tables=(),
+    **job_parameters,
+):
+    """A RunContext carrying stand-ins, built through the real config resolution path."""
+    from kafka_ingest.framework.config import resolve_config
+    from kafka_ingest.framework.contracts import RunContext
+    from kafka_ingest.sources import kafka
+
+    cfg = resolve_config(config_root, source_key, environment, kafka.SOURCE_SPEC, job_parameters=job_parameters)
+    return RunContext(
+        cfg=cfg,
+        spark=spark if spark is not None else FakeSpark(existing_tables=existing_tables),
+        audit=RecordingAudit(run_type=run_type),
+        state=None,
+        writers=RecordingWriters(),
+        tables=RecordingTables(existing_tables),
+        log=RecordingLog(),
+        run_id=f"{source_key}-{run_type}-test",
+        run_type=run_type,
+        run_sequence=1,
+    )
+
+
+def make_kafka_cfg(config_root, source_key="demo_topic", environment="dev", run_type="primary", **job_parameters):
+    """The source's own frozen config, resolved exactly as run() resolves it."""
+    from kafka_ingest.sources.kafka import config as kafka_config
+
+    ctx = make_kafka_ctx(config_root, source_key, environment, run_type, **job_parameters)
+    return kafka_config.build(ctx.cfg, run_type, ctx.tables)
+
+
+@pytest.fixture
+def kafka_ctx(config_root):
+    return make_kafka_ctx(config_root)
+
+
+@pytest.fixture
+def kafka_cfg(config_root):
+    return make_kafka_cfg(config_root)
 
 
 # --------------------------------------------------------------------------------------

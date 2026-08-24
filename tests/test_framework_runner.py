@@ -106,11 +106,17 @@ def test_every_dispatchable_source_exposes_exactly_the_contract(source_type):
     assert not {"read", "parse", "write", "validate"} & set(dir(module))
 
 
-@pytest.mark.parametrize("source_type", sorted(runner._SOURCES))
+# Kafka is implemented (Stage 3). Oracle and file are still stubs, and the list is derived
+# rather than hardcoded so that Stage 4 and Stage 5 shrink it by implementing a source, not
+# by editing this line.
+_UNIMPLEMENTED = sorted(t for t in runner._SOURCES if t != "kafka")
+
+
+@pytest.mark.parametrize("source_type", _UNIMPLEMENTED)
 def test_the_shipped_source_stubs_refuse_to_pretend(source_type):
-    """Stages 3-5 implement the three real sources. Until then they must raise: a stub that
-    returned an empty result would report a successful run that ingested nothing, which is
-    the one failure mode in this design that looks like success."""
+    """Stages 4-5 implement the two remaining sources. Until then they must RAISE: a stub
+    that returned an empty result would report a successful run that ingested nothing,
+    which is the one failure mode in this design that looks like success."""
     with pytest.raises(NotImplementedError, match="Stage"):
         runner._SOURCES[source_type].run(None)
 
