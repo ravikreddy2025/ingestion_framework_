@@ -9,6 +9,10 @@
 # conf/environments/<env>.yaml under `defaults_by_type: kafka:` when it varies by
 # environment. Put it in conf/sources/<source_key>.yaml when it varies by topic.
 #
+# EVERY KEY HERE IS DECLARED IN sources/kafka/spec.py. A key that is not is a hard error
+# at startup naming the key - which is the point: a setting that silently does nothing is
+# worse than a missing one.
+#
 # PLACEHOLDERS
 #   {catalog}      and any other key under `vars:` in the environment file
 #   {source_key}   the source's config filename without .yaml
@@ -25,12 +29,14 @@ defaults:
   # because neither is legal in an unquoted Unity Catalog identifier:
   #     vector.patient.events.v1  ->  vector_patient_events_v1
   #
+  # It is the one placeholder the CONFIG LOADER leaves alone: only the source can compute
+  # it, so sources/kafka/spec.py declares it in target_tokens and framework/tables.py
+  # renders it at the top of the run - before anything connects. Everything else must
+  # resolve at load, which is what keeps a typo a startup error.
+  #
   # To override the name for one topic, set `table_name:` in that topic's file - NOT a full
   # table name here or there. That keeps the catalog and schema in one place, so a source
   # file still never contains a catalog.
-  #
-  # STAGE NOTE: {topic_table} is derived by the Kafka config loader today. Stage 2 moves
-  # target-name resolution into framework/tables.py, driven by these patterns.
   landing_table:    "{catalog}.landing.{topic_table}"
   curated_table:    "{catalog}.curated.{topic_table}"
   quarantine_table: "{catalog}.landing.{topic_table}_quarantine"
@@ -41,29 +47,50 @@ defaults:
 
   # --- STREAMING ----------------------------------------------------------------------
   # Prefix for the Spark-managed consumer group, so this consumer is identifiable in
-  # broker-side monitoring. Replays automatically get a distinct suffix.
+  # broker-side monitoring. Spark OVERRIDES kafka.group.id, so this prefix is the only
+  # supported knob. Replays automatically get a distinct suffix.
   consumer_group_prefix: "dbx-{source_key}"
 
   # FIRST RUN ONLY. Once a checkpoint exists it always wins and this is ignored.
   starting_offsets: earliest
 
-  # Drain everything available, then stop - the right shape for a once-daily job and the
+  # Drain everything available, then stop - the right shape for a scheduled job and the
   # only trigger under which a Workflows run has a natural end.
+  #
+  # CADENCE IS NOT SET HERE - it is in the job definition, and it is not a free choice:
+  # the schedule must be at most ONE THIRD of this topic's Kafka retention. See the
+  # MUST-READ row in docs/CONFIGURATION.md.
   trigger: availableNow
 
   # Fail loudly when Kafka has aged out records we never consumed. Overriding this to
-  # false means silently accepting gaps and needs explicit domain sign-off.
+  # false means silently accepting gaps and needs explicit domain sign-off. Q13 in
+  # sql/03_support_queries.sql lists every source currently running with it disabled.
   fail_on_data_loss: true
 
-  # Required for the ce_* CloudEvent columns to populate - they come from Kafka headers.
-  include_headers: true
+  # MUST HAVE A VALUE. Unset is not "no limit" in any useful sense - it means the entire
+  # backlog arrives as ONE microbatch, so a first run on a retained topic becomes a single
+  # enormous batch whose failure costs the whole run. Under availableNow this does NOT cap
+  # what the run consumes; it splits the backlog into several bounded batches.
+  # Operationally overridable: ingest_control.kafka_max_offsets_per_trigger.
+  max_offsets_per_trigger: 1000000
+
+  # Read parallelism. Without it, parallelism is capped at the topic's partition count no
+  # matter how large the cluster is.
+  #
+  # A PLAIN INTEGER, deliberately not a computed multiple of the partition count: deriving
+  # that needs a Kafka admin client, and the runtime dependencies are PyYAML and requests.
+  # Rule of thumb: roughly 4x the topic's partition count. It only ever SPLITS offset
+  # ranges, never merges them, so over-setting is cheap - confirm the partition count with
+  # the producing team at onboarding and set it once.
+  min_partitions: 32
 
   # --- TABLE LAYOUT -------------------------------------------------------------------
   # Delta allows PARTITIONED BY or CLUSTER BY, never both. See docs/DESIGN.md.
   # Both layers are one table per topic, so `topic` is constant inside each and worthless
   # as a partition key.
   # landing: ingest_date - bounds partition growth and makes retention a partition drop.
-  # curated: event_date - the date of ce_time, falling back to kafka_timestamp.
+  # curated: event_date - the date of ce_time, falling back to kafka_timestamp. It is also
+  #          what bounds a curated replay's MERGE, which is why it must never be NULL.
   landing_partition_by: [ingest_date]
   curated_partition_by: [event_date]
 
@@ -74,9 +101,12 @@ defaults:
   # --- DESERIALIZATION ----------------------------------------------------------------
   # The curated payload struct's SHAPE follows the subject's latest registered version.
   # Each record is still DECODED with its own writer schema from the wire header - that is
-  # what makes a mixed-version microbatch work.
+  # what makes a mixed-version microbatch work. There are exactly two modes and there is
+  # deliberately no third - see sources/kafka/config.py.
   reader_schema_mode: registry_latest
 
-  # Platform default: a record that cannot be parsed fails the batch loudly. Support can
-  # flip this to 'quarantine' via the control table to unblock a stuck stream - no deploy.
-  on_deser_error: fail
+  # Platform default: a record that cannot be parsed FAILS THE BATCH loudly. Support flips
+  # this to QUARANTINE via ingest_control.kafka_failure_mode to unblock a stuck stream -
+  # no deploy, and the records stay recoverable from landing afterwards. The two values are
+  # the same two the CHECK constraint on that column allows.
+  failure_mode: FAILFAST

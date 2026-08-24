@@ -8,10 +8,15 @@
 # 2. Replace the five <ANGLE_BRACKET> placeholders below. That is usually the whole job.
 # 3. Add optional settings only where this topic genuinely differs from the platform
 #    default. Everything you omit is inherited.
-# 4. Add a task to resources/job_ingest_primary.yml with the new topic-key.
-# 5. Run `pytest tests/test_shipped_config.py` - it validates every topic in EVERY
+# 4. CONFIRM THE TOPIC'S PARTITION COUNT WITH THE PRODUCING TEAM and set min_partitions
+#    to roughly 4x it (below). The platform default assumes a mid-sized topic; a topic with
+#    many more partitions will read at a fraction of the parallelism it could.
+#    Confirm the topic's RETENTION at the same time - the ingestion schedule must be at most
+#    one third of it. See docs/CONFIGURATION.md.
+# 5. Add a task to resources/job_ingest_primary.yml with the new source-key.
+# 6. Run `pytest tests/test_shipped_config.py` - it validates every source in EVERY
 #    environment, so it catches a value that works in prod but breaks in dev.
-# 6. Open a PR. No Python changes are needed, ever, to add a topic.
+# 7. Open a PR. No Python changes are needed, ever, to add a topic.
 #
 # WHAT YOU DO **NOT** PUT HERE
 #   Table names, catalogs, checkpoint paths, broker endpoints, secret scopes, partition
@@ -57,16 +62,24 @@ source:
   # struct, so write them as `payload.<field>` - a bare name is rejected with a clear error.
   # curated_dedup_keys: [payload.<business_key>]
 
-  # Override the environment's batch size for a high- or low-volume topic.
+  # Override the environment's batch size for a high- or low-volume topic. It splits the
+  # backlog into bounded microbatches; it does NOT cap what a run consumes.
   # max_offsets_per_trigger: 2000000
+
+  # READ PARALLELISM. Roughly 4x the topic's partition count - step 4 above. Over-setting
+  # is cheap (it only ever splits offset ranges), under-setting silently caps throughput at
+  # the partition count. Set this whenever the topic's partition count differs materially
+  # from the platform assumption in conf/defaults/kafka.yaml.
+  # min_partitions: 48
 
   # Default is `earliest` (backfill everything retained on the first run). Use `latest`
   # when replaying history would wrongly re-trigger downstream consumers.
   # starting_offsets: latest
 
-  # Default is `fail` - a record that cannot be parsed fails the batch loudly. Only set
-  # `quarantine` for a topic with a KNOWN, ACCEPTED source of bad records.
-  # on_deser_error: quarantine
+  # Default is FAILFAST - a record that cannot be parsed fails the batch loudly. Only set
+  # QUARANTINE for a topic with a KNOWN, ACCEPTED source of bad records; support can set it
+  # temporarily from the control table during an incident without this file changing.
+  # failure_mode: QUARANTINE
 
   # Default is `registry_latest`. Pin only to freeze a contract; the id is registry-
   # specific, so check it is the same in every environment before putting it here.

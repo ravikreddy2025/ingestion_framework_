@@ -2,7 +2,8 @@
 -- TABLE MAINTENANCE - run on a schedule by resources/job_maintenance.yml.
 --
 -- Nothing in this framework prunes or compacts anything on its own. `delta.autoOptimize`
--- (set on every table in tables.py) compacts small files as they are written, but it does
+-- (set on every table framework/tables.py creates) compacts small files as they are written,
+-- but it does
 -- not bound total size and it does not remove the superseded files that every MERGE,
 -- DELETE and OPTIMIZE leaves behind. That is what this file is for.
 --
@@ -28,8 +29,9 @@
 -- (docs/build_log/DECISIONS.md D-06). Its schema is the literal 'audit' rather than a
 -- third bound parameter, because every environment uses that name (see
 -- conf/environments/<env>.yaml vars.audit_schema) and this file already carries enough
--- parameters. NOT YET WIRED: resources/job_maintenance.yml does not pass :ops_catalog
--- today (Stage 6) - see docs/build_log/STAGE_2b_REPORT.md.
+-- parameters. resources/job_maintenance.yml binds it from the ${var.ops_catalog} bundle
+-- variable, and tests/test_shipped_config.py asserts that variable and the environment
+-- file agree.
 -- =====================================================================================
 
 -- -------------------------------------------------------------------------------------

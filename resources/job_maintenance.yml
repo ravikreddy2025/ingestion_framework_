@@ -37,15 +37,28 @@ resources:
       # Maintenance overlapping itself achieves nothing and competes for the same files.
       max_concurrent_runs: 1
 
+      # Dropped, not queued. A missed weekly OPTIMIZE costs nothing - the next one does the
+      # same work - whereas a queued one starts the moment the first finishes and competes
+      # with whatever is running by then.
+      queue:
+        enabled: false
+
       email_notifications:
         on_failure:
           - ${var.notification_email}
 
       parameters:
         - name: catalog
-          # The DATA catalog. Must match vars.catalog in conf/environments/<target>.yaml;
-          # a test asserts they agree.
+          # The DATA catalog, holding the per-source layer tables. Must match vars.catalog
+          # in conf/environments/<target>.yaml; a test asserts they agree.
           default: ${var.data_catalog}
+        - name: ops_catalog
+          # The OPS catalog, holding the audit table (docs/build_log/DECISIONS.md D-06).
+          # sql/04 binds :ops_catalog for its two audit-table statements; without this
+          # parameter those two statements fail to bind and the job fails every week.
+          # Must match vars.ops_catalog in conf/environments/<target>.yaml; the same test
+          # asserts that too.
+          default: ${var.ops_catalog}
         - name: landing_retention_days
           default: ${var.landing_retention_days}
         - name: vacuum_retention_hours
@@ -58,38 +71,48 @@ resources:
           task_key: vector_patient_events
           max_retries: 0
           timeout_seconds: 14400
+          # retry_on_timeout is stated on every task below rather than inherited from this
+          # anchor: it is the one retry setting whose right answer can differ per task, and
+          # a value that arrives invisibly through a merge key is a value nobody reviews.
+          retry_on_timeout: false
           sql_task:
             warehouse_id: ${var.sql_warehouse_id}
             file:
               path: ../sql/04_maintenance.sql
             parameters:
               catalog: "{{job.parameters.catalog}}"
+              ops_catalog: "{{job.parameters.ops_catalog}}"
               landing_retention_days: "{{job.parameters.landing_retention_days}}"
               vacuum_retention_hours: "{{job.parameters.vacuum_retention_hours}}"
-              # Derived from the Kafka topic name - see config.table_name_for(). If a topic
+              # Derived from the Kafka topic name - see sources/kafka/config.py
+              # table_name_for(). If a source
               # sets `table_name:` in its config file, use that name here instead.
               landing_table: "${var.data_catalog}.landing.vector_patient_events_v1"
 
         - <<: *maintenance_task
           task_key: rcm_claim_status
+          retry_on_timeout: false
           sql_task:
             warehouse_id: ${var.sql_warehouse_id}
             file:
               path: ../sql/04_maintenance.sql
             parameters:
               catalog: "{{job.parameters.catalog}}"
+              ops_catalog: "{{job.parameters.ops_catalog}}"
               landing_retention_days: "{{job.parameters.landing_retention_days}}"
               vacuum_retention_hours: "{{job.parameters.vacuum_retention_hours}}"
               landing_table: "${var.data_catalog}.landing.rcm_claim_status_v2"
 
         - <<: *maintenance_task
           task_key: antifraud_txn_alerts
+          retry_on_timeout: false
           sql_task:
             warehouse_id: ${var.sql_warehouse_id}
             file:
               path: ../sql/04_maintenance.sql
             parameters:
               catalog: "{{job.parameters.catalog}}"
+              ops_catalog: "{{job.parameters.ops_catalog}}"
               landing_retention_days: "{{job.parameters.landing_retention_days}}"
               vacuum_retention_hours: "{{job.parameters.vacuum_retention_hours}}"
               landing_table: "${var.data_catalog}.landing.antifraud_txn_alerts_v1"

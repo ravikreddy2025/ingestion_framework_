@@ -5,7 +5,7 @@
 # conf/defaults.yaml and conf/environments/<env>.yaml:
 #
 #   table names, checkpoint root, consumer group prefix, partitioning, trigger,
-#   fail_on_data_loss, reader_schema_mode, on_deser_error, include_headers
+#   fail_on_data_loss, reader_schema_mode, failure_mode, min_partitions
 #
 # If you are about to paste a table name or a catalog into this file, stop - it belongs in
 # defaults.yaml with a {catalog} placeholder. Anything hardcoded here breaks dev/preprod.
