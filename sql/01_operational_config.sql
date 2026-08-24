@@ -18,57 +18,71 @@
 -- sql/03_support_queries.sql. Delta's own DESCRIBE HISTORY is the backstop.
 -- =====================================================================================
 -- TEMPLATE - NOT READY TO RUN AS-IS.
--- {ops_catalog} is a placeholder, using the same convention as conf/. Render it for a
--- target environment with notebooks/00_validate_config (section "Render the provisioning
--- SQL"), which substitutes it from conf/environments/<env>.yaml so this file cannot drift
--- from what the code reads. Do NOT hand-edit a copy per environment.
+-- {ops_catalog}, {control_schema} and {logs_schema} are placeholders, using the same
+-- convention as conf/. Render this for a target environment with notebooks/00_validate_config
+-- (section "Render the provisioning SQL"), which substitutes them from
+-- conf/environments/<env>.yaml so this file cannot drift from what the code reads. Do NOT
+-- hand-edit a copy per environment.
 
-CREATE SCHEMA IF NOT EXISTS {ops_catalog}.ingestion
+CREATE SCHEMA IF NOT EXISTS {ops_catalog}.{control_schema}
   COMMENT 'Operational control and durable state for the multi-source ingestion framework';
+
+-- Reserved for structured logging - nothing is written here yet (D-06). Created now, empty,
+-- so the shape is visible in a PR and Terraform can grant on it ahead of actually needing to.
+CREATE SCHEMA IF NOT EXISTS {ops_catalog}.{logs_schema}
+  COMMENT 'Reserved for structured logging. Nothing is written here yet.';
 
 -- =====================================================================================
 -- CONTROL - layer 4 of the five-layer configuration. One row per source_key.
 --
--- The named columns below are the levers EVERY source type is expected to share. Anything
--- specific to one source type goes in source_overrides as JSON, and is validated against
--- that source's SOURCE_SPEC exactly like a YAML key - an unknown key here fails the run
--- with the same message a YAML typo produces, rather than being silently ignored.
+-- FRAMEWORK-OWNED COLUMNS mean the exact same thing for every source type: source_key,
+-- source_type, enabled, replay_rerun_id, replay_controls, notes, updated_by, updated_at.
+--
+-- SOURCE-TYPE-OWNED COLUMNS are named `<source_type>_<setting>` (docs/build_log/
+-- DECISIONS.md D-01) because this ONE table is shared by every source type, and a bare
+-- `failure_mode` or `batch_limit` would mean a different mechanism depending on which row
+-- you were looking at. Each source type's own SOURCE_SPEC.control_columns declares which
+-- of these columns it owns; setting one for a row of the WRONG source type is a run-time
+-- error, not a silent no-op - see framework/control.py.
+--
+-- Adding a source type's columns is a deploy (new package, job template, conf files)
+-- already, so it may also need an ALTER TABLE ADD COLUMNS here. That is honest, not a
+-- regression: there is no second, untyped mechanism (the former source_overrides JSON) for
+-- a source-specific setting to hide in instead.
 -- =====================================================================================
-CREATE TABLE IF NOT EXISTS {ops_catalog}.ingestion.ingest_control (
+CREATE TABLE IF NOT EXISTS {ops_catalog}.{control_schema}.ingest_control (
   source_key                   STRING  NOT NULL COMMENT 'Matches conf/sources/<source_key>.yaml. Unique across ALL source types.',
   source_type                  STRING  COMMENT 'kafka | oracle | file. Checked against the source''s own declaration.',
 
-  -- ---- behaviour toggles ----------------------------------------------------------
+  -- ---- behaviour toggles, framework-owned ------------------------------------------
   enabled                      BOOLEAN COMMENT 'FALSE = emergency stop. The job runs, reads nothing, writes a SKIPPED audit row.',
-  failure_mode                 STRING  COMMENT 'FAILFAST | QUARANTINE. THE lever for unblocking a source stuck on bad records.',
-  batch_limit                  BIGINT  COMMENT 'Caps how much one run reads: max offsets per trigger, fetch cap, or max files per trigger.',
 
-  -- ---- checkpoint-reset override (incident use only) -------------------------------
-  -- Checkpoint-based sources only. Bypasses the source''s checkpoint-reset guard AND forks
-  -- the Delta txnAppId, so a restart cannot collide with versions already committed under
-  -- the old identity. Set this ONLY after confirming the checkpoint is genuinely gone.
-  -- Put the incident number here, e.g. 'INC12345'. Do NOT blank it back out once used:
-  -- reverting to NULL reverts the txnAppId to the original lineage, which still carries the
-  -- OLD watermark and would silently skip every write again.
-  checkpoint_reset_id          STRING  COMMENT 'Incident use only. Never clear after use.',
+  -- ---- kafka-only levers --------------------------------------------------------------
+  -- See sources/kafka/spec.py SOURCE_SPEC.control_columns for which setting each column maps to.
+  kafka_failure_mode            STRING  COMMENT 'FAILFAST | QUARANTINE. Kafka''s lever for unblocking a source stuck on bad records.',
+  kafka_max_offsets_per_trigger BIGINT  COMMENT 'Caps how many offsets one microbatch reads.',
+  -- Bypasses Kafka's checkpoint-reset guard AND forks the Delta txnAppId, so a restart
+  -- cannot collide with versions already committed under the old identity. Set this ONLY
+  -- after confirming the checkpoint is genuinely gone. Put the incident number here, e.g.
+  -- 'INC12345'. Do NOT blank it back out once used: reverting to NULL reverts the
+  -- txnAppId to the original lineage, which still carries the OLD watermark and would
+  -- silently skip every write again.
+  kafka_checkpoint_reset_id     STRING  COMMENT 'Incident use only. Never clear after use.',
 
-  -- ---- replay controls -------------------------------------------------------------
+  -- ---- replay controls, framework-owned ------------------------------------------------
   -- Populated to park a replay intent durably. The replay JOB PARAMETERS win over these,
   -- so an urgent one-off needs no UPDATE first. Clear these once the replay is done.
   replay_rerun_id              STRING  COMMENT 'REQUIRED for any replay. Isolates the checkpoint AND the Delta txnAppId.',
   replay_controls              STRING  COMMENT 'JSON object of source-specific replay settings, e.g. {"starting_offsets": "{...}"}',
 
-  -- ---- everything else -------------------------------------------------------------
-  source_overrides             STRING  COMMENT 'JSON object of source-specific operational overrides. Validated against that source type''s spec.',
-
-  -- ---- attribution -----------------------------------------------------------------
+  -- ---- attribution, framework-owned -----------------------------------------------------
   notes                        STRING  COMMENT 'Why this row was last changed. Incident number belongs here.',
   updated_by                   STRING,
   updated_at                   TIMESTAMP,
 
   CONSTRAINT source_key_present CHECK (source_key IS NOT NULL),
-  CONSTRAINT failure_mode_valid CHECK (
-    failure_mode IS NULL OR failure_mode IN ('FAILFAST', 'QUARANTINE')
+  CONSTRAINT kafka_failure_mode_valid CHECK (
+    kafka_failure_mode IS NULL OR kafka_failure_mode IN ('FAILFAST', 'QUARANTINE')
   )
 )
 USING DELTA
@@ -93,10 +107,19 @@ TBLPROPERTIES (
 -- must never raise; state writes are mandatory and must. That asymmetry is why these are
 -- two tables. See framework/state.py.
 --
+-- PARTITIONED BY (source_key), with deletion vectors enabled (docs/build_log/
+-- DECISIONS.md D-04). A run sequence is allocated on every run of every source, so with
+-- many sources on the same schedule this table takes concurrent MERGEs from different
+-- sources; Delta detects conflicts at file granularity, so partitioning by source_key puts
+-- each source's rows in disjoint files and stops those MERGEs conflicting with each other.
+-- Not CLUSTER BY - Delta allows one or the other, never both, and partitioning is what
+-- buys the conflict isolation here. See VB-15 for what is still unverified about this.
+--
 -- The job creates this table itself if it is missing, so provisioning it here is belt and
--- braces - but doing so is what lets the GRANTs below be in place before the first run.
+-- braces, kept in step with framework/state.py.ensure_state_table by
+-- tests/test_shipped_sql.py.
 -- =====================================================================================
-CREATE TABLE IF NOT EXISTS {ops_catalog}.ingestion.ingest_state (
+CREATE TABLE IF NOT EXISTS {ops_catalog}.{control_schema}.ingest_state (
   source_key       STRING    NOT NULL COMMENT 'Matches conf/sources/<source_key>.yaml',
   state_key        STRING    NOT NULL COMMENT 'watermark | run_sequence',
   state_value      STRING    COMMENT 'The value, as text. value_type says how to read it.',
@@ -107,45 +130,38 @@ CREATE TABLE IF NOT EXISTS {ops_catalog}.ingestion.ingest_state (
   CONSTRAINT state_key_present CHECK (source_key IS NOT NULL AND state_key IS NOT NULL)
 )
 USING DELTA
+PARTITIONED BY (source_key)
 COMMENT 'Durable ingestion state: watermarks and run sequences. Written by the ingestion job only.'
 TBLPROPERTIES (
   'delta.autoOptimize.optimizeWrite' = 'true',
   'delta.autoOptimize.autoCompact'   = 'true',
   -- "When did this watermark move, and which run moved it?" is the first question of every
   -- late-data investigation, and CDF answers it without a shadow table.
-  'delta.enableChangeDataFeed'       = 'true'
+  'delta.enableChangeDataFeed'       = 'true',
+  -- Cheap single-row MERGE updates instead of rewriting a whole file per update - the shape
+  -- every write to this table takes. See VB-15.
+  'delta.enableDeletionVectors'      = 'true'
 );
 
 -- =====================================================================================
--- GRANTS
+-- GRANTS ARE TERRAFORM-OWNED, NOT ISSUED HERE (docs/build_log/DECISIONS.md D-02).
 --
--- CONTROL: the support team edits, the job's service principal only reads. Splitting these
--- is what stops an ingestion job being able to disable itself.
--- STATE: the reverse. The job writes; support reads. A hand-edited watermark is a silent
--- data-loss incident, so support gets SELECT and nothing more.
+-- Neither this file nor the framework GRANTs anything: user groups and service-principal
+-- names are environment-specific and belong in Terraform, outside this repository. The
+-- exact privileges the ingestion service principal and the support group need - CONTROL:
+-- support edits, the job only reads, so an ingestion job can never disable itself. STATE:
+-- the reverse, the job writes and support gets SELECT only, because a hand-edited
+-- watermark is a silent data-loss incident - are recorded as a specification for whoever
+-- writes the Terraform in the "Unity Catalog privileges" table of
+-- docs/RUNBOOK_CLIENT_IT.md. See VB-16.
 -- =====================================================================================
-
-GRANT USE CATALOG ON CATALOG {ops_catalog} TO `ingestion-support`;
-GRANT USE SCHEMA  ON SCHEMA  {ops_catalog}.ingestion TO `ingestion-support`;
-GRANT SELECT, MODIFY ON TABLE {ops_catalog}.ingestion.ingest_control TO `ingestion-support`;
-GRANT SELECT ON TABLE {ops_catalog}.ingestion.ingest_state TO `ingestion-support`;
-
-GRANT USE CATALOG ON CATALOG {ops_catalog} TO `sp-kafka-ingestion`;
-GRANT USE SCHEMA  ON SCHEMA  {ops_catalog}.ingestion TO `sp-kafka-ingestion`;
-GRANT SELECT ON TABLE {ops_catalog}.ingestion.ingest_control TO `sp-kafka-ingestion`;
-GRANT SELECT, MODIFY ON TABLE {ops_catalog}.ingestion.ingest_state TO `sp-kafka-ingestion`;
-
--- The job creates ingest_state (and the audit table) on first run if provisioning has not
--- run. That needs CREATE TABLE on the schema; drop this grant if you would rather the job
--- fail loudly on an unprovisioned environment. See VB-16.
-GRANT CREATE TABLE ON SCHEMA {ops_catalog}.ingestion TO `sp-kafka-ingestion`;
 
 -- =====================================================================================
 -- Seed rows. A source with no control row runs on its YAML defaults, so this is optional -
 -- but an explicit row gives support somewhere obvious to look.
 -- =====================================================================================
 
-INSERT INTO {ops_catalog}.ingestion.ingest_control
+INSERT INTO {ops_catalog}.{control_schema}.ingest_control
   (source_key, source_type, enabled, notes, updated_by, updated_at)
 SELECT * FROM (
   VALUES
@@ -154,5 +170,5 @@ SELECT * FROM (
     ('antifraud_txn_alerts',  'kafka', true, 'initial onboarding', current_user(), current_timestamp())
 ) AS seed(source_key, source_type, enabled, notes, updated_by, updated_at)
 WHERE NOT EXISTS (
-  SELECT 1 FROM {ops_catalog}.ingestion.ingest_control c WHERE c.source_key = seed.source_key
+  SELECT 1 FROM {ops_catalog}.{control_schema}.ingest_control c WHERE c.source_key = seed.source_key
 );

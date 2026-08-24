@@ -30,13 +30,18 @@
 -- pipeline.ensure_curated().
 -- =====================================================================================
 -- TEMPLATE - NOT READY TO RUN AS-IS. See the note in sql/01_operational_config.sql:
--- {catalog} is rendered from conf/environments/<env>.yaml by notebooks/00_validate_config.
+-- {catalog}, {ops_catalog} and {audit_schema} are rendered from conf/environments/<env>.yaml
+-- by notebooks/00_validate_config.
 
 CREATE SCHEMA IF NOT EXISTS {catalog}.landing
   COMMENT 'Raw Kafka wire bytes. One table per topic, partitioned by ingest_date.';
 CREATE SCHEMA IF NOT EXISTS {catalog}.curated
   COMMENT 'Parsed events, one table per topic, payload kept nested.';
-CREATE SCHEMA IF NOT EXISTS {catalog}.audit
+-- The audit table lives in the OPS catalog, not here (docs/build_log/DECISIONS.md D-06) -
+-- it is operational metadata about every source type, not this topic's data. This file
+-- also creates its own schema for it (rather than relying on sql/01 having run first) so
+-- it stays runnable on its own, exactly like the landing/curated schemas above.
+CREATE SCHEMA IF NOT EXISTS {ops_catalog}.{audit_schema}
   COMMENT 'Per-run, per-layer ingestion status for every source. Separate from business data by design.';
 
 -- -------------------------------------------------------------------------------------
@@ -96,14 +101,17 @@ TBLPROPERTIES (
 -- why they are STRING and why it is said on the column itself. source_detail is a JSON
 -- STRING and not a MAP, so a new source type never forces an ALTER TABLE here.
 --
+-- txn_version (docs/build_log/DECISIONS.md D-03) carries the Delta txnVersion for
+-- whatever produced the row - a microbatch id, a batch source's run_sequence, or -1.
+--
 -- Keep this in step with framework/audit.py: AUDIT_DDL_COLUMNS (the table),
 -- AUDIT_SCHEMA (the DataFrame) and this block are compared column-for-column by
 -- tests/test_framework_audit.py.
 -- -------------------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS {catalog}.audit.ingest_audit (
-  audit_id              STRING    COMMENT 'run_id::batch_id::layer::status - unique per row',
+CREATE TABLE IF NOT EXISTS {ops_catalog}.{audit_schema}.ingest_audit (
+  audit_id              STRING    COMMENT 'run_id::txn_version::layer::status - unique per row',
   run_id                STRING    COMMENT 'One value per job execution; also stamped on data rows',
-  batch_id              BIGINT    COMMENT 'Streaming microbatch id, or the run_sequence for a batch source, or -1',
+  txn_version           BIGINT    COMMENT 'The Delta txnVersion this row corresponds to: a streaming microbatch id, a batch source run_sequence, or -1',
   source_type           STRING    COMMENT 'Which source implementation ran',
   source_key            STRING    COMMENT 'Matches conf/sources/<source_key>.yaml and ingest_control.source_key',
   source_ref            STRING    COMMENT 'Source-side identifier: topic name, SCHEMA.TABLE, or path glob',
@@ -133,7 +141,7 @@ TBLPROPERTIES (
 );
 
 -- -------------------------------------------------------------------------------------
--- QUARANTINE - per topic, only used when failure_mode = QUARANTINE.
+-- QUARANTINE - per topic, only used when kafka_failure_mode = QUARANTINE.
 -- Template; repeat per topic with the name from the topic YAML.
 -- Grants follow the data's sensitivity: a quarantined record still holds the payload.
 -- -------------------------------------------------------------------------------------
@@ -175,9 +183,9 @@ TBLPROPERTIES (
 );
 
 -- =====================================================================================
--- GRANTS
+-- GRANTS ARE TERRAFORM-OWNED, NOT ISSUED HERE (docs/build_log/DECISIONS.md D-02).
+-- See the "Unity Catalog privileges" table in docs/RUNBOOK_CLIENT_IT.md for the exact
+-- privilege list a platform admin provisions for the ingestion service principal and the
+-- support group, on both the data catalog (landing/curated, below) and the ops catalog
+-- (audit, above).
 -- =====================================================================================
-GRANT SELECT ON TABLE {catalog}.audit.ingest_audit TO `ingestion-support`;
-GRANT SELECT ON TABLE {catalog}.landing.{topic_table} TO `ingestion-support`;
-GRANT SELECT, MODIFY ON TABLE {catalog}.audit.ingest_audit TO `sp-kafka-ingestion`;
-GRANT SELECT, MODIFY ON TABLE {catalog}.landing.{topic_table} TO `sp-kafka-ingestion`;
