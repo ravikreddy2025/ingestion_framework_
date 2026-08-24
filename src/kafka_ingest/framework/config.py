@@ -30,7 +30,9 @@ source in dev and rejected there as an unknown key.
 {placeholder} tokens in layers 1-3 resolve from the environment's `vars:`, plus
 {source_key} and {domain} for source settings. Register values get vars ONLY - a profile
 is shared by many sources, so substituting {source_key} into a cert path would silently
-produce a per-source path. An unresolved placeholder is a hard error.
+produce a per-source path. An unresolved placeholder is a hard error, with ONE declared
+exception: the tokens a source type lists in SOURCE_SPEC.target_tokens are left for the
+source itself to fill, because only it knows them. See framework/tables.py.
 
 VALIDATION IS DATA-DRIVEN. There is no `if source_type == ...` in this module, and there
 must never be one. Everything comes from the source's SOURCE_SPEC (framework/contracts.py):
@@ -67,11 +69,30 @@ class ConfigError(ValueError):
 # them. Keep this list very short: anything here is a key three source authors can no
 # longer use for their own purposes.
 #
-#   domain    owning team. Appears in every audit row and fills {domain}.
-#   enabled   the emergency stop. Settable in YAML and, more usefully, in the control
-#             table - turning a source off must not need a deploy.
-FRAMEWORK_STRUCTURAL_KEYS = frozenset({"domain", "enabled"})
-FRAMEWORK_OPERATIONAL_KEYS = frozenset({"enabled"})
+#   domain            owning team. Appears in every audit row and fills {domain}.
+#   enabled           the emergency stop. Settable in YAML and, more usefully, in the
+#                     control table - turning a source off must not need a deploy.
+#   audit_table       the one shared audit table. Written by framework/audit.py.
+#   state_table       durable watermarks and run sequences. framework/state.py.
+#   control_table     where the layer-4 overrides are read from. framework/control.py.
+#   table_properties  TBLPROPERTIES for every table the framework creates.
+#   rerun_id          identifies a replay. Operational ONLY - a replay id checked into Git
+#                     would re-apply on every future deploy.
+#
+# The three table names are here rather than in each SOURCE_SPEC because the framework
+# reads them and no source does; a source type that had to declare them could also
+# misspell them.
+FRAMEWORK_STRUCTURAL_KEYS = frozenset(
+    {
+        "domain",
+        "enabled",
+        "audit_table",
+        "state_table",
+        "control_table",
+        "table_properties",
+    }
+)
+FRAMEWORK_OPERATIONAL_KEYS = frozenset({"enabled", "rerun_id"})
 
 # Top-level keys an environment file may use that are not register names.
 _ENV_RESERVED_KEYS = frozenset({"vars", "defaults", "defaults_by_type"})
@@ -193,29 +214,39 @@ def read_source_type(config_root: str, source_key: str) -> str:
 # --------------------------------------------------------------------------------------
 
 
-def _substitute(value: Any, scope: Mapping[str, Any], where: str) -> Any:
+def _substitute(value: Any, scope: Mapping[str, Any], where: str, deferred: frozenset[str] = frozenset()) -> Any:
     """Resolve {placeholder} tokens in strings, recursing into lists and dicts.
 
     An unresolved placeholder is a hard error naming the setting and the offending token.
     Letting it through would produce a table literally called `{catalog}.landing...`, which
     fails much later and much less clearly.
+
+    `deferred` is the exception, and it is a short, declared list: a source type's
+    SOURCE_SPEC.target_tokens names the placeholders only the SOURCE can fill, because they
+    come from data the configuration does not have - a Kafka topic name, a database table
+    name. Those are passed through untouched for framework/tables.py to fill at run time.
+    A token NOT in that list is still an error, which is what keeps a typo a startup
+    failure rather than a table with a brace in its name.
     """
     if isinstance(value, str):
 
         def _replace(match: re.Match) -> str:
             name = match.group(1)
+            if name in deferred:
+                return match.group(0)
             if name not in scope:
                 raise ConfigError(
                     f"{where}: '{value}' uses {{{name}}}, which is not defined. Available: "
-                    f"{sorted(scope)}. Add it under `vars:` in the environment file."
+                    f"{sorted(scope)}. Add it under `vars:` in the environment file, or - if "
+                    "only the source can supply it - to that source's SOURCE_SPEC.target_tokens."
                 )
             return str(scope[name])
 
         return _PLACEHOLDER.sub(_replace, value)
     if isinstance(value, list):
-        return [_substitute(item, scope, where) for item in value]
+        return [_substitute(item, scope, where, deferred) for item in value]
     if isinstance(value, dict):
-        return {k: _substitute(v, scope, where) for k, v in value.items()}
+        return {k: _substitute(v, scope, where, deferred) for k, v in value.items()}
     return value
 
 
@@ -295,12 +326,19 @@ def _load_registers(
 # --------------------------------------------------------------------------------------
 
 
-def load_structural(config_root: str, source_key: str, environment: str) -> dict[str, Any]:
+def load_structural(
+    config_root: str, source_key: str, environment: str, deferred: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     """Merge and substitute layers 1-3 for one source in one environment.
 
     Returns the merged settings. Spec-free on purpose: `resolve_config` validates, and
     keeping the merge separate means a caller that only wants to see what the YAML says
     (a notebook, a config dump) does not need a spec to get it.
+
+    `deferred` is that rule's one concession - a caller that HAS a spec passes
+    `spec.target_tokens` so a target pattern naming a source-derived value survives the
+    merge instead of failing on it. A caller with no spec passes nothing and gets the
+    strict behaviour, which is the right default for a config dump.
     """
     env_path = os.path.join(config_root, "environments", f"{environment}.yaml")
     if not os.path.exists(env_path):
@@ -342,7 +380,7 @@ def load_structural(config_root: str, source_key: str, environment: str) -> dict
         "source_key": source_key,
         "domain": merged.get("domain", ""),
     }
-    return _substitute(merged, scope, f"sources/{source_key}.yaml [{environment}]")
+    return _substitute(merged, scope, f"sources/{source_key}.yaml [{environment}]", deferred)
 
 
 def _source_environment_override(
@@ -385,9 +423,26 @@ def _source_environment_override(
 # --------------------------------------------------------------------------------------
 
 
+def layer_table_keys(spec: SourceSpec) -> frozenset[str]:
+    """`<layer>_table` for every layer this source type has.
+
+    ONE convention, defined here and read in framework/tables.py: a source's target table
+    for layer L is the setting `<L>_table`. Framework-owned for the same reason the audit
+    table is - the framework resolves, validates and creates those tables, so it also
+    decides what they are called in configuration.
+    """
+    return frozenset(f"{layer}_table" for layer in spec.layers)
+
+
 def known_keys(spec: SourceSpec) -> frozenset[str]:
     """Every key any layer may set for this source type."""
-    return spec.structural_keys | spec.operational_keys | FRAMEWORK_STRUCTURAL_KEYS | FRAMEWORK_OPERATIONAL_KEYS
+    return (
+        spec.structural_keys
+        | spec.operational_keys
+        | FRAMEWORK_STRUCTURAL_KEYS
+        | FRAMEWORK_OPERATIONAL_KEYS
+        | layer_table_keys(spec)
+    )
 
 
 def _operational_only(spec: SourceSpec) -> frozenset[str]:
@@ -516,7 +571,7 @@ def resolve_config(
         )
 
     origin = f"sources/{source_key}.yaml"
-    settings = load_structural(config_root, source_key, environment)
+    settings = load_structural(config_root, source_key, environment, spec.target_tokens)
     _validate_structural(spec, settings, origin)
 
     settings = apply_overrides(spec, settings, control or {}, "the control table")

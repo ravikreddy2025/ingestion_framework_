@@ -40,6 +40,13 @@ class SourceSpec:
                         keys, target names - changing a table's physical layout needs a PR)
       operational only  setting it in YAML is an ERROR (an incident-scoped safety bypass
                         checked into Git would silently re-apply on every future deploy)
+
+    target_tokens is the one field that is not about validation. It names the
+    {placeholders} in this source type's configuration that only the SOURCE can fill -
+    `{topic_table}` from a topic name, `{source_table}` from a database table - so
+    config.py leaves them alone instead of failing on them, and tables.render() fills them
+    at run time. Everything NOT named here still has to resolve at load, which is what
+    keeps a genuine typo a startup error. See framework/tables.py.
     """
 
     source_type: str
@@ -48,6 +55,7 @@ class SourceSpec:
     operational_keys: frozenset[str]
     mutually_exclusive: tuple[tuple[str, ...], ...]
     layers: tuple[str, ...]  # ("landing",) / ("landing", "curated", "quarantine")
+    target_tokens: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)

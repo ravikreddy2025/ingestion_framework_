@@ -36,7 +36,7 @@ OPTIMIZE IDENTIFIER(:landing_table)
 
 -- The audit table is shared by every topic, so this repeats across per-topic tasks. That is
 -- harmless: OPTIMIZE on already-compacted files is close to a no-op.
-OPTIMIZE IDENTIFIER(:catalog || '.audit.stream_audit')
+OPTIMIZE IDENTIFIER(:catalog || '.audit.ingest_audit')
   WHERE audit_date >= current_date() - INTERVAL 7 DAYS;
 
 -- -------------------------------------------------------------------------------------
@@ -45,7 +45,7 @@ OPTIMIZE IDENTIFIER(:catalog || '.audit.stream_audit')
 --    concurrent reader. If you think you need that, you want a different fix.
 -- -------------------------------------------------------------------------------------
 VACUUM IDENTIFIER(:landing_table) RETAIN :vacuum_retention_hours HOURS;
-VACUUM IDENTIFIER(:catalog || '.audit.stream_audit')   RETAIN :vacuum_retention_hours HOURS;
+VACUUM IDENTIFIER(:catalog || '.audit.ingest_audit')   RETAIN :vacuum_retention_hours HOURS;
 
 -- -------------------------------------------------------------------------------------
 -- 3. LANDING RETENTION - deliberately NOT enabled.

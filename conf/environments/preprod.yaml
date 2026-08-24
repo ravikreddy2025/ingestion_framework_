@@ -10,6 +10,9 @@
 
 vars:
   catalog: platform_preprod
+  # Operational catalog: the control and state tables. MUST match `ops_catalog`
+  # for this target in databricks.yml - a test asserts they agree.
+  ops_catalog: ops_preprod
 
 # Intentionally empty: preprod inherits production behaviour from conf/defaults.yaml and
 # conf/defaults/<source_type>.yaml. If you find yourself adding tuning here, ask whether

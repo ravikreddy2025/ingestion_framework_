@@ -19,6 +19,9 @@
 # Substituted into any {placeholder} in defaults / sources / cluster / registry values.
 vars:
   catalog: platform_dev
+  # Operational catalog: the control and state tables. MUST match `ops_catalog`
+  # for this target in databricks.yml - a test asserts they agree.
+  ops_catalog: ops_dev
 
 # Overrides conf/defaults.yaml, for every source of EVERY TYPE in this environment.
 # Only put a setting here if every source type understands it - a Kafka-only key here is

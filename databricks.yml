@@ -32,6 +32,12 @@ sync:
 # makes every job fail at startup with "unknown environment" - which is the intended
 # behaviour, but rename both together.
 #
+# The control table, the state table and the audit table are named in conf/defaults.yaml,
+# from `vars.ops_catalog` and `vars.catalog` - NOT here, and not as job parameters. One
+# name in one place: a bundle variable holding a table name the code also derives is a
+# variable that drifts, and the one it replaced was still pointing at a table Stage 2
+# renamed.
+#
 # The data catalog lives in conf/environments/<env>.yaml under `vars.catalog`, because the
 # CODE builds table names from it. It is ALSO declared here as `data_catalog`, for the one
 # thing that cannot read conf/: the maintenance job, which is SQL. The duplication is
@@ -42,9 +48,6 @@ variables:
   ops_catalog:
     description: Catalog holding the operational control table
     default: ops_dev
-  control_table:
-    description: 3-tier name of the operational control table
-    default: ops_dev.ingestion.ingestion_topic_control
   service_principal:
     description: Principal the ingestion jobs run as
     default: sp-kafka-ingestion-dev
@@ -96,7 +99,6 @@ targets:
     variables:
       ops_catalog: ops_preprod
       data_catalog: platform_preprod
-      control_table: ops_preprod.ingestion.ingestion_topic_control
       service_principal: sp-kafka-ingestion-preprod
     run_as:
       service_principal_name: ${var.service_principal}
@@ -109,7 +111,6 @@ targets:
     variables:
       ops_catalog: ops_prod
       data_catalog: platform_prod
-      control_table: ops_prod.ingestion.ingestion_topic_control
       service_principal: sp-kafka-ingestion
     run_as:
       service_principal_name: ${var.service_principal}
