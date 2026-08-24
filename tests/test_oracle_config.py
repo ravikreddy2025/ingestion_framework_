@@ -316,3 +316,156 @@ def test_the_tuning_knobs_are_operationally_overridable(oracle_config_root):
     write_oracle_source(oracle_config_root, partition_column="CLAIM_ID")
     cfg = make_oracle_cfg(oracle_config_root, fetch_size="2000", num_partitions="4")
     assert (cfg.fetch_size, cfg.num_partitions) == (2000, 4)
+
+
+# --------------------------------------------------------------------------------------
+# The full-vs-delta switch and the replay window (docs/build_log/DECISIONS.md D-09)
+# --------------------------------------------------------------------------------------
+
+
+def _cursor_source(config_root, **settings):
+    write_oracle_source(
+        config_root,
+        incremental_mode="cursor",
+        cursor_column="LAST_UPDATE_DT",
+        cursor_type="timestamp",
+        merge_keys=["CLAIM_ID"],
+        **settings,
+    )
+
+
+def test_support_can_switch_a_delta_source_to_a_full_load_without_a_deploy(oracle_config_root):
+    """The one operational key that changes WHICH ROWS are extracted, and it is deliberate:
+    a delta load that has been skipping rows is repaired by one full load, and waiting for
+    a PR to merge is the wrong shape of answer at 3am."""
+    _cursor_source(oracle_config_root)
+    cfg = make_oracle_cfg(oracle_config_root, incremental_mode="full")
+
+    assert cfg.incremental_mode == oracle_config.MODE_FULL
+    assert cfg.is_cursor is False
+    # What the increment MEANS is untouched, so switching back needs no second change.
+    assert cfg.cursor_column == "LAST_UPDATE_DT"
+    assert cfg.merge_keys == ("CLAIM_ID",)
+
+
+def test_an_override_still_cannot_redefine_the_increment(oracle_config_root):
+    """The mode may move; the cursor column, its type and the merge keys may not. Those are
+    structural, so an override of one is ignored rather than applied."""
+    _cursor_source(oracle_config_root)
+    cfg = make_oracle_cfg(oracle_config_root, cursor_column="CREATED_DT", merge_keys=["MEMBER_ID"])
+    assert cfg.cursor_column == "LAST_UPDATE_DT"
+    assert cfg.merge_keys == ("CLAIM_ID",)
+
+
+def test_an_illegal_mode_from_the_control_table_fails_like_any_other_bad_value(oracle_config_root):
+    _cursor_source(oracle_config_root)
+    with pytest.raises(ConfigError, match="incremental_mode"):
+        make_oracle_cfg(oracle_config_root, incremental_mode="delta")
+
+
+def test_a_replay_bounds_the_cursor_interval_explicitly(oracle_config_root):
+    """The bounds REPLACE the stored watermark for one run, which is what makes
+    re-extracting a window safe while the scheduled delta load keeps its own position."""
+    _cursor_source(oracle_config_root)
+    cfg = make_oracle_cfg(
+        oracle_config_root,
+        run_type="oracle_replay",
+        rerun_id="INC-1042",
+        replay_cursor_start="2026-08-01 00:00:00",
+        replay_cursor_end="2026-08-02 00:00:00",
+    )
+    assert cfg.is_replay is True
+    assert cfg.replay.is_bounded is True
+    assert (cfg.replay.cursor_start, cfg.replay.cursor_end) == ("2026-08-01 00:00:00", "2026-08-02 00:00:00")
+
+
+def test_a_replay_without_a_start_bound_is_refused(oracle_config_root):
+    """Refusing to re-extract the entire history of a table implicitly."""
+    _cursor_source(oracle_config_root)
+    with pytest.raises(ConfigError, match="replay_cursor_start"):
+        make_oracle_cfg(oracle_config_root, run_type="oracle_replay", rerun_id="INC-1042")
+
+
+def test_a_replay_without_a_rerun_id_is_refused(oracle_config_root):
+    """It identifies the re-extraction in the audit table, which is what a support engineer
+    greps for afterwards."""
+    _cursor_source(oracle_config_root)
+    with pytest.raises(ConfigError, match="rerun_id"):
+        make_oracle_cfg(oracle_config_root, run_type="oracle_replay", replay_cursor_start="2026-08-01 00:00:00")
+
+
+def test_replaying_a_source_that_has_no_cursor_is_refused(oracle_config_root):
+    """A full or filter extract already reads everything its predicate matches - re-running
+    it IS the ordinary run, and a replay of one would be a second name for the same thing."""
+    write_oracle_source(oracle_config_root)
+    with pytest.raises(ConfigError, match="incremental_mode is"):
+        make_oracle_cfg(
+            oracle_config_root,
+            run_type="oracle_replay",
+            rerun_id="INC-1042",
+            replay_cursor_start="2026-08-01 00:00:00",
+        )
+
+
+def test_replay_bounds_on_a_scheduled_run_are_refused(oracle_config_root):
+    """A scheduled run that honoured them would re-extract the same window on every future
+    run - the operational-only rule, made specific."""
+    _cursor_source(oracle_config_root)
+    with pytest.raises(ConfigError, match="belong to a replay"):
+        make_oracle_cfg(oracle_config_root, replay_cursor_start="2026-08-01 00:00:00")
+
+
+def test_an_unknown_run_type_is_refused(oracle_config_root):
+    _cursor_source(oracle_config_root)
+    with pytest.raises(ConfigError, match="run_type"):
+        make_oracle_cfg(oracle_config_root, run_type="kafka_replay")
+
+
+def test_one_transaction_identity_per_source_with_no_fork_for_a_replay(oracle_cfg):
+    """Unlike Kafka's, which forks on the rerun id. Oracle's txnVersion is the durable
+    run_sequence, allocated on every run of every type, so a replay always carries a HIGHER
+    version and cannot collide with what the primary lineage already committed."""
+    assert oracle_cfg.txn_app_id == "ingest::oracle::demo_oracle"
+
+
+# --------------------------------------------------------------------------------------
+# What the JDBC read needs (sub-step 4b)
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "SELECT 1 FROM DUAL",
+        "ALTER SESSION SET X = 1; DROP TABLE T",
+        "ALTER SESSION SET X = 1 -- x",
+        "UPDATE T SET X = 1",
+    ],
+)
+def test_a_session_statement_that_is_not_one_cheap_setting_is_refused(oracle_config_root, statement):
+    """It runs once per JDBC partition, on every connection the read opens. Anything that
+    wrote would be executed `num_partitions` times."""
+    assert _error(oracle_config_root, session_init=statement)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD'",
+        "BEGIN DBMS_APPLICATION_INFO.SET_MODULE('ingest', NULL); END;",
+    ],
+)
+def test_an_alter_session_or_a_plsql_block_is_accepted(oracle_config_root, statement):
+    assert _cfg(oracle_config_root, session_init=statement).session_init == statement
+
+
+def test_a_negative_query_timeout_is_refused(oracle_config_root):
+    assert _error(oracle_config_root, query_timeout=-1)
+
+
+def test_column_types_must_be_a_mapping_of_column_to_type(oracle_config_root):
+    assert _error(oracle_config_root, column_types=["AMOUNT"])
+    assert _error(oracle_config_root, column_types={"AMOUNT": ""})
+    assert _cfg(oracle_config_root, column_types={"AMOUNT": "DECIMAL(38,10)"}).column_types == {
+        "AMOUNT": "DECIMAL(38,10)"
+    }

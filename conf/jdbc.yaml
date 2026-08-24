@@ -18,8 +18,72 @@
 # discovers registers by listing conf/*.yaml, so adding one is a new file and no code
 # change at all.
 #
-# EMPTY UNTIL STAGE 4. Profiles are added when sources/oracle/ can read them - a profile
-# here that nothing reads is indistinguishable from one that is wired up.
+# THERE IS NO URL HERE, AND THAT IS DELIBERATE. sources/oracle/config.py builds the JDBC
+# URL from host + port + (service_name | sid), all validated. A URL written as a string is
+# also the obvious place for somebody to paste `user/password@host`, and `url` is the one
+# option whose NAME gives a log redactor no hint that it might carry a credential.
+#
+# TIER MARKERS
+#   [MUST CHANGE]         Placeholder. Will not work as shipped.
+#   [NICE TO CHANGE]      Sensible default. Tune with a reason.
+#   [NO CHANGE REQUIRED]  Dictated by how the database is configured.
+#
+# Full reference: docs/CONFIGURATION.md
 # =====================================================================================
 
-jdbc: {}
+jdbc:
+
+  # ===================================================================================
+  # The core claims database. Service-name form, username/password from the environment's
+  # secret scope. This is the shape every Oracle source starts from.
+  # ===================================================================================
+  oracle_prod_core:
+
+    # ----------------------------------------------------------- NO CHANGE REQUIRED --
+    # The only mode sources/oracle/security.py implements. Oracle wallets and Kerberos
+    # each need a file or a ticket staged on the EXECUTORS - a compute-profile problem
+    # rather than a configuration one - so adding either is a code change, deliberately.
+    auth_mode: basic
+
+    # ------------------------------------------------------------------ MUST CHANGE --
+    # Names of the KEYS inside the environment's secret scope - NOT the values. Keep the
+    # key names identical across environments; the SCOPE is what changes, and it is set
+    # per environment in conf/environments/<env>.yaml.
+    #
+    # The account these name should be READ-ONLY on the extracted schemas. This framework
+    # only ever issues SELECT, and an account that can do more is an account that can be
+    # made to do more by a mistake somewhere else.
+    username_key: oracle-core-username
+    password_key: oracle-core-password
+
+    # -------------------------------------------------------------- NICE TO CHANGE --
+    # The listener port. 1521 is Oracle's default and is the code default too; it is
+    # written out here because a database behind a non-default port is common enough that
+    # a reader should see where it goes.
+    port: 1521
+
+    # Extra JDBC CONNECTION PROPERTIES, passed to the driver verbatim.
+    #
+    # DELIBERATELY EMPTY. The obvious candidate is oracle.jdbc.mapDateToTimestamp, which
+    # decides whether an Oracle DATE reaches Spark with its time component intact - and
+    # whether it is needed, and under which name, is VB-03. Setting it before that is
+    # answered would be guessing at a property that silently truncates every timestamp in
+    # a column if it is wrong in either direction.
+    extra_options: {}
+
+  # ===================================================================================
+  # A legacy database reached by SID rather than service name. Kept as a worked example
+  # of the older URL form, which is still what many on-premise instances present.
+  #
+  #   service_name -> jdbc:oracle:thin:@//host:port/service
+  #   sid          -> jdbc:oracle:thin:@host:port:sid
+  #
+  # Exactly one of the two, per profile. Setting both, or neither, is a config error that
+  # names the choice - guessing between them produces a connection failure naming neither.
+  # ===================================================================================
+  oracle_legacy_billing:
+    auth_mode: basic
+    username_key: oracle-billing-username
+    password_key: oracle-billing-password
+    port: 1521
+    extra_options: {}

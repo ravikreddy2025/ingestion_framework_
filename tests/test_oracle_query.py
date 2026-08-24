@@ -254,3 +254,46 @@ def test_every_combination_of_the_four_parts_builds(oracle_config_root, base_nam
         assert f"LAST_UPDATE_DT {'>=' if cursor == 'merge' else '>'} TO_TIMESTAMP" in built
         assert "LAST_UPDATE_DT <= TO_TIMESTAMP" in built
     assert built.count("WHERE") == (0 if cursor is None and not filter_fragment else 1)
+
+
+# --------------------------------------------------------------------------------------
+# The replay window, and the bounds probe (sub-step 4b, docs/build_log/DECISIONS.md D-09)
+# --------------------------------------------------------------------------------------
+
+FILTERED_QUERY = "SELECT * FROM CLAIMS.CLAIM_HEADER WHERE STATUS IN ('A')"
+
+
+def test_a_replay_start_bound_is_always_inclusive(oracle_config_root):
+    """Even where merge_keys are waived, and that is deliberate: a replay's start is a
+    window boundary a human typed, so excluding it would silently drop the very rows the
+    operator named. A replay is supervised, and re-reading one boundary value costs
+    nothing."""
+    write_oracle_source(
+        oracle_config_root,
+        incremental_mode="cursor",
+        cursor_column="LAST_UPDATE_DT",
+        cursor_type="timestamp",
+        merge_keys=[],
+    )
+    cfg = make_oracle_cfg(
+        oracle_config_root,
+        run_type="oracle_replay",
+        rerun_id="INC-1042",
+        replay_cursor_start=WATERMARK,
+        replay_cursor_end=HIGH_WATER,
+    )
+    built = build_query(cfg, cfg.replay.cursor_start, cfg.replay.cursor_end)
+
+    assert "LAST_UPDATE_DT >= TO_TIMESTAMP('2026-08-01 00:00:00'" in built
+    assert "LAST_UPDATE_DT <= TO_TIMESTAMP('2026-08-24 06:30:00'" in built
+
+
+def test_the_partition_bounds_query_wraps_the_extract(oracle_config_root):
+    """One cheap round trip, over the same query the extract will run - so the bounds
+    cannot go stale the way a configured pair would."""
+    from kafka_ingest.sources.oracle.query import bounds_query
+
+    cfg = _cfg(oracle_config_root, partition_column="CLAIM_ID", num_partitions=4)
+    assert bounds_query(cfg, FILTERED_QUERY) == (
+        f"SELECT MIN(CLAIM_ID) AS lower_bound, MAX(CLAIM_ID) AS upper_bound FROM ({FILTERED_QUERY}) b"
+    )

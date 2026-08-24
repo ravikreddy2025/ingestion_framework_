@@ -54,3 +54,18 @@ registries:
 
   sr_onprem_antifraud:
     url: "https://schema-registry-af.fraud.internal:8081"
+
+# Overrides named profiles in conf/jdbc.yaml. The profile must already exist there -
+# conf/jdbc.yaml stays the single register of which databases we extract from. Host,
+# service name and secret scope are what differ per environment; the auth mode and the
+# secret KEY NAMES do not, so they stay in the register.
+jdbc:
+  oracle_prod_core:
+    host: "oracle-core01.corp.internal"
+    service_name: CLAIMSPRD
+    secret_scope: kv-oracle-prod
+
+  oracle_legacy_billing:
+    host: "oracle-billing01.corp.internal"
+    sid: BILLPRD
+    secret_scope: kv-oracle-prod

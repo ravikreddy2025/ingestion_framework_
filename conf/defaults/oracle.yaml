@@ -7,8 +7,8 @@
 #
 # EVERY KEY HERE IS DECLARED IN sources/oracle/spec.py AND READ BY THIS PACKAGE. A key
 # that is not is a hard error at startup naming the key - which is the point: a setting
-# that silently does nothing is worse than a missing one. Keys the JDBC read needs
-# (query timeout, session init, type overrides) arrive with the code that reads them.
+# that silently does nothing is worse than a missing one. Keys the WRITE path needs arrive
+# with the code that reads them, in sub-step 4c.
 #
 # PLACEHOLDERS
 #   {catalog}      and any other key under `vars:` in the environment file
@@ -70,3 +70,23 @@ defaults:
   # a config error, because Spark would silently ignore it and read on one executor.
   # Operationally overridable: ingest_control.oracle_num_partitions.
   num_partitions: 1
+
+  # --- THE READ ITSELF ----------------------------------------------------------------
+  # Seconds a single JDBC statement may run before the driver cancels it. ZERO MEANS NO
+  # TIMEOUT, which is the JDBC option's own default and is what this ships with: a first
+  # full extract of a large table legitimately runs for a long time, and a platform-wide
+  # timeout would kill it at the same point every night with an error that looks like a
+  # network fault. Set it per source once that source's normal run time is known.
+  query_timeout: 0
+
+  # DELIBERATELY NOT SET HERE, both of them:
+  #
+  #   session_init   an ALTER SESSION run once per JDBC CONNECTION, i.e. once per
+  #                  partition. What it should say depends on the database (NLS settings,
+  #                  a parallel hint, a resource group), so it belongs in a source file
+  #                  where a DBA can review it - never platform-wide.
+  #   column_types   per-column type overrides rendered into the JDBC customSchema option.
+  #                  A platform-wide default here would apply a type to a column of the
+  #                  same name in an unrelated table. See VB-02 / VB-03 / VB-04 before
+  #                  setting one at all: the right answer is usually to let the driver's
+  #                  mapping stand.

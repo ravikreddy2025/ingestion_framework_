@@ -7,10 +7,9 @@ the code that reads a key, delete the key.
 
 WHAT IS DELIBERATELY NOT HERE YET
 ---------------------------------
-Sub-step 4a builds configuration, validation and the query builder. The JDBC read
-(`query_timeout`, `session_init`, `column_types`) and the replay controls arrive with the
-code that reads them, in 4b and 4c. An empty slot is honest; a declared key with no reader
-is not.
+Nothing that the write path needs. `landing_partition_by` and anything else sub-step 4c
+reads arrives with the code that reads it. An empty slot is honest; a declared key with no
+reader is not.
 
 STRUCTURAL vs OPERATIONAL, and the three interesting cases
 ----------------------------------------------------------
@@ -24,8 +23,17 @@ STRUCTURAL vs OPERATIONAL, and the three interesting cases
                     them behind a PR. `filter_criteria` most of all - it is a SQL
                     fragment, and support must not be able to reach the source database's
                     parser through the control table.
-  operational ONLY  setting it in YAML is an ERROR. None yet; the replay controls in 4c
-                    are the first.
+  operational ONLY  setting it in YAML is an ERROR. The two replay cursor bounds: each is
+                    scoped to ONE re-extraction, and a bound checked into Git would silently
+                    re-apply on every future deploy.
+
+`incremental_mode` IS OPERATIONALLY OVERRIDABLE, and it is the one exception to "structural
+keys decide what is extracted" (docs/build_log/DECISIONS.md D-09). Support can move a source
+between a full and a delta load with no deploy, because that is a recovery action - a delta
+load that has been skipping rows is fixed by one full load, and waiting for a PR to merge is
+the wrong shape of answer at 3am. What it is NOT allowed to do is change what a column
+MEANS: `cursor_column`, `cursor_type`, `merge_keys` and `filter_criteria` all stay
+structural, so the mode can change while the definition of the increment cannot.
 """
 
 from __future__ import annotations
@@ -59,8 +67,20 @@ _STRUCTURAL = frozenset(
         "partition_column",
         "num_partitions",
         "fetch_size",
+        "query_timeout",
+        "session_init",
+        "column_types",
     }
 )
+
+# Replay bounds, operational-ONLY. They replace the stored watermark FOR ONE RUN, which is
+# what makes a bounded re-extraction possible without touching the durable state a
+# scheduled run depends on (D-09). Named `replay_*` rather than reusing the cursor keys
+# because those already mean something permanent: which column the cursor IS.
+REPLAY_CURSOR_START = "replay_cursor_start"
+REPLAY_CURSOR_END = "replay_cursor_end"
+
+_REPLAY_KEYS = frozenset({REPLAY_CURSOR_START, REPLAY_CURSOR_END})
 
 SOURCE_SPEC = SourceSpec(
     source_type="oracle",
@@ -72,9 +92,10 @@ SOURCE_SPEC = SourceSpec(
     # than as an error.
     required_keys=frozenset({"source_table", "incremental_mode", "fetch_size", "num_partitions"}),
     structural_keys=_STRUCTURAL,
-    # The two knobs that are safe to turn during an incident: neither changes WHICH rows
-    # are extracted, only how hard the extract leans on the source database.
-    operational_keys=frozenset({"fetch_size", "num_partitions"}),
+    # The two tuning knobs, plus the mode switch and the replay bounds (D-09). The tuning
+    # knobs change only how hard the extract leans on the source database; the mode switch
+    # and the bounds change WHICH ROWS, deliberately, because both are recovery actions.
+    operational_keys=frozenset({"fetch_size", "num_partitions", "incremental_mode"}) | _REPLAY_KEYS,
     # A hand-written query and the generated one are two ways to say the same thing, and
     # silently preferring one would make the other look ignored. Declared as pairs rather
     # than one group because `columns` + `filter_column` + `dynamic_date_filter` together
@@ -97,5 +118,9 @@ SOURCE_SPEC = SourceSpec(
     control_columns={
         "oracle_fetch_size": "fetch_size",
         "oracle_num_partitions": "num_partitions",
+        # The full-vs-delta switch. The replay bounds are NOT columns of their own: they
+        # ride in the framework-owned `replay_controls` JSON, exactly as Kafka's replay
+        # offsets do, because they are per-incident parameters rather than standing state.
+        "oracle_incremental_mode": "incremental_mode",
     },
 )

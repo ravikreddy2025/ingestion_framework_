@@ -135,6 +135,10 @@ class FakeRow:
     def asDict(self):  # noqa: N802 - mirrors the Spark API
         return dict(self._data)
 
+    def __getitem__(self, key):
+        """By column name, as pyspark.sql.Row does - a probe row is read that way."""
+        return self._data[key]
+
 
 class FakeDataFrame:
     """Records predicates instead of applying them.
@@ -907,7 +911,7 @@ def write_oracle_source(config_root, source_key="demo_oracle", **settings) -> st
     return source_key
 
 
-def make_oracle_cfg(config_root, source_key="demo_oracle", environment="dev", **job_parameters):
+def make_oracle_cfg(config_root, source_key="demo_oracle", environment="dev", run_type="primary", **job_parameters):
     """The source's own frozen config, resolved through the REAL five-layer path.
 
     Uses framework/tables.py itself rather than a stand-in: rendering the landing pattern
@@ -919,10 +923,133 @@ def make_oracle_cfg(config_root, source_key="demo_oracle", environment="dev", **
     from kafka_ingest.sources.oracle import config as oracle_config
 
     resolved = resolve_config(config_root, source_key, environment, oracle.SOURCE_SPEC, job_parameters=job_parameters)
-    return oracle_config.build(resolved, tables)
+    return oracle_config.build(resolved, run_type, tables)
+
+
+def make_oracle_ctx(config_root, source_key="demo_oracle", environment="dev", run_type="primary", **job_parameters):
+    """A RunContext of stand-ins, built through the real config resolution path.
+
+    A source is handed a RunContext and nothing else, so this is how one is tested without
+    a database: recording writers, a recording audit writer and a FakeSpark whose reader
+    captures the options rather than connecting.
+    """
+    from kafka_ingest.framework.config import resolve_config
+    from kafka_ingest.framework.contracts import RunContext
+    from kafka_ingest.sources import oracle
+
+    cfg = resolve_config(config_root, source_key, environment, oracle.SOURCE_SPEC, job_parameters=job_parameters)
+    return RunContext(
+        cfg=cfg,
+        spark=FakeSpark(),
+        audit=RecordingAudit(run_type=run_type),
+        state=None,
+        writers=RecordingWriters(),
+        tables=RecordingTables(),
+        log=RecordingLog(),
+        run_id=f"{source_key}-{run_type}-test",
+        run_type=run_type,
+        run_sequence=1,
+    )
 
 
 @pytest.fixture
 def oracle_cfg(oracle_config_root):
     """The default source: a full extract of CLAIMS.CLAIM_HEADER."""
     return make_oracle_cfg(oracle_config_root)
+
+
+# --------------------------------------------------------------------------------------
+# Recording JDBC read path.
+#
+# A JDBC read is entirely "hand the right options to spark.read". Recording the options
+# map tests exactly the part that has to be right, and does it with no driver, no
+# database and no JVM - which is the only way it can be tested at all here.
+# --------------------------------------------------------------------------------------
+
+
+class RecordingJdbcReader:
+    """Stands in for spark.read, capturing format/options instead of connecting."""
+
+    def __init__(self, spark):
+        self._spark = spark
+        self.format_used = None
+        self.options_used = {}
+
+    def format(self, source):
+        self.format_used = source
+        return self
+
+    def options(self, **options):
+        self.options_used.update(options)
+        return self
+
+    def option(self, key, value):
+        self.options_used[key] = value
+        return self
+
+    def load(self):
+        self._spark.reads.append(self)
+        return self._spark.next_frame()
+
+
+class LoadedFrame:
+    """What a recorded read returns: rows and a schema, both supplied by the test."""
+
+    def __init__(self, rows=(), schema=None):
+        self.rows = [FakeRow(row) if isinstance(row, dict) else row for row in rows]
+        self.schema = schema
+
+    def collect(self):
+        return list(self.rows)
+
+    def count(self):
+        return len(self.rows)
+
+
+class FakeJdbcSpark(FakeSpark):
+    """A FakeSpark whose `.read` records. `frames` are returned one per load(), in order.
+
+    A list rather than one frame because an Oracle run reads more than once: a probe for
+    the partition bounds, then the extract itself, and the interesting assertions are
+    about how the two DIFFER.
+    """
+
+    def __init__(self, frames=None, **kwargs):
+        super().__init__(**kwargs)
+        self.reads = []
+        self._frames = list(frames or [])
+
+    @property
+    def read(self):
+        return RecordingJdbcReader(self)
+
+    def next_frame(self):
+        return self._frames.pop(0) if self._frames else LoadedFrame()
+
+    def options_for(self, index):
+        return self.reads[index].options_used
+
+
+# --------------------------------------------------------------------------------------
+# A Spark schema, without Spark. sources/oracle/types.py reads `.fields`, `.name` and
+# `.dataType.simpleString()` by duck typing precisely so this is possible.
+# --------------------------------------------------------------------------------------
+
+
+class FakeType:
+    def __init__(self, name):
+        self._name = name
+
+    def simpleString(self):  # noqa: N802 - mirrors the Spark API
+        return self._name
+
+
+class FakeField:
+    def __init__(self, name, type_name):
+        self.name = name
+        self.dataType = FakeType(type_name)
+
+
+class FakeSchema:
+    def __init__(self, columns):
+        self.fields = [FakeField(name, type_name) for name, type_name in columns.items()]

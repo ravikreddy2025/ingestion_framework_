@@ -133,7 +133,11 @@ def _cursor_predicates(cfg: OracleConfig, last_watermark: str | None, run_high_w
     loses rows against a live one, which is why `run_high_water` is a required argument
     here rather than a defaulted one.
 
-    THE LOWER BOUND'S OPERATOR IS DECIDED BY `merge_keys` (see 4c and OracleConfig):
+    THE LOWER BOUND'S OPERATOR IS DECIDED BY `merge_keys` (see 4c and OracleConfig), and
+    by whether this is a REPLAY. A replay's start bound is a window boundary a human typed,
+    so it is always inclusive: excluding it would silently drop the very rows the operator
+    named, and a replay is a supervised action where re-reading one boundary value costs
+    nothing.
 
       merge keys set     `>=`  re-reads the boundary, and the MERGE de-duplicates it.
                                Tie-safe on a non-unique cursor. The recommended default.
@@ -153,9 +157,26 @@ def _cursor_predicates(cfg: OracleConfig, last_watermark: str | None, run_high_w
     column = cfg.cursor_column
     predicates = [f"{column} <= {_literal(cfg, run_high_water)}"]
     if last_watermark:
-        operator = ">=" if cfg.merge_on_write else ">"
+        operator = ">=" if (cfg.merge_on_write or cfg.is_replay) else ">"
         predicates.insert(0, f"{column} {operator} {_literal(cfg, last_watermark)}")
     return predicates
+
+
+def bounds_query(cfg: OracleConfig, query: str) -> str:
+    """MIN and MAX of the partition column, over the query this run is about to extract.
+
+    Over the QUERY and not over the table, deliberately: bounds taken from the whole table
+    would slice a filtered extract into partitions that are mostly empty, and the last one
+    would do all the work. The column names are fixed here because reader.py reads them
+    back by name - a positional read would break the day someone adds a third aggregate.
+    """
+    column = cfg.partition_column
+    if not column:
+        raise ConfigError(
+            f"source '{cfg.source_key}': partition bounds were asked for, but no "
+            "partition_column is configured. A serial read needs no bounds."
+        )
+    return f"SELECT MIN({column}) AS lower_bound, MAX({column}) AS upper_bound FROM ({query}) b"
 
 
 def _literal(cfg: OracleConfig, value: str) -> str:

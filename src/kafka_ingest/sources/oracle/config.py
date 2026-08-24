@@ -24,11 +24,25 @@ truths live in `target_tokens()`, which is the one function that crosses between
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from ...framework.config import ConfigError
-from .spec import COLUMNS, DYNAMIC_DATE_FILTER, FILTER_COLUMN, FILTER_CRITERIA, SQL_QUERY
+from .spec import (
+    COLUMNS,
+    DYNAMIC_DATE_FILTER,
+    FILTER_COLUMN,
+    FILTER_CRITERIA,
+    REPLAY_CURSOR_END,
+    REPLAY_CURSOR_START,
+    SQL_QUERY,
+)
+
+# The framework carries `run_type` as an opaque string and enumerates nothing; these are
+# the two shapes THIS source knows how to execute.
+RUN_TYPE_PRIMARY = "primary"
+RUN_TYPE_ORACLE_REPLAY = "oracle_replay"
+VALID_RUN_TYPES = (RUN_TYPE_PRIMARY, RUN_TYPE_ORACLE_REPLAY)
 
 # How much of the table this run extracts.
 #
@@ -98,6 +112,103 @@ _FRAGMENT_FORBIDDEN_WORDS = (
 _QUERY_OPENERS = ("SELECT", "WITH")
 
 
+# The only JDBC auth mode this framework implements. Oracle wallets and Kerberos both need
+# a file or ticket staged on the executors, which is a compute-profile problem rather than a
+# configuration one - adding either is a code change here, deliberately, so that no
+# half-supported mode can be selected from YAML.
+JDBC_AUTH_BASIC = "basic"
+VALID_JDBC_AUTH = (JDBC_AUTH_BASIC,)
+
+# The Oracle thin driver. Not configurable: a different driver class means a different
+# connection string grammar, and this module builds the URL.
+ORACLE_DRIVER = "oracle.jdbc.OracleDriver"
+
+# A host or service name that will be pasted into a JDBC URL. Deliberately narrow - a `/`
+# or an `@` here would change which server is connected to, and a URL is not a place to
+# find that out.
+_HOSTNAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$")
+_SERVICE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._$#-]{0,127}$")
+
+
+@dataclass(frozen=True)
+class JdbcProfile:
+    """One entry from conf/jdbc.yaml, with this environment's overlay applied.
+
+    Holds no credential and never will: `secret_scope` plus the two KEY NAMES are what is
+    written down, and sources/oracle/security.py resolves them at run time.
+
+    THE URL IS BUILT HERE, from parts, rather than configured as a string. An Oracle thin
+    URL embeds the host, the port and either a service name or a SID, and it is also the
+    obvious place for somebody to paste `user/password@host` - building it from validated
+    parts means a credential cannot get into the one option that is not treated as
+    sensitive by name.
+    """
+
+    name: str
+    host: str
+    port: int = 1521
+    service_name: str | None = None
+    sid: str | None = None
+    auth_mode: str = JDBC_AUTH_BASIC
+    secret_scope: str | None = None
+    username_key: str | None = None
+    password_key: str | None = None
+    # Extra JDBC connection properties, passed through verbatim. This is where a driver
+    # property such as oracle.jdbc.mapDateToTimestamp belongs once VB-03 answers whether it
+    # is needed - per profile, in a PR, rather than hardcoded for every database.
+    extra_options: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        where = f"jdbc profile '{self.name}'"
+        if self.auth_mode not in VALID_JDBC_AUTH:
+            raise ConfigError(f"{where}: auth_mode '{self.auth_mode}' not in {sorted(VALID_JDBC_AUTH)}")
+        if not (self.secret_scope and self.username_key and self.password_key):
+            raise ConfigError(
+                f"{where}: basic auth requires secret_scope plus username_key and password_key - "
+                "the NAMES of the secrets, never the values."
+            )
+        if bool(self.service_name) == bool(self.sid):
+            raise ConfigError(
+                f"{where}: set exactly one of service_name or sid. They select different URL "
+                "forms (@//host:port/service vs @host:port:sid), and guessing between them "
+                "produces a connection error that names neither."
+            )
+        if not _HOSTNAME.match(str(self.host or "")):
+            raise ConfigError(f"{where}: host '{self.host}' is not a plain hostname. It is pasted into the JDBC URL.")
+        if not 1 <= int(self.port) <= 65535:
+            raise ConfigError(f"{where}: port {self.port} is out of range")
+        for label in ("service_name", "sid"):
+            value = getattr(self, label)
+            if value and not _SERVICE.match(str(value)):
+                raise ConfigError(f"{where}: {label} '{value}' contains characters that are not legal in a JDBC URL.")
+
+    @property
+    def url(self) -> str:
+        """`jdbc:oracle:thin:@//host:port/service` or the older `@host:port:sid` form."""
+        if self.service_name:
+            return f"jdbc:oracle:thin:@//{self.host}:{self.port}/{self.service_name}"
+        return f"jdbc:oracle:thin:@{self.host}:{self.port}:{self.sid}"
+
+
+@dataclass(frozen=True)
+class ReplayControls:
+    """What THIS execution is re-extracting, if anything. Every field is operational-only.
+
+    `rerun_id` is framework-owned and identifies the replay; the two bounds REPLACE the
+    stored watermark for this run and this run only. A replay never writes `ingest_state`
+    (sub-step 4c asserts it), which is what makes re-extracting a window safe while a
+    scheduled delta load continues from where it actually got to.
+    """
+
+    rerun_id: str | None = None
+    cursor_start: str | None = None
+    cursor_end: str | None = None
+
+    @property
+    def is_bounded(self) -> bool:
+        return bool(self.cursor_start or self.cursor_end)
+
+
 @dataclass(frozen=True)
 class DateWindow:
     """The `dynamic_date_filter` block: a column, and how far back to look from now.
@@ -119,8 +230,9 @@ class OracleConfig:
     environment: str
     domain: str
 
+    run_type: str
     jdbc_ref: str
-    jdbc_profile: Mapping[str, Any]
+    jdbc: JdbcProfile
 
     source_schema: str
     source_table: str
@@ -140,8 +252,12 @@ class OracleConfig:
     partition_column: str | None
     num_partitions: int
     fetch_size: int
+    query_timeout: int
+    session_init: str | None
+    column_types: Mapping[str, str]
 
     table_properties: Mapping[str, Any]
+    replay: ReplayControls
 
     # -- derived ---------------------------------------------------------------------
 
@@ -159,6 +275,25 @@ class OracleConfig:
         return self.incremental_mode == MODE_CURSOR
 
     @property
+    def is_replay(self) -> bool:
+        return self.run_type != RUN_TYPE_PRIMARY
+
+    @property
+    def txn_app_id(self) -> str:
+        """The identity Delta deduplicates retried appends against. STABLE across restarts.
+
+        One identity per source, with no fork for a replay - unlike Kafka's, which forks on
+        the rerun id. The difference is what supplies the txnVersion: Kafka's is a
+        microbatch id that RESTARTS at 0 in a replay's own checkpoint, so a replay under the
+        primary identity would collide with versions already committed. Oracle's is
+        `run_sequence` from `ingest_state`, allocated by the runner on every run of every
+        type, so a replay always carries a HIGHER version than anything before it and cannot
+        collide. Forking here would buy nothing and would cost the property that makes the
+        marker work at all: one writer, one identity, forever.
+        """
+        return f"ingest::oracle::{self.source_key}"
+
+    @property
     def merge_on_write(self) -> bool:
         """Merge keys change CORRECTNESS here, not just performance.
 
@@ -171,13 +306,15 @@ class OracleConfig:
         return bool(self.merge_keys)
 
 
-def build(cfg: Any, tables: Any) -> OracleConfig:
+def build(cfg: Any, run_type: str, tables: Any) -> OracleConfig:
     """Turn a framework ResolvedConfig into a validated OracleConfig.
 
     `tables` is framework/tables.py, carried on the RunContext. It renders the landing
     pattern - which still holds {source_schema} and {source_table}, because only this
     source can supply them - and validates the resulting name before anything connects.
     """
+    if run_type not in VALID_RUN_TYPES:
+        raise ConfigError(f"run_type '{run_type}' not in {sorted(VALID_RUN_TYPES)}")
     source_schema = _identifier(_required_text(cfg, "source_schema"), "source_schema", cfg.source_key)
     source_table = _identifier(_required_text(cfg, "source_table"), "source_table", cfg.source_key)
     jdbc_ref = _required_text(cfg, "jdbc_ref")
@@ -190,11 +327,11 @@ def build(cfg: Any, tables: Any) -> OracleConfig:
         source_key=cfg.source_key,
         environment=cfg.environment,
         domain=str(cfg.get("domain") or ""),
+        run_type=run_type,
         jdbc_ref=jdbc_ref,
-        # Resolved, not just named: `profile()` raises and lists the valid names, so a
-        # typo in jdbc_ref fails at config load rather than as a connection error.
-        # sub-step 4b turns this mapping into a URL and a credential lookup.
-        jdbc_profile=dict(cfg.profile("jdbc", jdbc_ref)),
+        # `profile()` raises and lists the valid names, so a typo in jdbc_ref fails at
+        # config load rather than as a connection error an hour into an incident.
+        jdbc=JdbcProfile(name=jdbc_ref, **dict(cfg.profile("jdbc", jdbc_ref))),
         source_schema=source_schema,
         source_table=source_table,
         landing_table=tables.target(cfg, "landing", target_tokens(source_schema, source_table, cfg.source_key)),
@@ -210,7 +347,11 @@ def build(cfg: Any, tables: Any) -> OracleConfig:
         partition_column=_optional_identifier(cfg, "partition_column"),
         num_partitions=_positive_int(cfg.get("num_partitions"), "num_partitions", cfg.source_key),
         fetch_size=_positive_int(cfg.get("fetch_size"), "fetch_size", cfg.source_key),
+        query_timeout=_non_negative_int(cfg.get("query_timeout"), "query_timeout", cfg.source_key),
+        session_init=_text(cfg.get("session_init")),
+        column_types=_column_types(cfg),
         table_properties=cfg.get("table_properties") or {},
+        replay=_replay_controls(cfg, run_type),
     )
     _validate(resolved)
     return resolved
@@ -255,6 +396,8 @@ def _validate(cfg: OracleConfig) -> None:
     _check_filter_criteria(cfg, where)
     _check_sql_query(cfg, where)
     _check_read_parallelism(cfg, where)
+    _check_session_init(cfg, where)
+    _check_replay_is_executable(cfg, where)
 
 
 def _check_mode_requirements(cfg: OracleConfig, where: str) -> None:
@@ -361,6 +504,68 @@ def _check_sql_query(cfg: OracleConfig, where: str) -> None:
             )
 
 
+def _check_session_init(cfg: OracleConfig, where: str) -> None:
+    """`sessionInitStatement` runs PER CONNECTION, i.e. once per JDBC partition.
+
+    So it must be cheap and idempotent - an ALTER SESSION is the intended use, and anything
+    that wrote would be executed `num_partitions` times. It is checked by shape, and a
+    statement separator outside a PL/SQL block is refused: chaining two statements here
+    would run something nobody reviewed on every connection the read opens.
+    """
+    if cfg.session_init is None:
+        return
+    statement = cfg.session_init.upper()
+    if not statement.startswith(("ALTER SESSION", "BEGIN")):
+        raise ConfigError(
+            f"{where}: session_init must be an ALTER SESSION statement or a PL/SQL block. It "
+            "runs once per JDBC partition, on every connection, so it has to be cheap and "
+            f"idempotent - got '{cfg.session_init[:60]}'."
+        )
+    for text in _FRAGMENT_FORBIDDEN_TEXT:
+        if text == ";" and statement.startswith("BEGIN"):
+            continue
+        if text in cfg.session_init:
+            raise ConfigError(
+                f"{where}: session_init contains '{text}'. One statement per connection - a "
+                "separator or comment marker here would run on every connection the read opens."
+            )
+
+
+def _check_replay_is_executable(cfg: OracleConfig, where: str) -> None:
+    """A replay must be able to do what it was asked, and must not need state to do it.
+
+    The bounds are checked for SHAPE here and rendered into SQL by query.py's `_literal()`,
+    which is the single place text becomes SQL. Checking at config load means an
+    unparseable bound fails before the job has cost a cluster minute.
+    """
+    if not cfg.is_replay:
+        if cfg.replay.is_bounded:
+            raise ConfigError(
+                f"{where}: {REPLAY_CURSOR_START}/{REPLAY_CURSOR_END} are set on a "
+                f"'{cfg.run_type}' run. They replace the stored watermark for ONE run and "
+                "belong to a replay - a scheduled run that honoured them would re-extract the "
+                "same window on every future run."
+            )
+        return
+    if not cfg.replay.rerun_id:
+        raise ConfigError(
+            f"{where}: a replay requires a rerun_id. It identifies this re-extraction in the "
+            "audit table, and it is what a support engineer greps for afterwards."
+        )
+    if not cfg.is_cursor:
+        raise ConfigError(
+            f"{where}: a replay re-extracts a cursor interval, but incremental_mode is "
+            f"'{cfg.incremental_mode}'. Re-running a full or filter extract needs no replay - "
+            "the ordinary run already reads everything the predicate matches."
+        )
+    if not cfg.replay.cursor_start:
+        raise ConfigError(
+            f"{where}: a replay requires {REPLAY_CURSOR_START} - refusing to re-extract the "
+            "entire history of this table implicitly. Set an end bound too, unless 'from "
+            "there to now' is what you mean."
+        )
+
+
 def _check_read_parallelism(cfg: OracleConfig, where: str) -> None:
     """`numPartitions` without a `partitionColumn` does not split anything.
 
@@ -383,6 +588,42 @@ def _check_read_parallelism(cfg: OracleConfig, where: str) -> None:
 # --------------------------------------------------------------------------------------
 # Readers
 # --------------------------------------------------------------------------------------
+
+
+def _replay_controls(cfg: Any, run_type: str) -> ReplayControls:
+    """The bounds for this execution, if it is one. `rerun_id` is framework-owned (D-05)."""
+    return ReplayControls(
+        rerun_id=_text(cfg.get("rerun_id")),
+        cursor_start=_text(cfg.get(REPLAY_CURSOR_START)),
+        cursor_end=_text(cfg.get(REPLAY_CURSOR_END)),
+    )
+
+
+def _column_types(cfg: Any) -> dict[str, str]:
+    """Per-column type overrides, rendered into the JDBC `customSchema` option by types.py.
+
+    Validated as a mapping of identifier -> non-empty text here; whether the text names a
+    type Spark accepts is types.py's business, because that is where the option is built.
+    """
+    raw = cfg.get("column_types")
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ConfigError(
+            f"source '{cfg.source_key}': column_types must be a mapping of COLUMN -> Spark "
+            f"type, got {type(raw).__name__}."
+        )
+    return {
+        _identifier(str(column).strip(), "column_types", cfg.source_key): _required_type(cfg, column, value)
+        for column, value in raw.items()
+    }
+
+
+def _required_type(cfg: Any, column: Any, value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ConfigError(f"source '{cfg.source_key}': column_types['{column}'] is empty.")
+    return text
 
 
 def _date_window(cfg: Any) -> DateWindow | None:
@@ -456,6 +697,17 @@ def _text(value: Any) -> str | None:
 def _lower(value: Any) -> str | None:
     text = _text(value)
     return None if text is None else text.lower()
+
+
+def _non_negative_int(value: Any, key: str, source_key: str) -> int:
+    """Zero is meaningful for `query_timeout`: it is the JDBC option's own 'no timeout'."""
+    try:
+        number = int(value if value is not None else 0)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"source '{source_key}': '{key}' must be an integer, got {value!r}") from exc
+    if number < 0:
+        raise ConfigError(f"source '{source_key}': '{key}' cannot be negative, got {number}.")
+    return number
 
 
 def _positive_int(value: Any, key: str, source_key: str) -> int:

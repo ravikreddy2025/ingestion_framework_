@@ -18,6 +18,7 @@ from conftest import make_oracle_cfg, write_oracle_source
 from kafka_ingest.framework.config import FRAMEWORK_STRUCTURAL_KEYS, known_keys, resolve_config
 from kafka_ingest.framework.control import read_control
 from kafka_ingest.sources import oracle
+from kafka_ingest.sources.oracle import spec as oracle_spec
 
 SPEC = oracle.SOURCE_SPEC
 PACKAGE = pathlib.Path(oracle.__file__).parent
@@ -115,13 +116,36 @@ def test_every_control_column_maps_to_a_setting_that_is_operationally_overridabl
         assert setting in SPEC.operational_keys, f"control column '{column}' maps to '{setting}', which nothing reads"
 
 
-def test_the_control_columns_are_the_two_levers_support_has():
-    """Named explicitly so that adding a third is a deliberate edit here AND an ALTER TABLE
+def test_the_control_columns_are_the_levers_support_has():
+    """Named explicitly so that adding a fourth is a deliberate edit here AND an ALTER TABLE
     in sql/01 - there is no free-form JSON escape hatch any more."""
     assert SPEC.control_columns == {
         "oracle_fetch_size": "fetch_size",
         "oracle_num_partitions": "num_partitions",
+        "oracle_incremental_mode": "incremental_mode",
     }
+
+
+def test_the_mode_switch_is_the_one_operational_key_that_changes_what_is_extracted():
+    """docs/build_log/DECISIONS.md D-09, and the exception that proves the rule.
+
+    Support can move a source between a full and a delta load without a deploy, because
+    that is a RECOVERY action. What they still cannot do is change what the increment
+    means - the cursor column, its type, the merge keys and the filter all stay
+    structural, so the mode can change while its definition cannot.
+    """
+    assert "incremental_mode" in SPEC.operational_keys
+    assert "incremental_mode" in SPEC.structural_keys
+    for key in ("cursor_column", "cursor_type", "merge_keys", "filter_criteria"):
+        assert key not in SPEC.operational_keys, f"'{key}' would let an override redefine the increment"
+
+
+@pytest.mark.parametrize("key", [oracle_spec.REPLAY_CURSOR_START, oracle_spec.REPLAY_CURSOR_END])
+def test_the_replay_bounds_are_operational_only(key):
+    """Each is scoped to ONE re-extraction. A bound checked into Git would silently
+    re-apply on every future deploy, quietly re-reading the same window forever."""
+    assert key in SPEC.operational_keys
+    assert key not in SPEC.structural_keys
 
 
 def test_a_control_row_setting_both_columns_resolves_end_to_end(oracle_config_root):
@@ -144,7 +168,7 @@ def test_a_control_row_setting_both_columns_resolves_end_to_end(oracle_config_ro
     table = "ops.ingestion.ingest_control"
     overrides = read_control(FakeSpark([row], existing_tables=(table,)), table, "demo_oracle", SPEC)
     resolved = resolve_config(oracle_config_root, "demo_oracle", "dev", SPEC, control=overrides)
-    cfg = oracle_config.build(resolved, tables)
+    cfg = oracle_config.build(resolved, "primary", tables)
 
     assert cfg.fetch_size == 500
     assert cfg.num_partitions == 4

@@ -567,3 +567,101 @@ code must change -- see "If it fails").
   Python -- that anchors the window on the Databricks driver's clock, which is a third clock
   and no closer to the data.
 - **Status:** OPEN
+
+### VB-21 -- Is the partition-bounds probe cheap, and does it return usable bounds?
+- **Stage / file:** Stage 4b. `sources/oracle/reader.py` `partition_bounds()`,
+  `sources/oracle/query.py` `bounds_query()`.
+- **Why it matters:** `lowerBound` / `upperBound` do not filter -- they only decide where
+  Spark cuts the range into `numPartitions` slices -- so this framework READS them with
+  `SELECT MIN(col), MAX(col)` over the same query the extract will run, rather than taking
+  them from configuration where they would go stale silently. That is one extra round trip
+  per partitioned run, and two things about it are unverified: whether Oracle answers it from
+  an index (cheap) or with a full scan of the filtered set (a second full read), and whether
+  wrapping the extract query in `SELECT MIN(...) FROM (<query>) b` defeats any hint or
+  parallel plan the extract itself relies on. If the probe is expensive, a partitioned read
+  costs two scans instead of one and nothing in the run's own numbers shows it.
+- **How to check:**
+  ```sql
+  EXPLAIN PLAN FOR
+  SELECT MIN(CLAIM_ID) AS lower_bound, MAX(CLAIM_ID) AS upper_bound
+    FROM (SELECT * FROM CLAIMS.CLAIM_HEADER WHERE STATUS IN ('A')) b;
+  SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+  ```
+  Then time the probe against the extract on a real table, and check the resulting slice
+  sizes: `df.groupBy(spark_partition_id()).count().show()` on the loaded frame.
+- **Expected:** An INDEX FULL SCAN (MIN/MAX) or equivalent, milliseconds rather than minutes,
+  and partitions within an order of magnitude of each other in row count.
+- **If it fails:** Two options, in order. Take the bounds from the TABLE rather than the
+  filtered query (cheaper, cruder, and the outer partitions end up sparse), or add optional
+  `partition_lower_bound` / `partition_upper_bound` settings for the tables where a DBA has
+  a better answer than a probe. Do NOT drop the bounds and keep `numPartitions` -- Spark
+  silently falls back to a single partition, which is the failure this exists to avoid.
+- **Status:** OPEN
+
+### VB-22 -- Is the Oracle JDBC driver installed on the target cluster, and which version?
+- **Stage / file:** Stage 4b. `sources/oracle/security.py` names `oracle.jdbc.OracleDriver`.
+- **Why it matters:** Nothing in this repository installs a JDBC driver, and `ojdbc` is not on
+  Databricks Runtime by default. The failure is loud (`ClassNotFoundException`) so it will not
+  corrupt data -- but the VERSION is not loud at all, and it is what decides the answers to
+  VB-02 (NUMBER mapping), VB-03 (DATE vs TIMESTAMP) and whether `oracle.jdbc.*` connection
+  properties are honoured under the names this framework would pass them by. Two clusters
+  running different ojdbc versions would land the same table with different types.
+- **How to check:** On the target cluster:
+  ```python
+  spark._jvm.java.lang.Class.forName("oracle.jdbc.OracleDriver")
+  spark._jvm.oracle.jdbc.OracleDriver.getJDBCVersion()
+  ```
+  and check how it is installed: cluster library, init script, or Unity Catalog volume JAR.
+- **Expected:** The class loads, and the driver version is recorded somewhere a human can find
+  it -- ideally pinned as a cluster library in the bundle rather than installed by hand.
+- **If it fails:** Installing the driver is a platform task (`docs/RUNBOOK_CLIENT_IT.md`), not
+  a code change. Record the version there, because VB-02/VB-03 are answered PER VERSION and an
+  upgrade re-opens them.
+- **Status:** OPEN
+
+### VB-23 -- Does `customSchema` apply per column, in the grammar this framework renders?
+- **Stage / file:** Stage 4b. `sources/oracle/types.py` `custom_schema()`.
+- **Why it matters:** `column_types` is the escape hatch for a column whose driver default
+  mapping is wrong -- the fix VB-02 and VB-03 point at. It is rendered as
+  `AMOUNT DECIMAL(38,10), NOTES STRING` and passed as the JDBC `customSchema` option, on the
+  assumption that naming SOME columns leaves the rest on their default mapping. If instead the
+  option is read as the FULL schema, every unnamed column would be dropped or mistyped -- and
+  a run that lands three columns out of forty still reports a row count and a success.
+- **How to check:**
+  ```python
+  df = spark.read.format("jdbc").options(**opts, customSchema="AMOUNT DECIMAL(38,10)").load()
+  df.schema  # is AMOUNT overridden AND every other column still present, correctly typed?
+  ```
+  Also try a column name that does not exist in the table, to see whether it errors or is
+  silently ignored.
+- **Expected:** Only the named column changes type; every other column keeps its default
+  mapping; a name that does not exist raises rather than being ignored.
+- **If it fails:** If `customSchema` must be complete, `types.py` has to render EVERY column,
+  which means discovering the full column list first -- a second query against
+  `ALL_TAB_COLUMNS` at run time, and a design change worth a decision entry rather than a
+  quiet fix. If an unknown column name is silently ignored, add a post-read check that every
+  key of `column_types` appears in the resolved schema.
+- **Status:** OPEN
+
+### VB-24 -- Is `sessionInitStatement` honoured alongside a `dbtable` subquery, and how often does it run?
+- **Stage / file:** Stage 4b. `sources/oracle/reader.py`, `sources/oracle/config.py`
+  `_check_session_init()`.
+- **Why it matters:** The framework accepts an `ALTER SESSION` (or a PL/SQL block) and passes
+  it as `sessionInitStatement`, documenting that it runs once per JDBC connection -- i.e. once
+  per partition. Two things follow, and neither is checked here: if it does NOT run, a source
+  relying on it for an NLS setting reads DIFFERENT VALUES than it expects with no error at
+  all; if it runs more often than assumed, anything with a cost is paid per connection.
+- **How to check:** Set a session statement whose effect is observable in the data, e.g.
+  `ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'`, run a partitioned read of a
+  DATE column, and confirm the format applied. Then count the executions from the database
+  side while the read runs:
+  ```sql
+  SELECT sql_text, executions FROM v$sql WHERE sql_text LIKE 'ALTER SESSION%';
+  ```
+- **Expected:** The statement runs once per connection -- `numPartitions` executions for a
+  partitioned read, one for a serial one -- and its effect is visible in the returned data.
+- **If it fails:** If it is ignored under a `dbtable` subquery, the setting has to move into
+  the connection properties (`extra_options` on the jdbc profile) instead, and
+  `_check_session_init()` plus the `session_init` key should be removed rather than left as a
+  lever that does nothing.
+- **Status:** OPEN

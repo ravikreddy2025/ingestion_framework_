@@ -1,8 +1,8 @@
 # Stage 4 Report -- Oracle source
 
 Branch `stage-4-oracle`, cut from `main` after Stage 3 (PR #5) merged. **One section per
-sub-step**, written as each sub-step's exit gate goes green. Sub-steps 4b (JDBC read), 4c
-(watermark lifecycle) and 4d (operationalise) are not started.
+sub-step**, written as each sub-step's exit gate goes green. Sub-steps 4c (watermark
+lifecycle) and 4d (operationalise) are not started.
 
 ---
 
@@ -248,3 +248,237 @@ skips are the `sql_query` cells of the cross product that are not buildable conf
 
 **New VB entries this sub-step:** VB-19 (the `TO_TIMESTAMP` literal and its format model),
 VB-20 (`SYSTIMESTAMP` as the dynamic window's anchor).
+
+
+---
+
+# Sub-step 4b -- the JDBC read
+
+**NOTHING IN THIS SUB-STEP WAS EXECUTED AGAINST A DATABASE.** There is no Oracle here, no
+JDBC driver, and no JVM that could load one. What ran is every unit test below, against
+recording stand-ins; what a real read does with the options they assert is VB-01, VB-12 and
+VB-21 to VB-24. That distinction is the point of the sub-step's own exit gate and it is
+stated here rather than buried.
+
+Sub-step 4b also carries the new work from `DECISIONS.md` D-09: support can switch a source
+between a full and a delta load without a deploy, and a replay can bound the cursor interval
+explicitly.
+
+## What was built
+
+```
+sources/oracle/
+  security.py   profile + resolved secrets -> JDBC connection options. No PySpark import.
+  reader.py     the read options, the two shapes of read, and the partition-bounds probe
+  types.py      customSchema going in, the resolved schema coming out, drift between runs
+  config.py     JdbcProfile (builds the URL from parts), ReplayControls, the 4b keys
+  query.py      + bounds_query(); a replay's start bound is always inclusive
+conf/jdbc.yaml                  two worked profiles - service-name and SID forms
+conf/environments/*.yaml        the per-environment jdbc overlay (host, service, scope)
+conf/defaults/oracle.yaml       query_timeout, and why session_init/column_types have no default
+sql/01_operational_config.sql   oracle_incremental_mode + its CHECK
+```
+
+`run.py` is still the Stage 1 stub. 4c assembles these into `run(ctx)` with the watermark
+lifecycle, which is the piece that decides ordering and must not be half-built.
+
+## 1. Done and verified
+
+- **The three non-negotiable read options.** `fetchsize` is always set (the driver's own
+  default is ten rows per round trip); the query goes in `dbtable` as a parenthesised
+  subquery and never in the `query` option, which is the form that works under either answer
+  to VB-01; `driver` is named rather than left to JVM auto-discovery. Proof:
+  `test_the_fetch_size_is_always_set`,
+  `test_the_query_is_passed_as_a_parenthesised_subquery_in_dbtable`,
+  `test_the_driver_class_is_named`.
+- **All four partition options, or none.** A serial read sets none of them, because
+  `numPartitions` alone splits nothing; a partitioned read sets all four. Proof:
+  `test_a_serial_read_sets_none_of_the_partition_options`,
+  `test_a_partitioned_read_sets_all_four`.
+- **Partition bounds are READ, not configured**, with a `SELECT MIN/MAX` over the same query
+  the extract will run - so a filtered extract is sliced over the rows it will actually
+  return, and no configured pair can go stale into skew. The probe never opens the extract's
+  connections, a serial read never pays for it at all, and an extract matching no rows falls
+  back to a serial read rather than handing Spark `lowerBound=None`. Proof:
+  `test_the_bounds_come_from_the_query_the_run_will_extract`,
+  `test_the_bounds_probe_never_opens_the_extract_s_connections`,
+  `test_no_partition_column_means_no_probe_at_all`,
+  `test_an_empty_extract_falls_back_to_a_serial_read`.
+- **No credential can reach a log line, an audit row, or the URL.** The password is masked by
+  name through the framework's own redactor, on the FULL read options map and not just the
+  connection half; and the URL is BUILT from validated parts, so `user/password@host` pasted
+  into `host:` is refused rather than becoming the one option whose name gives a redactor no
+  hint. Proof: `test_no_credential_appears_in_a_redacted_read_options_map`,
+  `test_no_credential_survives_redaction_of_the_options_map`,
+  `test_a_rendered_log_line_never_carries_the_password`,
+  `test_a_host_that_is_not_a_hostname_is_refused` (5 cases).
+- **`conf/jdbc.yaml` follows the register pattern exactly**, with no new mechanism: two
+  profiles recording auth mode and secret KEY names, overlaid per environment with host,
+  service name/SID and secret scope. Both URL forms are covered because many on-premise
+  instances still present a SID. Proof: `test_a_service_name_profile_builds_the_modern_url_form`,
+  `test_a_sid_profile_builds_the_older_url_form`,
+  `test_exactly_one_of_service_name_and_sid_is_required`,
+  `test_the_shipped_profiles_resolve_in_every_environment`.
+- **Type handling, all three jobs.** `customSchema` renders only the overridden columns and
+  refuses a type this module cannot verify; the resolved schema becomes plain data for the
+  audit row; a column the driver mapped to `void` stops the run rather than landing NULLs.
+  Proof: `test_overrides_render_in_the_option_s_own_grammar`,
+  `test_a_type_this_module_cannot_verify_is_refused` (5 cases),
+  `test_a_column_the_driver_could_not_map_stops_the_run`.
+- **Schema drift is non-additive-only, and it is a failure.** A changed type or a column that
+  stopped being returned stops the run and names both types; a NEW column is allowed, because
+  adding one is the ordinary way a source table evolves and failing on it would make every
+  source-side release an ingestion incident. Proof: `test_a_type_change_is_reported_with_both_types`,
+  `test_a_column_that_stopped_being_returned_is_reported`,
+  `test_a_new_column_is_additive_and_allowed`,
+  `test_assert_no_drift_names_the_table_and_every_change`.
+- **D-09, the full-vs-delta switch.** `incremental_mode` is now operationally overridable via
+  `ingest_control.oracle_incremental_mode` (with a CHECK constraint), and it is the ONE
+  operational key that changes which rows are extracted. What the increment MEANS -
+  `cursor_column`, `cursor_type`, `merge_keys`, `filter_criteria` - stays structural, so an
+  override of any of them is still ignored. Proof:
+  `test_support_can_switch_a_delta_source_to_a_full_load_without_a_deploy`,
+  `test_an_override_still_cannot_redefine_the_increment`,
+  `test_the_mode_switch_is_the_one_operational_key_that_changes_what_is_extracted`.
+- **D-09, the replay window.** `replay_cursor_start` / `replay_cursor_end` are
+  operational-only and ride in the framework-owned `replay_controls` JSON. A replay requires a
+  rerun id, a cursor source and a start bound; the bounds on a scheduled run are refused
+  outright, because a scheduled run that honoured them would re-extract the same window
+  forever. A replay's start bound is always INCLUSIVE, even where `merge_keys` are waived -
+  it is a boundary a human typed, and excluding it would silently drop the rows they named.
+  Proof: `test_a_replay_bounds_the_cursor_interval_explicitly`,
+  `test_a_replay_without_a_start_bound_is_refused`,
+  `test_a_replay_without_a_rerun_id_is_refused`,
+  `test_replaying_a_source_that_has_no_cursor_is_refused`,
+  `test_replay_bounds_on_a_scheduled_run_are_refused`,
+  `test_a_replay_start_bound_is_always_inclusive`.
+- **`session_init` is checked by shape.** It runs once per JDBC CONNECTION - i.e. once per
+  partition - so anything that wrote would execute `num_partitions` times. An ALTER SESSION or
+  a PL/SQL block is accepted; a SELECT, a DML statement, a chained statement and a comment
+  marker are not. Proof: `test_a_session_statement_that_is_not_one_cheap_setting_is_refused`
+  (4 cases), `test_an_alter_session_or_a_plsql_block_is_accepted` (2 cases).
+- **CORE section 7 grep returns nothing** (run from the repository root over
+  `src/kafka_ingest/framework/`; exit status 1, no output).
+- **Exit gate, all three commands run:**
+  ```
+  $ python -m ruff check src tests
+  All checks passed!
+
+  $ python -m ruff format --check src tests
+  67 files already formatted
+
+  $ python -m pytest -m "not spark" -q
+  708 passed, 6 skipped, 36 deselected in 34.72s
+  ```
+- **Fourteen mutations run to prove the new tests can fail**, each restored afterwards. Every
+  one failed at least one test:
+
+  | Mutation | Result |
+  |---|---|
+  | `fetchsize` no longer set | 1 failed |
+  | the `query` option instead of a `dbtable` subquery | 3 failed |
+  | `numPartitions` dropped from a partitioned read | 1 failed |
+  | an empty extract keeps its NULL bounds | 1 failed |
+  | a serial read still pays for the bounds probe | 2 failed |
+  | host validation removed (a credential could enter the URL) | 5 failed |
+  | service_name/sid exclusivity removed | 2 failed |
+  | a replay without a start bound accepted | 1 failed |
+  | replay bounds accepted on a scheduled run | 1 failed |
+  | `session_init` unchecked | 4 failed |
+  | an unmapped column allowed to land as NULL | 1 failed |
+  | a type change no longer reported as drift | 2 failed |
+  | a dropped column no longer reported as drift | 2 failed |
+  | a replay's start bound becomes exclusive | 1 failed |
+
+## 2. Done but not verifiable here
+
+Everything in this sub-step that touches a database. Explicitly:
+
+- **No JDBC read was executed, and no connection was opened.** Every read test asserts the
+  OPTIONS MAP handed to `spark.read`, against a recording stand-in.
+- **VB-21 (new)** -- is the partition-bounds probe cheap, and are the slices even? A probe
+  that full-scans turns a partitioned run into two scans, and nothing in the run's own
+  numbers would show it.
+- **VB-22 (new)** -- is the Oracle JDBC driver installed on the target cluster, and which
+  version? The class-not-found case is loud; the VERSION is not, and it is what decides
+  VB-02 and VB-03.
+- **VB-23 (new)** -- does `customSchema` override only the columns it names, or is it read as
+  the complete schema? If the latter, `column_types` would silently drop every column it does
+  not mention.
+- **VB-24 (new)** -- is `sessionInitStatement` honoured alongside a `dbtable` subquery, and
+  how often does it run? If it is ignored, a source relying on it reads different values with
+  no error at all.
+- **VB-01** is unchanged and is the reason for the `dbtable` form. **VB-02 / VB-03 / VB-04**
+  now have their fix path built (`column_types` -> `customSchema`, and `extra_options` on the
+  jdbc profile for driver properties) but remain unanswered.
+- **VB-12** covers whether the cluster can reach the database at all.
+
+## 3. Not reproduced
+
+- **`framework/security.py` needed no change.** The stage file lists it under "Edit". Stage 3
+  had already split it - `SecretResolver` and `redact()` are source-agnostic and were reused
+  as they are - and adding anything JDBC-shaped to it would trip the CORE section 7 grep. The
+  Oracle half went to `sources/oracle/security.py`, mirroring `sources/kafka/security.py`.
+- **The read path is in `reader.py`, not `run.py`.** The stage file says
+  "`sources/oracle/run.py` read path". Kafka already puts reader construction in
+  `sources/kafka/reader.py`, and a support engineer asking "how is the read built?" should
+  find the same answer in both packages. `run.py` stays the run's shape, which is what 4c
+  fills in.
+- **`lowerBound` / `upperBound` are not configuration.** The stage file's sketch shows
+  `lo` / `hi` without saying where they come from. Configured bounds go stale silently -
+  an id range grows and every new row lands in the last slice - so they are probed instead.
+  VB-21 is the check on that choice.
+- **No `sources/oracle/run.py` and no shipped Oracle source file yet.** The first is 4c by
+  the stage file's own split; the second waits on `tests/test_shipped_config.py` learning to
+  partition by `source_type`, which is 4d's operationalise work.
+
+## 4. Blocked
+
+- Nothing. Two things deliberately not done, one sentence each per CORE rule 8:
+  - **No retry, no connection pool, no circuit breaker around JDBC** - all three are on the
+    stage file's "do not build" list, and Spark opens and closes its own connections per
+    partition, so a driver-side pool would pool nothing.
+  - **No `ALL_TAB_COLUMNS` probe to recover Oracle's own type names** - it would make the
+    "unmapped type" message name the Oracle type rather than the Spark one, at the cost of a
+    second round trip and a second thing to keep in step; VB-23 may force the question, and
+    it should be answered then rather than guessed at now.
+
+## 5. Decisions for the human
+
+1. **Partition bounds are probed, not configured.** One extra round trip per partitioned run,
+   in exchange for bounds that cannot go stale into skew. VB-21 is the measurement.
+   *What would change it:* a probe that costs a second full scan - at which point the honest
+   fix is optional explicit bounds for the tables where a DBA has a better answer, not
+   dropping the bounds and keeping `numPartitions`.
+2. **One `txnAppId` per source, with no fork for a replay** - unlike Kafka's, which forks on
+   the rerun id. Oracle's `txnVersion` is the durable `run_sequence`, allocated on every run
+   of every type, so a replay always carries a higher version and cannot collide with what
+   the primary lineage committed. This follows the stage file's own
+   `ingest::oracle::{source_key}` exactly.
+   *What would change it:* `run_sequence` ceasing to be monotonic across run types.
+3. **`query_timeout` ships as 0 - no timeout.** A first full extract of a large table
+   legitimately runs for a long time, and a platform-wide timeout would kill it at the same
+   point every night with an error that looks like a network fault. It is a per-source setting
+   once that source's normal run time is known.
+   *What would change it:* a shared Oracle instance where a runaway session is an operational
+   incident for other users - then a generous platform default (say two hours) is better than
+   none.
+4. **Only `auth_mode: basic` exists.** Wallets and Kerberos each need a file or a ticket
+   staged on the executors, which is a compute-profile problem rather than a configuration
+   one, so adding either is a code change and no half-supported mode is selectable from YAML.
+   *What would change it:* a client whose Oracle estate mandates wallet auth - worth knowing
+   before 4d writes the onboarding checklist.
+5. **A replay's start bound is inclusive even where `merge_keys` are waived.** The scheduled
+   run's operator rule (`>` without merge keys) is about not re-reading; a replay is about
+   re-reading deliberately, and dropping the boundary row the operator typed would be a
+   surprise in the one situation where somebody is watching.
+   *What would change it:* nothing I can see; recorded because the two rules differ.
+
+---
+
+**Test count:** 630 passed, 6 skipped before -> **708 passed, 6 skipped, 36 deselected**
+after (`pytest -m "not spark" -q`). Net +78 across three new test files and the D-09
+additions to the two existing ones.
+
+**New VB entries this sub-step:** VB-21 (the bounds probe), VB-22 (the JDBC driver and its
+version), VB-23 (`customSchema` semantics), VB-24 (`sessionInitStatement` semantics).
