@@ -1,8 +1,8 @@
 # Stage 4 Report -- Oracle source
 
 Branch `stage-4-oracle`, cut from `main` after Stage 3 (PR #5) merged. **One section per
-sub-step**, written as each sub-step's exit gate goes green. Sub-step 4d (operationalise)
-is not started.
+sub-step**, written as each sub-step's exit gate goes green. All four are done; the closing
+summary is at the foot of the file.
 
 ---
 
@@ -690,3 +690,227 @@ conf/defaults/oracle.yaml   landing_partition_by, and why it is not a cursor-der
 after (`pytest -m "not spark" -q`). Net +37 across two new test files.
 
 **New VB entries this sub-step:** VB-25 (rows committed below the high-water mark).
+
+
+---
+
+# Sub-step 4d -- operationalise
+
+The Oracle source becomes something a team can run: a job, an onboarding template, a
+worked example, the configuration reference, the failure table, and the incident playbook.
+Nothing here needed a code change to `sources/oracle/`.
+
+## What was built
+
+```
+resources/job_ingest_oracle.yml    a SEPARATE job from the Kafka one - see decision 1
+conf/sources/_TEMPLATE_oracle.yaml the four questions the SOURCE TEAM has to answer first
+conf/sources/oracle_claim_header.yaml  the worked example, resolved in every environment
+sql/03_support_queries.sql         Q17-Q24, the queries the playbook sends people to
+docs/CONFIGURATION.md              section 9: every Oracle key, tiered, plus the MUST-READ
+docs/DESIGN.md                     section 10: the order, the closed interval, 8 failures
+docs/RUNBOOK_SUPPORT.md            section 8: seven playbooks, SQL and job parameters only
+tests/test_shipped_jobs.py         the job definition against the code and config it invokes
+entrypoints/run_replay.py          + the two Oracle replay flags
+tests/test_shipped_config.py       partitioned by source_type - see section 3
+```
+
+## 1. Done and verified
+
+- **`tests/test_shipped_config.py` now partitions by `source_type`**, which is what makes a
+  shipped Oracle source possible at all: every test in it resolved every non-underscore file
+  against the KAFKA spec, so one Oracle file would have failed twenty-two of them. The
+  partition is derived by reading each file's declared type, so Stage 5's first file source
+  joins without another edit. The Oracle half adds nine checks of its own - the target
+  schema derivation, a real JDBC URL and secret scope in every environment, the merge-key
+  decision being visible, and no incident lever checked into Git.
+- **The worked example resolves in all three environments.** `oracle_claim_header` ->
+  `{catalog}.oracle_claims.claim_header`, a delta load keyed on `CLAIM_ID` with an
+  eight-way partitioned read. Proof: `test_every_shipped_oracle_source_resolves`,
+  `test_every_oracle_source_reaches_a_real_database_in_every_environment`,
+  `test_every_oracle_target_lands_in_its_own_source_system_schema`.
+- **No landing table can be shared across source TYPES.** The old test compared Kafka
+  sources with each other; a Kafka topic and an Oracle table both resolve to a name in the
+  same catalog, and nothing else would have noticed a collision. Proof:
+  `test_no_two_sources_share_a_landing_table`.
+- **The job definition is checked against the code and config it invokes.**
+  `max_concurrent_runs: 1`, `queue.enabled: false`, every task calling a real entry point
+  with a `source-key` that has a file behind it AND declares `source_type: oracle`. The
+  failure this catches - a task naming a source that does not exist - surfaces at 03:30 in
+  an environment nobody is watching, as an argparse error nobody reads. Proof: the nine
+  tests in `tests/test_shipped_jobs.py`.
+- **The runbook's citations are tested.** `sql/03` has already had a rename reach the code
+  and not the runbook once; section 8 sends a support engineer to Q17-Q24 mid-incident, so
+  a test asserts both that those queries exist and that the playbook cites them. Proof:
+  `test_every_oracle_query_the_runbook_cites_exists`.
+- **Every replay control any shipped spec declares has a CLI flag.** This one was WRITTEN
+  BECAUSE OF A SURVIVING MUTATION (below): the existing test iterated the entrypoint's own
+  list, so deleting an entry simply tested less. The new test derives the expected set from
+  every `SOURCE_SPEC` in the dispatch dict, so a spec declaring a `replay_*` key with no way
+  to pass it fails. Proof:
+  `test_every_replay_control_any_shipped_source_declares_has_a_flag`.
+- **The onboarding template leads with the four questions for the SOURCE TEAM** - which
+  column is the cursor and when it is stamped (VB-25), what the stable key is, which column
+  the read can be split on, and whether there are LOB/RAW/INTERVAL/TZ columns (VB-04). It
+  also carries D-02's missing step: `CREATE SCHEMA IF NOT EXISTS <catalog>.oracle_<schema>`
+  before the first run, in every environment, because the framework creates tables and never
+  schemas. Both templates are asserted inert. Proof:
+  `test_a_template_is_not_mistaken_for_a_deployable_source` (2 cases).
+- **`docs/CONFIGURATION.md` section 9** documents every Oracle key tiered MUST / NICE / NO
+  CHANGE, opening with the `merge_keys` MUST-READ table - the setting that decides whether
+  rows can be silently lost - and closing with the three control columns and the replay
+  parameters.
+- **`docs/DESIGN.md` section 10** carries the ordering rule, the closed interval, why the
+  merge key includes the cursor column, and an eight-row failure table covering every
+  scenario the stage file lists: transient JDBC failure, write failure after read, crash
+  between write and advance, a manually corrupted watermark, out-of-order cursor values
+  (VB-25), a source table altered additively and non-additively, and a dropped table.
+- **`docs/RUNBOOK_SUPPORT.md` section 8** is seven playbooks, SQL and job parameters only:
+  transient failure, a source database refusing the load, a short-looking run, a wrong
+  watermark, the Oracle replay, the full/delta switch, and an altered source table. Q18
+  (correcting a watermark) states both directions of the danger before the statement, and
+  Q23 (which sources waived their merge keys) is the check the playbook makes people run
+  before Q18 or Q24.
+- **Exit gate, all three commands run:**
+  ```
+  $ python -m ruff check src tests
+  All checks passed!
+
+  $ python -m ruff format --check src tests
+  72 files already formatted
+
+  $ python -m pytest -m "not spark" -q
+  770 passed, 6 skipped, 36 deselected in 15.85s
+  ```
+- **CORE section 7 grep returns nothing.**
+- **Eight mutations run, each restored afterwards.** Seven failed immediately:
+
+  | Mutation | Result |
+  |---|---|
+  | two concurrent Oracle runs allowed | 1 failed |
+  | runs queue instead of being dropped | 1 failed |
+  | a task names a source that does not exist | 2 failed |
+  | a Kafka source lands in the Oracle job | 1 failed |
+  | the shipped source waives its merge keys | 1 failed |
+  | a partitioned read with no partition column | 14 failed |
+  | a query the runbook cites is renamed | 1 failed |
+  | **the Oracle replay start bound loses its flag** | **0 failed** -> test added, now 1 failed |
+
+  The survivor is the interesting one and it is the same shape as 4a's: the existing test
+  iterated the entrypoint's own parameter list, so deleting an entry tested less rather than
+  failing. A lever a spec declares and the entrypoint cannot pass is invisible until an
+  incident. The new crossing test closes it.
+
+## 2. Done but not verifiable here
+
+- **The job definition has never been deployed or validated.** `databricks bundle validate`
+  needs a workspace and a CLI (VB-13); these tests parse the YAML and check its contents,
+  which is not the same thing.
+- **The schedule (03:30 UTC daily) is a PROPOSAL, not a decision** - see decision 2.
+- **VB-22 is what the job depends on most**: the Oracle JDBC driver is not on Databricks
+  Runtime by default and nothing in this repository installs it. The job template says so at
+  the top rather than assuming it.
+- **The support queries have never been executed** (VB-17 covers running the shipped SQL).
+  Q19 and Q22 name `{catalog}.oracle_claims.claim_header` as their worked example, so they
+  need the same substitution the provisioning scripts do.
+
+## 3. Not reproduced
+
+- **`tests/test_shipped_config.py` had to change before a shipped Oracle source could
+  exist**, which sub-step 4b's report predicted. It is a bigger change than 4d's file list
+  suggests - the module-level `SOURCE_KEYS` was the parametrisation for twenty-two tests.
+- **The Oracle job is a SEPARATE template**, not a task appended to
+  `resources/job_ingest_primary.yml`. The stage file says "one job template under
+  `resources/`", which this is; the reasoning for not reusing the Kafka one is decision 1.
+- **`docs/DESIGN.md` and `docs/CONFIGURATION.md` were APPENDED to, not rewritten.** Both
+  still describe the retired module layout and pre-Stage-2 column names in their earlier
+  sections; CORE assigns that rewrite to Stage 7, and Stages 2, 2b and 3 left the same files
+  stale for the same reason. The new sections are self-contained and say so at the top.
+- **`docs/NAVIGATION.md` and `docs/RUNBOOK_DEVELOPER.md` are untouched** and still list only
+  Kafka's modules. Same reason.
+
+## 4. Blocked
+
+- Nothing. Two things deliberately not done, one sentence each per CORE rule 8:
+  - **No Oracle replay job template** - `resources/job_replay.yml` already takes `run_type`
+    and `rerun_id` as parameters and names no source type, so `oracle_replay` runs through
+    it today; adding a second replay job would be two places to keep in step.
+  - **No `notebooks/` addition for Oracle connectivity checking** - the existing notebooks
+    import modules Stage 3 retired and are broken until Stage 7 rewrites them, so adding a
+    ninth would be adding to a pile nobody can run.
+
+## 5. Decisions for the human
+
+1. **The Oracle job is separate from the Kafka job, and that is an operational choice
+   rather than a technical one.** The entrypoint is identical and one job could serve both.
+   Three reasons for the split: the cadence is negotiated with a different team (a DBA, not
+   a producing team); a stuck run holds sessions open on somebody else's production
+   database rather than costing lag; and "pause all Oracle extraction" during a DBA's
+   incident should be one `pause_status`, not a per-task edit in a job that also serves
+   Kafka.
+   *What would change it:* a preference for one job per environment with tasks tagged by
+   type - at which point the pause becomes a per-task edit, which is the cost.
+2. **The schedule is 03:30 UTC daily, and it is a PROPOSAL.** CORE section 10 says to
+   propose rather than set. It is after the Kafka window so the two do not compete for
+   serverless capacity, but how stale the consuming teams can afford the data to be, and
+   what the source DBA will accept, are not knowable from here.
+   *What would change it:* either team's answer.
+3. **Retries are 2 with a ten-minute interval, against Kafka's 3 at five minutes.** A JDBC
+   failure is often the source database being busy, and retrying quickly makes that worse
+   for everyone.
+   *What would change it:* evidence that Oracle failures here are network blips rather than
+   load.
+4. **The worked example ships with `query_timeout: 3600`** while the platform default is 0
+   (no timeout). A delta run reads minutes of changes, so a statement still running after an
+   hour is a stuck session rather than a large extract - but the FIRST run of that table is
+   a full read and will need it raised deliberately.
+   *What would change it:* nothing, though it is worth knowing before the first onboarding
+   run rather than during it.
+
+---
+
+**Test count:** 745 passed, 6 skipped before -> **770 passed, 6 skipped, 36 deselected**
+after (`pytest -m "not spark" -q`). Net +25: nine job-definition tests, nine Oracle
+shipped-config tests, the replay-control crossing test, and the template parametrisation.
+
+**New VB entries this sub-step:** none. 4d added no new unverifiable assumption - it wires
+up what 4a-4c built, and every assumption it depends on already has an entry (VB-13 for the
+bundle, VB-17 for the SQL, VB-22 for the driver, VB-25 for the cursor).
+
+---
+
+# Stage 4 -- closing summary
+
+All four sub-steps are green. The Oracle source is complete: configuration and the query
+builder (4a), the JDBC read (4b), the watermark lifecycle (4c), and the operational surface
+(4d).
+
+**Test count across the stage:** 487 passed at the end of Stage 3 -> **770 passed**,
+6 skipped, 36 deselected. Net +283.
+
+**New VB entries across the stage:** VB-19 (the `TO_TIMESTAMP` literal), VB-20
+(`SYSTIMESTAMP` as the window anchor), VB-21 (the bounds probe), VB-22 (the JDBC driver and
+its version), VB-23 (`customSchema` semantics), VB-24 (`sessionInitStatement` semantics),
+VB-25 (rows committed below the high-water mark).
+
+**The three that should be answered before the first production run**, in order:
+
+1. **VB-22** - the driver is not on DBR by default and nothing here installs it. Everything
+   else is moot until it is there, and its VERSION decides VB-02 and VB-03.
+2. **VB-23** - if `customSchema` is read as the complete schema rather than a per-column
+   override, `column_types` silently drops every column it does not name. That is a design
+   change, not a patch.
+3. **VB-25** - whether the source application stamps its cursor at statement time or at
+   commit. It is a conversation with the source team at onboarding, and the answer decides
+   whether a delta load on that table can be trusted at all.
+
+**Decisions returned across the stage:** fourteen, listed in the five `## 5.` sections
+above. Four were already settled by the human as D-09 in `docs/build_log/DECISIONS.md`.
+
+**What Stage 4 did NOT do**, and why, so the next session does not go looking: no curated
+layer for Oracle (CORE section 10), no schema-migration or reconciliation utility, no
+connection pool or retry framework, no generic SQL builder, and nothing that lets
+`filter_criteria` come from the control table - all five are on the stage file's "do not
+build" list. `docs/DESIGN.md`, `docs/CONFIGURATION.md`, `docs/NAVIGATION.md` and
+`docs/RUNBOOK_DEVELOPER.md` still carry pre-Stage-2 wording in their earlier sections;
+Stage 7 owns that rewrite.

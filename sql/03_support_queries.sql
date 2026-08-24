@@ -539,3 +539,190 @@ WHERE layer = 'run' AND status = 'COMPLETED'
 GROUP BY source_type, source_key
 HAVING max(pending_work) > 0
 ORDER BY most_recent DESC;
+
+
+-- =====================================================================================
+-- ORACLE (added in Stage 4). Q17-Q24 are referenced by docs/RUNBOOK_SUPPORT.md section 8.
+--
+-- The Oracle source has no checkpoint. Its position lives in ingest_state, written by the
+-- ingestion job ONLY and advanced only after a committed write. Support READS it during
+-- every incident and WRITES it in exactly one situation - Q18, and only after Q21.
+-- =====================================================================================
+
+-- -------------------------------------------------------------------------------------
+-- Q17. WHERE IS EACH ORACLE SOURCE'S WATERMARK, AND WHEN DID IT LAST MOVE?
+--
+--     The first query of every Oracle incident. A watermark that has not moved since a
+--     failed run is CORRECT - nothing advances until a write has committed - so "it is
+--     stale" is only a finding when the runs in between reported success.
+-- -------------------------------------------------------------------------------------
+SELECT source_key,
+       state_value AS watermark,
+       value_type,
+       updated_at,
+       updated_by_run,
+       timestampdiff(HOUR, updated_at, current_timestamp()) AS hours_since_it_moved
+FROM {ops_catalog}.{control_schema}.ingest_state
+WHERE state_key = 'watermark'
+ORDER BY updated_at;
+
+-- -------------------------------------------------------------------------------------
+-- Q18. CORRECT A WATERMARK. READ THIS BEFORE RUNNING IT.
+--
+--     The only write support ever makes to ingest_state, and the only one that can cause
+--     silent data loss:
+--
+--       SET IT BACKWARDS  -> the next run re-extracts that interval. Safe where merge_keys
+--                            are set (the MERGE de-duplicates); DUPLICATES rows where they
+--                            are waived. Check with Q23 first.
+--       SET IT FORWARDS   -> every row between the old and new value is skipped by every
+--                            future run. Nothing re-reads it. Do not do this to "get past"
+--                            a problem.
+--
+--     Take the value from Q21 - the position_end of the last run you trust - rather than
+--     typing a timestamp. The format must be exactly what the source writes:
+--     'YYYY-MM-DD HH:MM:SS[.ffffff]' for a timestamp cursor, digits for a number cursor.
+--     A value the source cannot parse fails the NEXT run, not this statement.
+-- -------------------------------------------------------------------------------------
+MERGE INTO {ops_catalog}.{control_schema}.ingest_state AS t
+USING (
+  SELECT 'oracle_claim_header'    AS source_key,      -- <- the source
+         'watermark'              AS state_key,
+         '2026-08-01 00:00:00'    AS state_value,     -- <- from Q21, not from memory
+         'string'                 AS value_type,
+         current_timestamp()      AS updated_at,
+         'manual-INC12345'        AS updated_by_run   -- <- the incident, so Q17 shows why
+) AS s
+ON t.source_key = s.source_key AND t.state_key = s.state_key
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;
+
+-- -------------------------------------------------------------------------------------
+-- Q19. DUPLICATE CHECK for an Oracle source. Should return zero rows.
+--
+--     A source with merge_keys cannot duplicate: the merge key is (merge_keys +
+--     cursor_column), so a re-extracted row matches the version already there. A source
+--     that WAIVED its merge keys appends, so a crash between the write and the watermark
+--     advance - or a switch to a full load - duplicates the interval.
+--
+--     Replace the key columns with that table's own. The cursor column belongs in the
+--     GROUP BY: two genuinely different versions of one row are not duplicates.
+-- -------------------------------------------------------------------------------------
+SELECT CLAIM_ID, LAST_UPDATE_DT, count(*) AS copies,
+       collect_set(run_id)   AS written_by_runs,
+       collect_set(ingest_date) AS ingest_dates
+FROM {catalog}.oracle_claims.claim_header
+WHERE ingest_date >= current_date() - INTERVAL 7 DAYS
+GROUP BY CLAIM_ID, LAST_UPDATE_DT
+HAVING count(*) > 1
+ORDER BY copies DESC
+LIMIT 100;
+
+-- -------------------------------------------------------------------------------------
+-- Q20. REDUCE THE LOAD THIS EXTRACT PUTS ON THE SOURCE DATABASE. No deploy.
+--
+--     Both columns are safe to turn during an incident because NEITHER changes which rows
+--     are extracted - only how hard the read leans on Oracle.
+--
+--       oracle_num_partitions  concurrent JDBC sessions. 1 = serial. Needs a
+--                              partition_column in the source file to be above 1.
+--       oracle_fetch_size      rows per round trip. Lower = less executor memory per
+--                              session, more round trips. The DRIVER's own default is TEN;
+--                              never set this to 0 or NULL expecting "the default".
+--
+--     Set them back to NULL to inherit the reviewed values from Git.
+-- -------------------------------------------------------------------------------------
+UPDATE {ops_catalog}.{control_schema}.ingest_control
+SET oracle_num_partitions = 2,
+    oracle_fetch_size     = 5000,
+    notes                 = 'INC12345 - DBA asked for less load during month-end',
+    updated_by            = current_user(),
+    updated_at            = current_timestamp()
+WHERE source_key = 'oracle_claim_header';
+
+-- -------------------------------------------------------------------------------------
+-- Q21. WHAT INTERVAL DID EACH RUN ACTUALLY COVER, AND WHAT DID IT ASK ORACLE FOR?
+--
+--     source_detail carries the EXACT SQL the run sent. That is the point of it: once a
+--     dynamic date window and a watermark are involved, the query is not reconstructable
+--     from the configuration afterwards, and "what did this run actually read" is the
+--     first question of every Oracle incident.
+--
+--     position_start / position_end are the interval's bounds. Take the position_end of
+--     the last run you trust into Q18 when a watermark needs correcting.
+-- -------------------------------------------------------------------------------------
+SELECT run_id, run_type, status, event_ts,
+       position_start, position_end,
+       record_count,
+       get_json_object(source_detail, '$.incremental_mode') AS mode,
+       get_json_object(source_detail, '$.query')            AS query_sent_to_oracle
+FROM {ops_catalog}.{audit_schema}.ingest_audit
+WHERE source_type = 'oracle'
+  AND source_key = 'oracle_claim_header'
+  AND layer = 'run'
+  AND audit_date >= current_date() - INTERVAL 7 DAYS
+ORDER BY event_ts DESC
+LIMIT 50;
+
+-- -------------------------------------------------------------------------------------
+-- Q22. DID THE ORACLE REPLAY COVER WHAT IT WAS ASKED TO, AND DID IT LEAVE STATE ALONE?
+--
+--     Two checks in one place, because the second is the one nobody thinks to make: a
+--     replay must NOT have moved the watermark. Run Q17 before and after the replay and
+--     compare - the value and updated_at should both be unchanged.
+-- -------------------------------------------------------------------------------------
+SELECT run_id, run_type, status, event_ts, position_start, position_end, record_count
+FROM {ops_catalog}.{audit_schema}.ingest_audit
+WHERE source_key = 'oracle_claim_header'
+  AND rerun_id = 'INC12345'
+  AND layer = 'run'
+ORDER BY event_ts;
+
+-- And the rows it wrote, tagged with the same id:
+SELECT ingest_date, count(*) AS rows_written, min(LAST_UPDATE_DT), max(LAST_UPDATE_DT)
+FROM {catalog}.oracle_claims.claim_header
+WHERE replay_run_id = 'INC12345'
+GROUP BY ingest_date
+ORDER BY ingest_date;
+
+-- -------------------------------------------------------------------------------------
+-- Q23. WHICH ORACLE SOURCES HAVE WAIVED THEIR MERGE KEYS?
+--
+--     RUN THIS BEFORE Q18 (setting a watermark backwards) OR Q24 (switching to a full
+--     load). A waived source APPENDS, so both of those duplicate rows on it; a source with
+--     merge keys absorbs the re-read silently.
+--
+--     merge_keys is structural, so it is not in the control table - the audit row's
+--     source_detail carries the merge key the run actually used, which is the only place
+--     this is answerable from SQL.
+-- -------------------------------------------------------------------------------------
+SELECT source_key,
+       max_by(get_json_object(source_detail, '$.merge_on'), event_ts) AS merge_key_used,
+       max(event_ts) AS as_of
+FROM {ops_catalog}.{audit_schema}.ingest_audit
+WHERE source_type = 'oracle' AND layer = 'run' AND source_detail IS NOT NULL
+  AND audit_date >= current_date() - INTERVAL 30 DAYS
+GROUP BY source_key
+HAVING max_by(get_json_object(source_detail, '$.merge_on'), event_ts) IN ('[]', 'null')
+ORDER BY source_key;
+
+-- -------------------------------------------------------------------------------------
+-- Q24. SWITCH A TABLE BETWEEN A DELTA AND A FULL LOAD. No deploy.
+--
+--     The one operational lever that changes WHICH ROWS are extracted, and it exists
+--     because repairing a delta load that has been skipping rows is a recovery action -
+--     waiting for a PR to merge is the wrong shape of answer at 3am.
+--
+--     BEFORE: run Q23. On a source that waived merge_keys, a full load duplicates every
+--     row it re-reads. Consider raising the task timeout too - a full read of a large
+--     table takes far longer than a delta run.
+--
+--     A full run does NOT advance or clear the watermark, so setting the column back to
+--     NULL resumes the delta load from the last genuine delta boundary.
+-- -------------------------------------------------------------------------------------
+UPDATE {ops_catalog}.{control_schema}.ingest_control
+SET oracle_incremental_mode = 'full',   -- NULL to go back to what the source file says
+    notes                   = 'INC12345 - clean sweep after suspected missed rows',
+    updated_by              = current_user(),
+    updated_at              = current_timestamp()
+WHERE source_key = 'oracle_claim_header';

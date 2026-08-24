@@ -1,0 +1,134 @@
+# =====================================================================================
+# ORACLE TABLE ONBOARDING TEMPLATE
+#
+# 1. Copy this file to conf/sources/<your_source_key>.yaml
+#      The FILENAME becomes the source_key: it keys the operational control table, keys
+#      ingest_state (where this table's watermark lives), and appears in every audit row.
+#      lower_snake_case, and conventionally <system>_<table>, e.g. oracle_claim_header.
+# 2. Replace the <ANGLE_BRACKET> placeholders. For a full extract that is three lines.
+# 3. ASK THE SOURCE TEAM THESE FOUR QUESTIONS BEFORE YOU FILL IN ANYTHING ELSE. Every one
+#    of them changes what this framework can promise, and none can be answered from the
+#    Databricks side:
+#
+#      a. WHICH COLUMN IS THE CURSOR, and is it assigned when the transaction STARTS or
+#         when it COMMITS? If it is assigned at the start, a long-running transaction can
+#         commit a row whose cursor value is already below this source's watermark, and
+#         that row is never extracted. See VB-25 - it is a property of the source
+#         application, not something this code can detect or fix.
+#      b. WHAT IS THE TABLE'S STABLE KEY? It becomes merge_keys, and without it the
+#         extract cannot re-read its own boundary safely. `merge_keys: []` is a legal
+#         answer and it is a DECISION - see the MUST-READ row in docs/CONFIGURATION.md.
+#      c. WHICH COLUMN CAN THE READ BE SPLIT ON, and roughly how many rows are there? A
+#         partition column must be numeric, date or timestamp AND reasonably evenly
+#         distributed; a skewed one produces one task doing all the work, which looks like
+#         a slow cluster rather than a configuration mistake.
+#      d. ARE THERE LOB, RAW, INTERVAL or TIMESTAMP WITH TIME ZONE COLUMNS? Those have no
+#         clean Spark mapping (VB-04). Project them away with `columns:` or give them an
+#         explicit `column_types:` entry - do not discover them on the first run.
+#
+# 4. CREATE THE TARGET SCHEMA FIRST. The framework creates TABLES, never SCHEMAS
+#    (docs/build_log/DECISIONS.md D-02), and the target is derived from the Oracle name:
+#        CLAIMS.CLAIM_HEADER  ->  <catalog>.oracle_claims.claim_header
+#    So `CREATE SCHEMA IF NOT EXISTS <catalog>.oracle_claims;` must be run, in EVERY
+#    environment, before the first run. Without it the first run fails on a missing schema.
+# 5. Confirm the jdbc_ref profile exists in conf/jdbc.yaml AND has a host, service name
+#    and secret scope in every conf/environments/<env>.yaml.
+# 6. Add a task to resources/job_ingest_oracle.yml with the new source-key.
+# 7. Run `pytest tests/test_shipped_config.py` - it validates every source in EVERY
+#    environment, so it catches a value that works in prod but breaks in dev.
+# 8. Open a PR. No Python changes are needed, ever, to add a table.
+#
+# WHAT YOU DO **NOT** PUT HERE
+#   Catalogs, table names, hostnames, ports, passwords, secret scopes. Those live in
+#   conf/defaults/oracle.yaml (common), conf/jdbc.yaml (the connection register) and
+#   conf/environments/<env>.yaml (per environment). Hardcoding any of them here silently
+#   breaks the other environments.
+#
+# This file is inert: source_key "_TEMPLATE_oracle" is never scheduled, and the config
+# validator skips underscore-prefixed files.
+# =====================================================================================
+
+source_type: oracle
+
+source:
+
+  # -------------------------------------------------------------------- MUST CHANGE --
+  # The Oracle table, exactly as Oracle holds it. Oracle folds unquoted identifiers to
+  # UPPER CASE, so that is the case to write here - though either resolves to the same
+  # target, because Unity Catalog folds to lower.
+  source_schema: <ORACLE_SCHEMA>
+  source_table: <ORACLE_TABLE>
+
+  # Which database. Must name a profile in conf/jdbc.yaml.
+  jdbc_ref: <jdbc_profile_name>
+
+  domain: <vector|rcm|gma|antifraud|dwh_pes>
+
+  # ------------------------------------------------------- OPTIONAL - omit to inherit --
+  # Every line below has a platform default. Delete what you do not need.
+
+  # --- HOW MUCH TO EXTRACT ------------------------------------------------------------
+  # full   | everything, every run. The default, and the right answer for a small
+  #        | reference table. Costs a full read each time.
+  # cursor | only what changed since the last committed watermark. Needs question (a).
+  # filter | a fixed predicate, evaluated fresh each run. No watermark, no state.
+  # incremental_mode: cursor
+
+  # Required by `cursor`, and question (a) above is about this column.
+  # cursor_column: LAST_UPDATE_DT
+  # cursor_type: timestamp        # timestamp | number
+
+  # THE TABLE'S STABLE KEY - question (b). With it, a cursor run re-reads its own boundary
+  # and the MERGE de-duplicates, so rows sharing the last watermark value cannot be lost.
+  # An EMPTY LIST is the explicit waiver for a table with no stable key, and it accepts
+  # that those rows can be lost. There is no third option: omitting the key entirely on a
+  # cursor source is a startup error, because silence is not a decision anybody made.
+  # merge_keys: [CLAIM_ID]
+
+  # --- WHICH ROWS AND COLUMNS ---------------------------------------------------------
+  # Project columns away rather than landing everything - question (d) is the usual reason.
+  # columns: [CLAIM_ID, MEMBER_ID, STATUS, LAST_UPDATE_DT]
+
+  # A standing predicate, e.g. only open claims. Both halves or neither. STRUCTURAL: it
+  # cannot be overridden from the control table, deliberately - it reaches Oracle's parser
+  # verbatim, so changing it is a PR.
+  # filter_column: STATUS
+  # filter_criteria: "IN ('A','P')"
+
+  # A rolling window, evaluated by ORACLE's clock (SYSTIMESTAMP). P<n>D or PT<n>H only.
+  # dynamic_date_filter:
+  #   column: LAST_UPDATE_DT
+  #   window: "P7D"
+
+  # A hand-written query, for a join or an expression the keys above cannot express. It is
+  # MUTUALLY EXCLUSIVE with columns / filter_column / filter_criteria / dynamic_date_filter,
+  # and it must be a single SELECT (or WITH ... SELECT). A cursor predicate is still
+  # appended to it, so the cursor column must be in its select list.
+  # sql_query: "SELECT c.CLAIM_ID, m.NAME, c.LAST_UPDATE_DT FROM CLAIMS.CLAIM_HEADER c JOIN CLAIMS.MEMBER m ON m.ID = c.MEMBER_ID"
+
+  # --- READ PARALLELISM - question (c) ------------------------------------------------
+  # BOTH OR NEITHER. Without a partition_column the read runs on ONE executor whatever the
+  # cluster size, and the run WARNs about it every time. With one, Spark reads MIN/MAX of
+  # this column and splits the range into num_partitions slices - so the column must be
+  # numeric, date or timestamp, and evenly distributed.
+  # partition_column: CLAIM_ID
+  # num_partitions: 8
+
+  # Rows per JDBC round trip. The platform default is 10000; the ORACLE DRIVER's own
+  # default is TEN. Lower this for rows carrying large columns - this many are buffered in
+  # executor memory at a time.
+  # fetch_size: 10000
+
+  # --- THE CONNECTION -----------------------------------------------------------------
+  # Seconds one statement may run, 0 = no timeout (the platform default). Set it once this
+  # table's normal run time is known.
+  # query_timeout: 3600
+
+  # Run once per JDBC CONNECTION, i.e. once per partition, so it must be cheap and
+  # idempotent. An ALTER SESSION or a PL/SQL block, nothing else.
+  # session_init: "ALTER SESSION SET NLS_DATE_FORMAT = 'YYYY-MM-DD HH24:MI:SS'"
+
+  # Per-column type overrides, for a column the driver maps wrongly - question (d), and
+  # VB-02 / VB-03 before you set one at all. The default mapping is usually right.
+  # column_types:
+  #   AMOUNT: "DECIMAL(38,10)"

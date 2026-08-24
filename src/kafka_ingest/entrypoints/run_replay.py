@@ -14,6 +14,11 @@ during an incident is expensive, so the parameter is REQUIRED and has no default
                    and the gap has to be refilled.
   curated_replay   the bytes are fine, the PARSE was not. Re-reads the landing table, never
                    contacts the broker, and therefore works forever regardless of retention.
+  oracle_replay    a WINDOW of an Oracle table has to be re-extracted - the source fixed
+                   its data, or an incident window landed wrong. Bounded by
+                   replay_cursor_start / replay_cursor_end, which REPLACE the stored
+                   watermark for this run only: the scheduled delta load keeps its own
+                   position and is not disturbed, and this run never writes ingest_state.
 
 Everything below is passed through as a JOB PARAMETER, which means it is validated against
 the source type's own SOURCE_SPEC exactly like a YAML key: a misspelled replay control is
@@ -32,11 +37,15 @@ from ..framework import logs, runner
 # setting name is `replay_x`. Kept here as data rather than as one argparse call per name
 # so that adding one is a single line.
 _REPLAY_PARAMETERS = (
+    # kafka
     "replay_starting_offsets",
     "replay_starting_timestamp",
     "replay_ending_offsets",
     "replay_ending_timestamp",
     "replay_landing_filter",
+    # oracle - a cursor interval, in the cursor column's own units
+    "replay_cursor_start",
+    "replay_cursor_end",
 )
 
 

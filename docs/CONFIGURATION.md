@@ -627,3 +627,105 @@ databricks bundle validate -t dev
 `test_shipped_config.py` loads and validates every shipped topic file. Run it in CI on
 every PR — it catches a typo'd catalog name, an unknown cluster reference, a non-3-tier
 table name and a DBFS cert path before any of them reach a cluster.
+
+
+---
+
+## 9. Oracle sources — `conf/sources/<source_key>.yaml`, `source_type: oracle`
+
+Added in Stage 4. Sections 1–8 above still describe the Kafka source in places where the
+wording has not caught up; this section is self-contained for Oracle.
+
+Copy `conf/sources/_TEMPLATE_oracle.yaml` to onboard a table. It carries the four questions
+the SOURCE TEAM has to answer first — which column is the cursor and when it is stamped,
+what the stable key is, which column the read can be split on, and whether there are LOB /
+RAW / INTERVAL / TZ columns. None of them can be answered from the Databricks side.
+
+### 🔴 MUST-READ — `merge_keys` decides whether rows can be silently lost
+
+A cursor extract reads `cursor > last_watermark AND cursor <= high_water`. The upper bound
+is always captured at the start of the run, so rows committed *during* the extract are not
+half-read. The remaining hazard is the LOWER bound, and `merge_keys` decides it:
+
+| `merge_keys` | Predicate | Write | Property |
+|---|---|---|---|
+| **set** (recommended) | `>= last_watermark` | MERGE | **Tie-safe.** The boundary is re-read and de-duplicated, so rows sharing a cursor value cannot be lost. |
+| **`[]`** (explicit waiver) | `> last_watermark` | append | Faster. **A row committed with exactly the last watermark value, after the previous run passed it, is never extracted.** |
+
+Omitting `merge_keys` on a cursor source is a **startup error**, not a default — silence is
+not a decision anybody made. A waived source WARNs on every run, naming the risk.
+
+The merge key is `merge_keys + cursor_column`, so it identifies a **version** of a row, not
+the row. That is what keeps landing a retained mirror rather than a current-state table, and
+it is why switching between full and delta loads is safe (see `oracle_incremental_mode`).
+
+### 🔴 MUST CHANGE
+
+| Key | What it is |
+|---|---|
+| `source_schema` | The Oracle schema, e.g. `CLAIMS`. Write it as Oracle holds it (upper case); the target is lower-cased. |
+| `source_table` | The Oracle table. **The only key with no platform default.** |
+| `jdbc_ref` | A profile name from `conf/jdbc.yaml`. Never a host or a URL. |
+| `domain` | Owning team. Appears in every audit row. |
+
+**The target is derived, never configured:** `CLAIMS.CLAIM_HEADER` →
+`{catalog}.oracle_claims.claim_header`. The schema must already exist —
+`CREATE SCHEMA IF NOT EXISTS <catalog>.oracle_claims;` in every environment, before the
+first run. The framework creates tables, never schemas.
+
+### 🟡 NICE TO CHANGE
+
+| Key | Default | Change it when |
+|---|---|---|
+| `incremental_mode` | `full` | The table is large enough that a full read is not affordable. `cursor` needs `cursor_column` + `cursor_type` + a `merge_keys` decision; `filter` needs `filter_column` + `filter_criteria`. |
+| `cursor_column` / `cursor_type` | — | Required by `cursor`. `timestamp` or `number`. |
+| `merge_keys` | — | See the MUST-READ block above. |
+| `partition_column` + `num_partitions` | `1` (serial) | Always, once the source team names a column. Both or neither: a count without a column reads on ONE executor whatever the cluster size, and the run WARNs about it. |
+| `fetch_size` | `10000` | Rows are wide (lower it) or very narrow (raise it). **Never leave it unset — the Oracle driver's own default is TEN rows per round trip.** |
+| `columns` | all | Projecting away a LOB / RAW / INTERVAL / TZ column is the usual reason. |
+| `filter_column` + `filter_criteria` | — | A standing predicate, e.g. open claims only. **Structural**: it reaches Oracle's parser verbatim, so it can never be overridden from the control table. |
+| `dynamic_date_filter` | — | A rolling window, evaluated by **Oracle's** clock. `P<n>D` or `PT<n>H` only — a month is not thirty days to everyone. |
+| `sql_query` | — | A join or an expression the keys above cannot express. Mutually exclusive with `columns` / `filter_*` / `dynamic_date_filter`. One `SELECT` (or `WITH … SELECT`); the cursor predicate is still appended, so the cursor column must be in its select list. |
+| `query_timeout` | `0` (none) | Once the table's normal run time is known. |
+| `session_init` | — | An `ALTER SESSION` this table needs. **Runs once per JDBC connection, i.e. per partition** — keep it cheap and idempotent. |
+| `column_types` | — | A column the driver maps wrongly. Read VB-02 / VB-03 first: the default mapping is usually right. |
+
+### 🟢 NO CHANGE REQUIRED
+
+| Key | Why |
+|---|---|
+| `landing_table` | Derived from `source_schema` / `source_table`. Set it only if the derived name collides. |
+| `landing_partition_by` | `ingest_date` — the date a row was WRITTEN. Bounds partition growth and makes retention a partition drop. |
+| `table_properties` | Platform-wide, from `conf/defaults.yaml`. |
+
+### Operational overrides — `ingest_control`
+
+Three columns, and one of them is different in kind from every other operational lever in
+this framework:
+
+| Column | Setting | Effect |
+|---|---|---|
+| `oracle_fetch_size` | `fetch_size` | Rows per round trip. Lower it when a run is straining the source. |
+| `oracle_num_partitions` | `num_partitions` | Parallel connections. Lower it when a DBA asks for less load. Needs `partition_column` in the source file. |
+| `oracle_incremental_mode` | `incremental_mode` | **The full-vs-delta switch.** A recovery lever: a delta load that has been skipping rows is repaired by one full load, without waiting for a PR. |
+
+**Switching to `full` duplicates rows on a source that waived `merge_keys`**, because that
+source appends. Where `merge_keys` are set the merge absorbs the re-read and the switch
+costs only time. A full run does **not** advance or clear the watermark, so switching back
+to `cursor` resumes from the last genuine delta boundary.
+
+Everything that decides what the increment *means* — `cursor_column`, `cursor_type`,
+`merge_keys`, `filter_criteria`, `source_schema`, `source_table` — is structural, and an
+override of one is ignored and logged.
+
+### Replay parameters — `oracle_replay`
+
+| Parameter | Required | What it is |
+|---|---|---|
+| `rerun-id` | yes | Tags every row the replay writes, and identifies it in the audit table. |
+| `replay-cursor-start` | yes | Inclusive lower bound, **always** — a replay's start is a boundary a human typed. |
+| `replay-cursor-end` | no | Upper bound. Omit for "from there to now", which still captures a real high-water mark. |
+
+A replay **never writes `ingest_state`**, so the scheduled delta load keeps its own position
+and an incident cannot strand production state at a bound somebody typed once. Both bounds
+are operational-only: a bound checked into Git would re-extract the same window forever.

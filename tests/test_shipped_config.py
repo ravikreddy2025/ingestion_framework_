@@ -23,10 +23,11 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from kafka_ingest.framework import tables
 from kafka_ingest.framework.config import ConfigError, available_environments, load_structural, resolve_config
-from kafka_ingest.sources import kafka
+from kafka_ingest.sources import kafka, oracle
 from kafka_ingest.sources.kafka import config as kafka_config
 from kafka_ingest.sources.kafka.config import (
     RUN_TYPE_PRIMARY,
@@ -34,6 +35,7 @@ from kafka_ingest.sources.kafka.config import (
     VALID_READER_MODES,
     VALID_REGISTRY_AUTH,
 )
+from kafka_ingest.sources.oracle import config as oracle_config
 
 CONF_ROOT = Path(__file__).resolve().parent.parent / "conf"
 
@@ -42,12 +44,27 @@ CONF_ROOT = Path(__file__).resolve().parent.parent / "conf"
 SOURCE_FILES = sorted(p for p in (CONF_ROOT / "sources").glob("*.yaml") if not p.name.startswith("_"))
 SOURCE_KEYS = [p.stem for p in SOURCE_FILES]
 
+
+def _declared_type(path) -> str:
+    """The `source_type:` a source file declares, read the same way the runner reads it.
+
+    Every check below applies to ONE source type, because a source type's own spec is what
+    decides which keys are valid - so the suite is partitioned here rather than each test
+    guarding itself.
+    """
+    return (yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get("source_type")
+
+
+KAFKA_KEYS = [p.stem for p in SOURCE_FILES if _declared_type(p) == "kafka"]
+ORACLE_KEYS = [p.stem for p in SOURCE_FILES if _declared_type(p) == "oracle"]
+
 # Every environment we ship. Most checks run against ALL of them, because the failure this
 # suite exists to prevent is a value that is valid in prod and broken in dev.
 ENVIRONMENTS = available_environments(str(CONF_ROOT))
 
-# The full cross product - one test case per (source, environment).
-SOURCE_ENVS = [(s, e) for s in SOURCE_KEYS for e in ENVIRONMENTS]
+# The full cross product - one test case per (source, environment), per source type.
+SOURCE_ENVS = [(s, e) for s in KAFKA_KEYS for e in ENVIRONMENTS]
+ORACLE_ENVS = [(s, e) for s in ORACLE_KEYS for e in ENVIRONMENTS]
 
 
 def _settings(source_key, environment="prod"):
@@ -65,7 +82,7 @@ def _resolve(source_key, environment="prod", run_type=RUN_TYPE_PRIMARY, **job_pa
 def source_key_any():
     """Any one shipped source: these settings come from conf/defaults.yaml, so every source
     resolves the same value and testing all of them would assert the same thing N times."""
-    return SOURCE_KEYS[0]
+    return KAFKA_KEYS[0]
 
 
 def test_conf_directory_is_present_and_populated():
@@ -73,7 +90,9 @@ def test_conf_directory_is_present_and_populated():
     assert (CONF_ROOT / "defaults.yaml").is_file()
     assert (CONF_ROOT / "clusters.yaml").is_file()
     assert (CONF_ROOT / "registries.yaml").is_file()
-    assert SOURCE_KEYS, "no deployable source files found in conf/sources/"
+    assert KAFKA_KEYS, "no deployable Kafka source files found in conf/sources/"
+    assert ORACLE_KEYS, "no deployable Oracle source files found in conf/sources/"
+    assert (CONF_ROOT / "jdbc.yaml").is_file()
     assert ENVIRONMENTS, "no environment files found in conf/environments/"
 
 
@@ -153,7 +172,7 @@ def test_environments_never_share_a_catalog_or_a_checkpoint(source_key, environm
         assert cfg.checkpoint_path != rival.checkpoint_path
 
 
-@pytest.mark.parametrize("source_key", SOURCE_KEYS)
+@pytest.mark.parametrize("source_key", KAFKA_KEYS)
 def test_partitioning_matches_the_agreed_layout(source_key):
     cfg = _resolve(source_key)
     # `topic` is constant inside a per-topic table, so partitioning on it would create a
@@ -168,19 +187,23 @@ def test_partitioning_matches_the_agreed_layout(source_key):
     )
 
 
-@pytest.mark.parametrize("source_key", SOURCE_KEYS)
+@pytest.mark.parametrize("source_key", KAFKA_KEYS)
 def test_shipped_checkpoint_paths_are_unique_per_source(source_key):
     assert _resolve(source_key).checkpoint_path.endswith(f"/{source_key}/primary")
 
 
 def test_no_two_sources_share_a_landing_table():
-    """Landing is ONE TABLE PER TOPIC. Two sources sharing one would interleave their raw
-    bytes, and a per-topic replay or retention drop would take the other one with it."""
-    landing = [_resolve(k).landing_table for k in SOURCE_KEYS]
+    """Landing is ONE TABLE PER SOURCE. Two sources sharing one would interleave their
+    rows, and a per-source replay or retention drop would take the other one with it.
+
+    Across source TYPES as well: a Kafka topic and an Oracle table both resolve to a name
+    in the same catalog, and nothing but this test would notice a collision.
+    """
+    landing = [_resolve(k).landing_table for k in KAFKA_KEYS] + [_resolve_oracle(k).landing_table for k in ORACLE_KEYS]
     assert len(set(landing)) == len(landing), f"sources share a landing table: {sorted(landing)}"
 
 
-@pytest.mark.parametrize("source_key", SOURCE_KEYS)
+@pytest.mark.parametrize("source_key", KAFKA_KEYS)
 def test_shipped_table_names_are_legal_unquoted_identifiers(source_key):
     """Kafka topic names carry dots; Unity Catalog identifiers cannot. If this fails, the
     table would need backtick quoting everywhere it is referenced."""
@@ -193,7 +216,7 @@ def test_shipped_table_names_are_legal_unquoted_identifiers(source_key):
 def test_no_two_sources_share_a_checkpoint_or_a_curated_table():
     """A shared checkpoint silently corrupts both sources' offset state."""
     checkpoints, curated = {}, {}
-    for source_key in SOURCE_KEYS:
+    for source_key in KAFKA_KEYS:
         cfg = _resolve(source_key)
         assert cfg.checkpoint_path not in checkpoints, (
             f"{source_key} and {checkpoints.get(cfg.checkpoint_path)} share a checkpoint path"
@@ -205,14 +228,14 @@ def test_no_two_sources_share_a_checkpoint_or_a_curated_table():
         curated[cfg.curated_table] = source_key
 
 
-@pytest.mark.parametrize("source_key", SOURCE_KEYS)
+@pytest.mark.parametrize("source_key", KAFKA_KEYS)
 def test_pinned_reader_schema_always_has_an_id(source_key):
     cfg = _resolve(source_key)
     if cfg.reader_schema_mode == "pinned_id":
         assert cfg.reader_schema_id, f"{source_key}: pinned_id without reader_schema_id"
 
 
-@pytest.mark.parametrize("source_key", SOURCE_KEYS)
+@pytest.mark.parametrize("source_key", KAFKA_KEYS)
 def test_dedup_keys_reference_the_payload_struct(source_key):
     """Business fields live inside the nested payload struct, so a bare column name is a
     config mistake that would only surface at runtime."""
@@ -224,7 +247,7 @@ def test_dedup_keys_reference_the_payload_struct(source_key):
         )
 
 
-@pytest.mark.parametrize("source_key", SOURCE_KEYS)
+@pytest.mark.parametrize("source_key", KAFKA_KEYS)
 def test_every_referenced_profile_exists(source_key):
     """Resolution raises and lists the valid names if a reference is wrong."""
     cfg = _resolve(source_key)
@@ -232,7 +255,7 @@ def test_every_referenced_profile_exists(source_key):
     assert cfg.registry.url.startswith("http")
 
 
-@pytest.mark.parametrize("source_key", SOURCE_KEYS)
+@pytest.mark.parametrize("source_key", KAFKA_KEYS)
 def test_no_shipped_source_checks_an_incident_lever_into_git(source_key):
     """checkpoint_reset_id and every replay control are operational-ONLY.
 
@@ -245,12 +268,17 @@ def test_no_shipped_source_checks_an_incident_lever_into_git(source_key):
         assert key not in settings, f"{source_key}: '{key}' is operational-only and must not be in YAML"
 
 
-def test_template_is_not_mistaken_for_a_deployable_source():
-    """The template must stay inert - and must fail loudly if someone tries to deploy it."""
-    assert (CONF_ROOT / "sources" / "_TEMPLATE.yaml").is_file(), "onboarding template missing"
-    assert "_TEMPLATE" not in SOURCE_KEYS
+@pytest.mark.parametrize("template", ["_TEMPLATE", "_TEMPLATE_oracle"])
+def test_a_template_is_not_mistaken_for_a_deployable_source(template):
+    """A template must stay inert - and must fail loudly if someone tries to deploy it.
+
+    Both are full of <ANGLE_BRACKET> placeholders by design, so "fails to resolve" IS the
+    correct behaviour and this asserts it rather than trusting the underscore convention.
+    """
+    assert (CONF_ROOT / "sources" / f"{template}.yaml").is_file(), f"{template} onboarding template missing"
+    assert template not in SOURCE_KEYS
     with pytest.raises(ConfigError):
-        _resolve("_TEMPLATE")
+        _resolve(template) if template == "_TEMPLATE" else _resolve_oracle(template)
 
 
 # --------------------------------------------------------------------------------------
@@ -377,3 +405,100 @@ def test_the_bundle_does_not_also_name_the_control_table():
         "databricks.yml declares control_table again - it is named in conf/defaults.yaml, "
         "and two names for one table is how the two stop agreeing"
     )
+
+
+# --------------------------------------------------------------------------------------
+# ORACLE SOURCES
+#
+# The same resolution path, against the Oracle spec. What differs is what can go wrong: a
+# Kafka source's failure is a topic or a checkpoint, an Oracle source's is a schema that
+# does not exist in one environment, or a table name that is legal in Oracle and illegal
+# in Unity Catalog.
+# --------------------------------------------------------------------------------------
+
+
+def _resolve_oracle(source_key, environment="prod", run_type="primary", **job_parameters):
+    resolved = resolve_config(
+        str(CONF_ROOT), source_key, environment, oracle.SOURCE_SPEC, job_parameters=job_parameters
+    )
+    return oracle_config.build(resolved, run_type, tables)
+
+
+@pytest.mark.parametrize("source_key, environment", ORACLE_ENVS)
+def test_every_shipped_oracle_source_resolves(source_key, environment):
+    cfg = _resolve_oracle(source_key, environment)
+
+    assert cfg.source_key == source_key
+    assert cfg.domain, f"{source_key}: empty domain"
+    assert len(cfg.landing_table.split(".")) == 3
+    assert "{" not in cfg.landing_table
+    assert cfg.fetch_size > 0 and cfg.num_partitions > 0
+
+
+@pytest.mark.parametrize("source_key, environment", ORACLE_ENVS)
+def test_every_oracle_source_reaches_a_real_database_in_every_environment(source_key, environment):
+    """A jdbc profile with no host or no secret scope in ONE environment would only fail
+    when that environment was deployed."""
+    cfg = _resolve_oracle(source_key, environment)
+    assert cfg.jdbc.url.startswith("jdbc:oracle:thin:@"), f"{source_key}/{environment}: {cfg.jdbc.url}"
+    assert "{" not in cfg.jdbc.url
+    assert cfg.jdbc.secret_scope, f"{source_key}/{environment}: no secret scope"
+    assert cfg.jdbc.username_key and cfg.jdbc.password_key
+
+
+@pytest.mark.parametrize("source_key, environment", ORACLE_ENVS)
+def test_oracle_environments_never_share_a_catalog(source_key, environment):
+    """dev must not be able to write into prod's landing tables."""
+    cfg = _resolve_oracle(source_key, environment)
+    for other in [e for e in ENVIRONMENTS if e != environment]:
+        assert cfg.landing_table != _resolve_oracle(source_key, other).landing_table
+
+
+@pytest.mark.parametrize("source_key", ORACLE_KEYS)
+def test_every_oracle_target_lands_in_its_own_source_system_schema(source_key):
+    """`{catalog}.oracle_<source_schema>.<source_table>`, lower-cased. The `oracle_` prefix
+    is what stops an Oracle CLAIMS schema colliding with a Kafka or file feed of the same
+    name in the same catalog."""
+    cfg = _resolve_oracle(source_key)
+    catalog, schema, table = cfg.landing_table.split(".")
+    assert schema == f"oracle_{cfg.source_schema.lower()}"
+    assert table == cfg.source_table.lower()
+
+
+@pytest.mark.parametrize("source_key", ORACLE_KEYS)
+def test_every_oracle_cursor_source_has_answered_the_merge_key_question(source_key):
+    """`merge_keys` absent is a startup error, so reaching here means somebody decided. A
+    WAIVER is legal and lossy at the boundary - this test exists so that a waiver in the
+    shipped configuration is visible in a diff rather than discovered during an incident."""
+    cfg = _resolve_oracle(source_key)
+    if cfg.is_cursor and not cfg.merge_keys:
+        pytest.fail(
+            f"{source_key} waives merge_keys: rows sharing the boundary cursor value can be "
+            "lost. That may be correct for a table with no stable key - if so, delete this "
+            "assertion deliberately and record why."
+        )
+
+
+@pytest.mark.parametrize("source_key", ORACLE_KEYS)
+def test_a_partitioned_oracle_read_names_the_column_it_splits_on(source_key):
+    """num_partitions > 1 without a partition_column reads on ONE executor, whatever the
+    cluster size. Config load refuses it; this proves the shipped files never try."""
+    cfg = _resolve_oracle(source_key)
+    if cfg.num_partitions > 1:
+        assert cfg.partition_column, f"{source_key}: num_partitions={cfg.num_partitions} with no partition_column"
+
+
+@pytest.mark.parametrize("source_key", ORACLE_KEYS)
+def test_no_shipped_oracle_source_checks_an_incident_lever_into_git(source_key):
+    """The replay cursor bounds are operational-ONLY: a bound in Git would silently
+    re-extract the same window on every future run."""
+    settings = load_structural(str(CONF_ROOT), source_key, "prod", oracle.SOURCE_SPEC.target_tokens)
+    for key in sorted(oracle.SOURCE_SPEC.operational_keys - oracle.SOURCE_SPEC.structural_keys):
+        assert key not in settings, f"{source_key}: '{key}' is operational-only and must not be in YAML"
+
+
+def test_every_jdbc_profile_the_sources_use_exists_in_the_register():
+    """The register is the single answer to "which databases do we extract from?"."""
+    register = yaml.safe_load((CONF_ROOT / "jdbc.yaml").read_text(encoding="utf-8"))["jdbc"]
+    for source_key in ORACLE_KEYS:
+        assert _resolve_oracle(source_key).jdbc_ref in register
