@@ -34,25 +34,30 @@
 defaults:
 
   # --- THE FRAMEWORK'S OWN THREE TABLES -------------------------------------------------
-  # Shared by every source of every type. Only the catalog changes between environments,
-  # so they belong here rather than repeated in every source file. Each is created by
-  # sql/01_operational_config.sql or sql/02_layer_tables.sql when an environment is
-  # provisioned; the job creates audit and state itself if they are missing.
+  # Shared by every source of every type. Only the catalog and schema vars change between
+  # environments, so they belong here rather than repeated in every source file. Each is
+  # created by sql/01_operational_config.sql or sql/02_layer_tables.sql when an environment
+  # is provisioned; the job creates audit and state itself if they are missing.
   #
   # These three are FRAMEWORK-OWNED KEYS (framework/config.py FRAMEWORK_STRUCTURAL_KEYS):
   # no SOURCE_SPEC declares them, because the framework reads them and no source does.
+  #
+  # ONE OPS CATALOG, THREE SCHEMAS (docs/build_log/DECISIONS.md D-06). All three live under
+  # {ops_catalog}, split by purpose rather than by data-vs-operational: audit is queried
+  # constantly during triage and has its own schema; control and state share a schema
+  # because they have the same blast radius and audience; {logs_schema} is reserved for
+  # structured logging, not written yet. {audit_schema} / {control_schema} / {logs_schema}
+  # are environment `vars:` (conf/environments/<env>.yaml), same as {catalog} / {ops_catalog}.
 
   # One row per (run, layer, status), for every source. First stop for incident triage.
-  # Lives in the DATA catalog, next to the data whose arrival it records.
-  audit_table: "{catalog}.audit.ingest_audit"
+  audit_table: "{ops_catalog}.{audit_schema}.ingest_audit"
 
   # Durable watermarks and run sequences. Written by the ingestion job ONLY, and its writes
   # are mandatory - see framework/state.py.
-  state_table: "{ops_catalog}.ingestion.ingest_state"
+  state_table: "{ops_catalog}.{control_schema}.ingest_state"
 
   # Layer 4: the support team's runtime overrides. Written by support, read by the job.
-  # Both live in the OPS catalog, which is a different blast radius from the data.
-  control_table: "{ops_catalog}.ingestion.ingest_control"
+  control_table: "{ops_catalog}.{control_schema}.ingest_control"
 
   # --- TABLE PROPERTIES -----------------------------------------------------------------
   # Delta table properties applied to EVERY table the framework creates, in every layer.

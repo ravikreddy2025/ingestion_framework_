@@ -22,6 +22,12 @@ vars:
   # Operational catalog: the control and state tables. MUST match `ops_catalog`
   # for this target in databricks.yml - a test asserts they agree.
   ops_catalog: ops_dev
+  # The three ops-catalog schemas (docs/build_log/DECISIONS.md D-06). There is no reason
+  # for these to differ by environment - only catalog/ops_catalog do - so every environment
+  # file carries the same three values.
+  audit_schema: audit
+  control_schema: ingestion
+  logs_schema: logs
 
 # Overrides conf/defaults.yaml, for every source of EVERY TYPE in this environment.
 # Only put a setting here if every source type understands it - a Kafka-only key here is

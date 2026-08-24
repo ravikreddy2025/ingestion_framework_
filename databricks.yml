@@ -33,10 +33,12 @@ sync:
 # behaviour, but rename both together.
 #
 # The control table, the state table and the audit table are named in conf/defaults.yaml,
-# from `vars.ops_catalog` and `vars.catalog` - NOT here, and not as job parameters. One
-# name in one place: a bundle variable holding a table name the code also derives is a
-# variable that drifts, and the one it replaced was still pointing at a table Stage 2
-# renamed.
+# from `vars.ops_catalog` plus `vars.audit_schema` / `vars.control_schema` - NOT here, and
+# not as job parameters. All three now live under the OPS catalog, split by schema
+# (docs/build_log/DECISIONS.md D-06); `vars.catalog` (the DATA catalog) no longer names any
+# of them. One name in one place: a bundle variable holding a table name the code also
+# derives is a variable that drifts, and the one this replaced was still pointing at a
+# table Stage 2 renamed.
 #
 # The data catalog lives in conf/environments/<env>.yaml under `vars.catalog`, because the
 # CODE builds table names from it. It is ALSO declared here as `data_catalog`, for the one
