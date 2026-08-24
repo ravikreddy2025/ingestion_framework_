@@ -27,12 +27,21 @@ LAYER_SQL = SQL_DIR / "02_layer_tables.sql"
 SUPPORT_SQL = SQL_DIR / "03_support_queries.sql"
 MAINTENANCE_SQL = SQL_DIR / "04_maintenance.sql"
 
-CONTROL_TABLE = "{ops_catalog}.ingestion.ingest_control"
-STATE_TABLE = "{ops_catalog}.ingestion.ingest_state"
-AUDIT_TABLE = "{catalog}.audit.ingest_audit"
+CONTROL_TABLE = "{ops_catalog}.{control_schema}.ingest_control"
+STATE_TABLE = "{ops_catalog}.{control_schema}.ingest_state"
+AUDIT_TABLE = "{ops_catalog}.{audit_schema}.ingest_audit"
 
-# Identifiers Stage 2 retired, and what replaced each. A rename that reaches the code and
-# the DDL but not the runbook is the exact failure these files have already had once.
+# Identifiers Stage 2 (and the decisions-and-stage2-followup pass) retired, and what
+# replaced each. A rename that reaches the code and the DDL but not the runbook is the
+# exact failure these files have already had once.
+#
+# NOTE: `failure_mode`, `batch_limit`, `max_offsets_per_trigger` and `source_overrides`
+# are deliberately NOT here even though D-01 retired them as bare control-table columns -
+# `failure_mode` and `max_offsets_per_trigger` are now SUBSTRINGS of their own replacements
+# (`kafka_failure_mode`, `kafka_max_offsets_per_trigger`), and `source_overrides` is a name
+# every explanatory comment about the rename legitimately still uses, here and in the SQL
+# itself. This test's `retired in text` check is a plain substring search, so adding any of
+# them would fail on the very column, or the very comment, that replaced them.
 RETIRED = {
     "ingestion_topic_control": "ingest_control",
     "stream_audit": "ingest_audit",
@@ -44,7 +53,6 @@ RETIRED = {
     "rerun_ending_offsets": "replay_controls JSON",
     "rerun_ending_timestamp": "replay_controls JSON",
     "curated_replay_landing_filter": "replay_controls JSON",
-    "max_offsets_per_trigger": "batch_limit, or source_overrides JSON",
     "starting_offsets      STRING": "position_start",
     "ending_offsets        STRING": "position_end",
 }
@@ -89,16 +97,18 @@ def test_no_sql_file_references_a_retired_identifier(retired, replacement):
 
 
 def test_every_operational_table_queried_is_provisioned(support_sql, provisioning_sql):
-    """A query against {ops_catalog}.ingestion.<something nobody creates> is a typo that
-    only shows up when someone runs it."""
-    referenced = set(re.findall(r"\{ops_catalog\}\.ingestion\.(\w+)", support_sql))
-    created = set(re.findall(r"CREATE TABLE IF NOT EXISTS \{ops_catalog\}\.ingestion\.(\w+)", provisioning_sql))
+    """A query against {ops_catalog}.{control_schema}.<something nobody creates> is a typo
+    that only shows up when someone runs it."""
+    referenced = set(re.findall(r"\{ops_catalog\}\.\{control_schema\}\.(\w+)", support_sql))
+    created = set(
+        re.findall(r"CREATE TABLE IF NOT EXISTS \{ops_catalog\}\.\{control_schema\}\.(\w+)", provisioning_sql)
+    )
     assert referenced <= created, f"queried but never created: {sorted(referenced - created)}"
 
 
 def test_the_audit_table_queried_is_the_one_that_is_provisioned(support_sql, provisioning_sql):
-    referenced = set(re.findall(r"\{catalog\}\.audit\.(\w+)", support_sql))
-    created = set(re.findall(r"CREATE TABLE IF NOT EXISTS \{catalog\}\.audit\.(\w+)", provisioning_sql))
+    referenced = set(re.findall(r"\{ops_catalog\}\.\{audit_schema\}\.(\w+)", support_sql))
+    created = set(re.findall(r"CREATE TABLE IF NOT EXISTS \{ops_catalog\}\.\{audit_schema\}\.(\w+)", provisioning_sql))
     assert referenced == created == {"ingest_audit"}
 
 
@@ -108,6 +118,22 @@ def test_the_maintenance_script_optimises_the_audit_table_that_exists():
     night until somebody looks at it."""
     maintenance = _read(MAINTENANCE_SQL)
     assert "audit.ingest_audit" in maintenance
+
+
+def test_ingest_state_is_partitioned_with_deletion_vectors_in_the_provisioning_sql(provisioning_sql):
+    """docs/build_log/DECISIONS.md D-04, kept in step with framework/state.py's own
+    `ensure_state_table` call the same way the audit table's columns are kept in step with
+    framework/audit.py - the job creates this table itself if provisioning has not run, so
+    the two must agree on more than just column names."""
+    pattern = re.compile(
+        r"CREATE TABLE IF NOT EXISTS \{ops_catalog\}\.\{control_schema\}\.ingest_state.*?;",
+        re.DOTALL,
+    )
+    match = pattern.search(provisioning_sql)
+    assert match, "no CREATE TABLE for ingest_state found"
+    statement = match.group(0)
+    assert "PARTITIONED BY (source_key)" in statement
+    assert re.search(r"'delta\.enableDeletionVectors'\s*=\s*'true'", statement)
 
 
 # --------------------------------------------------------------------------------------
@@ -136,16 +162,27 @@ def _update_targets(sql: str, table: str) -> set:
 def test_the_support_updates_only_set_columns_the_control_table_has(support_sql, provisioning_sql):
     written = _update_targets(support_sql, CONTROL_TABLE)
     assert written, "no UPDATE against the control table found - the regex has gone stale"
-    declared = set(sql_table_columns(provisioning_sql, "ingestion.ingest_control"))
+    declared = set(sql_table_columns(provisioning_sql, "ingest_control"))
     assert written <= declared, f"UPDATE sets columns the table does not have: {sorted(written - declared)}"
 
 
 def test_support_never_updates_the_state_table(support_sql):
-    """Support has SELECT on ingest_state and nothing more, by grant (sql/01). A hand-moved
-    watermark is a silent data-loss incident, so the runbook must not even show how."""
+    """Support has SELECT on ingest_state and nothing more (docs/RUNBOOK_CLIENT_IT.md's
+    Unity Catalog privileges table). A hand-moved watermark is a silent data-loss incident,
+    so the runbook must not even show how."""
     assert not _update_targets(support_sql, STATE_TABLE)
     assert f"UPDATE {STATE_TABLE}" not in support_sql
     assert f"DELETE FROM {STATE_TABLE}" not in support_sql
+
+
+def test_no_sql_file_grants_anything(provisioning_sql):
+    """docs/build_log/DECISIONS.md D-02: grants are Terraform-owned, outside this
+    repository - a job that can grant privileges is a job that can grant itself more. See
+    the "Unity Catalog privileges" table in docs/RUNBOOK_CLIENT_IT.md for the specification
+    this replaced the GRANT statements with."""
+    assert "GRANT " not in provisioning_sql
+    assert "GRANT " not in _read(SUPPORT_SQL)
+    assert "GRANT " not in _read(MAINTENANCE_SQL)
 
 
 def test_the_support_queries_read_all_three_framework_tables(support_sql):
@@ -159,7 +196,7 @@ def test_the_audit_columns_the_queries_are_built_on_exist(provisioning_sql):
     """Spot-check the columns every triage query in the file depends on. Not exhaustive by
     design - see the note above - and it is the SHARED, source-agnostic ones that matter,
     because those are what make one audit table serve three source types."""
-    declared = set(sql_table_columns(provisioning_sql, "audit.ingest_audit"))
+    declared = set(sql_table_columns(provisioning_sql, "ingest_audit"))
     for column in (
         "source_type",
         "source_key",

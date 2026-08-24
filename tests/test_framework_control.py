@@ -7,8 +7,13 @@ Three rules, each with a test, and the third is the one most likely to be skippe
   * DUPLICATE rows are an error naming the source_key, because two rows means two answers
     to "is this source enabled?";
   * every override is VALIDATED against the source's SOURCE_SPEC, so a typo in the
-    `source_overrides` JSON fails exactly the way a YAML typo does instead of parsing,
+    `replay_controls` JSON fails exactly the way a YAML typo does instead of parsing,
     merging and doing nothing at all.
+
+Also covers docs/build_log/DECISIONS.md D-01: prefixed, per-source-type control columns
+replacing the old shared `failure_mode` / `batch_limit` columns and the JSON
+`source_overrides` escape hatch, and the wrong-source-type error that catches a column set
+on a row it does not belong to.
 
 Needs no Spark: framework/control.py takes the session as an argument and imports no
 PySpark.
@@ -71,10 +76,10 @@ def test_duplicate_rows_raise_and_name_the_source_key(demo_spec):
 # --------------------------------------------------------------------------------------
 
 
-def test_an_unknown_key_in_source_overrides_is_rejected(demo_spec):
+def test_an_unknown_key_in_replay_controls_is_rejected(demo_spec):
     """The rule most likely to be skipped, and skipping it puts a hole in the middle of the
     validation everything else is careful about."""
-    rows = [{"source_key": "demo_source", "source_overrides": '{"btach_limit": 100}'}]
+    rows = [{"source_key": "demo_source", "replay_controls": '{"btach_limit": 100}'}]
     with pytest.raises(ConfigError, match=r"unknown keys \['btach_limit'\]"):
         _read(rows, demo_spec)
 
@@ -83,7 +88,7 @@ def test_the_unknown_key_error_reads_the_same_as_a_yaml_typo(demo_spec, demo_con
     """Same message shape, so a support engineer who has seen one recognises the other."""
     from kafka_ingest.framework.config import resolve_config
 
-    rows = [{"source_key": "demo_source", "source_overrides": '{"nonsense": 1}'}]
+    rows = [{"source_key": "demo_source", "replay_controls": '{"nonsense": 1}'}]
     with pytest.raises(ConfigError) as from_control:
         _read(rows, demo_spec)
     with pytest.raises(ConfigError) as from_yaml:
@@ -95,13 +100,13 @@ def test_the_unknown_key_error_reads_the_same_as_a_yaml_typo(demo_spec, demo_con
 
 
 def test_malformed_json_says_which_column_and_which_source(demo_spec):
-    rows = [{"source_key": "demo_source", "source_overrides": "{not json"}]
-    with pytest.raises(ConfigError, match="source_overrides for source_key 'demo_source' is not valid JSON"):
+    rows = [{"source_key": "demo_source", "replay_controls": "{not json"}]
+    with pytest.raises(ConfigError, match="replay_controls for source_key 'demo_source' is not valid JSON"):
         _read(rows, demo_spec)
 
 
 def test_json_that_is_not_an_object_is_rejected(demo_spec):
-    rows = [{"source_key": "demo_source", "source_overrides": "[1, 2]"}]
+    rows = [{"source_key": "demo_source", "replay_controls": "[1, 2]"}]
     with pytest.raises(ConfigError, match="parsed as list"):
         _read(rows, demo_spec)
 
@@ -112,13 +117,16 @@ def test_json_that_is_not_an_object_is_rejected(demo_spec):
 
 
 def test_the_named_columns_become_settings(demo_spec):
+    """`enabled` / `replay_rerun_id` are framework-owned and stay bare; `failure_mode` /
+    `batch_limit` are this source type's OWN levers and are read from ITS prefixed columns
+    (docs/build_log/DECISIONS.md D-01), not from a column called the same as the setting."""
     rows = [
         {
             "source_key": "demo_source",
             "source_type": "demo",
             "enabled": False,
-            "failure_mode": "QUARANTINE",
-            "batch_limit": 500,
+            "demo_failure_mode": "QUARANTINE",
+            "demo_batch_limit": 500,
             "replay_rerun_id": "INC42",
         }
     ]
@@ -133,7 +141,7 @@ def test_the_named_columns_become_settings(demo_spec):
 def test_null_columns_are_not_overrides(demo_spec):
     """A NULL means "not set here", not "set to nothing" - otherwise every unset column
     would blank out the YAML value beneath it."""
-    rows = [{"source_key": "demo_source", "enabled": None, "batch_limit": 500}]
+    rows = [{"source_key": "demo_source", "enabled": None, "demo_batch_limit": 500}]
     assert _read(rows, demo_spec) == {"batch_limit": 500}
 
 
@@ -152,18 +160,27 @@ def test_attribution_and_notes_are_ignored(demo_spec):
     assert _read(rows, demo_spec) == {}
 
 
-def test_source_overrides_json_is_merged_in(demo_spec):
-    rows = [{"source_key": "demo_source", "source_overrides": '{"trigger": "once"}'}]
+def test_an_operational_key_with_no_control_column_cannot_be_set_from_the_control_table(demo_spec):
+    """`trigger` is operational on demo_spec but was deliberately given no prefixed column
+    (mirroring Kafka's real shape) - not every operational key needs one, and one with none
+    is simply invisible to this table, not a bug. A bare `trigger` column is just an
+    unrecognised column, silently ignored like any other."""
+    rows = [{"source_key": "demo_source", "trigger": "once"}]
+    assert _read(rows, demo_spec) == {}
+
+
+def test_replay_controls_json_is_merged_in(demo_spec):
+    rows = [{"source_key": "demo_source", "replay_controls": '{"trigger": "once"}'}]
     assert _read(rows, demo_spec) == {"trigger": "once"}
 
 
-def test_replay_controls_win_over_source_overrides(demo_spec):
-    """An incident-scoped replay setting should beat a standing override parked in
-    source_overrides."""
+def test_replay_controls_win_over_a_named_column(demo_spec):
+    """An incident-scoped replay setting should beat a standing override parked in a named
+    control column."""
     rows = [
         {
             "source_key": "demo_source",
-            "source_overrides": '{"batch_limit": 100}',
+            "demo_batch_limit": 100,
             "replay_controls": '{"batch_limit": 5}',
         }
     ]
@@ -175,12 +192,57 @@ def test_a_structural_key_is_carried_through_and_ignored_later(demo_spec, demo_c
     control.py carries the key; config.py drops it and says so in the log."""
     from kafka_ingest.framework.config import resolve_config
 
-    rows = [{"source_key": "demo_source", "source_overrides": '{"partition_by": ["nonsense"]}'}]
+    rows = [{"source_key": "demo_source", "replay_controls": '{"partition_by": ["nonsense"]}'}]
     overrides = _read(rows, demo_spec)
     assert overrides == {"partition_by": ["nonsense"]}
 
     cfg = resolve_config(demo_config_root, "demo_source", "prod", demo_spec, control=overrides)
     assert cfg.get("partition_by") == ["ingest_date"]
+
+
+# --------------------------------------------------------------------------------------
+# D-01 point 4: a column belonging to a DIFFERENT source type is an error, not a silent
+# ignore. `other_control_columns` is what framework/runner.py builds from every known
+# SOURCE_SPEC.control_columns and passes in - these tests supply it directly.
+# --------------------------------------------------------------------------------------
+
+
+def test_a_column_belonging_to_a_different_source_type_is_rejected(demo_spec):
+    """A copy-pasted row, or a typo in the prefix, must fail loudly rather than silently do
+    nothing."""
+    rows = [{"source_key": "demo_source", "source_type": "demo", "other_reset_id": "INC1"}]
+    with pytest.raises(ConfigError, match=r"'other_reset_id' is set for source_key 'demo_source'.*belongs to"):
+        control.read_control(_spark(rows), CONTROL_TABLE, "demo_source", demo_spec, {"other_reset_id": "other_type"})
+
+
+def test_a_column_this_spec_also_declares_is_exempt_from_the_foreign_check(demo_spec):
+    """Two source types happening to declare the identical column name is not, on its own,
+    a mistake on THIS row - only a column neither this spec nor the row's real type owns
+    is."""
+    rows = [{"source_key": "demo_source", "demo_batch_limit": 7}]
+    overrides = control.read_control(
+        _spark(rows), CONTROL_TABLE, "demo_source", demo_spec, {"demo_batch_limit": "demo"}
+    )
+    assert overrides == {"batch_limit": 7}
+
+
+def test_a_spec_with_no_control_columns_declared_defaults_to_empty():
+    """Oracle and file are still Stage 1 stubs (Stage 4/5 build them) - their
+    control_columns must default to empty rather than requiring every SOURCE_SPEC to set it."""
+    from kafka_ingest.sources.oracle import SOURCE_SPEC
+
+    assert dict(SOURCE_SPEC.control_columns) == {}
+
+
+def test_the_shipped_kafka_spec_declares_its_control_columns():
+    """docs/build_log/DECISIONS.md D-01's settled column shape for Kafka's own levers."""
+    from kafka_ingest.sources.kafka import SOURCE_SPEC
+
+    assert dict(SOURCE_SPEC.control_columns) == {
+        "kafka_failure_mode": "failure_mode",
+        "kafka_max_offsets_per_trigger": "max_offsets_per_trigger",
+        "kafka_checkpoint_reset_id": "checkpoint_reset_id",
+    }
 
 
 def test_a_row_declaring_the_wrong_source_type_is_an_error(demo_spec):

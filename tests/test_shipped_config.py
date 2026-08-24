@@ -300,6 +300,23 @@ def test_the_framework_tables_resolve_to_legal_names(topic_key_any, environment,
     validate_name(settings[setting], f"conf/defaults.yaml {setting} [{environment}]")
 
 
+@pytest.mark.parametrize("environment", ENVIRONMENTS)
+def test_the_frameworks_own_tables_all_live_under_the_ops_catalog(topic_key_any, environment):
+    """docs/build_log/DECISIONS.md D-06: audit, control and state all moved under
+    {ops_catalog}, split by schema. A name that is syntactically legal but points at the
+    wrong catalog would pass the test above without this one - `{catalog}.audit.
+    ingest_audit` is just as legal a name as `{ops_catalog}.{audit_schema}.ingest_audit`."""
+    from kafka_ingest.config import _read_yaml
+
+    ops_catalog = _read_yaml(str(CONF_ROOT / "environments" / f"{environment}.yaml"))["vars"]["ops_catalog"]
+    settings = load_structural(str(CONF_ROOT), topic_key_any, environment)
+    for setting in FRAMEWORK_TABLES:
+        assert settings[setting].startswith(f"{ops_catalog}."), (
+            f"{setting} in environment '{environment}' does not live under the ops catalog "
+            f"'{ops_catalog}': {settings[setting]}"
+        )
+
+
 def test_the_bundle_does_not_also_name_the_control_table():
     """One name in one place. A bundle variable holding a table name the code derives is a
     variable that drifts - and the one this replaced was pointing at a table Stage 2

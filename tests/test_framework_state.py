@@ -163,10 +163,24 @@ def test_a_source_with_no_state_table_configured_is_told_so_plainly():
         store.read_state("demo_source", STATE_WATERMARK)
 
 
-def test_ensure_creates_an_unpartitioned_table(demo_config_root, demo_spec):
+def test_ensure_creates_a_table_partitioned_by_source_key_with_deletion_vectors(demo_config_root, demo_spec):
+    """docs/build_log/DECISIONS.md D-04: partitioning isolates concurrent MERGEs from
+    different sources at the file level, and deletion vectors make the small, frequent,
+    single-row MERGE updates this table takes cheaper than rewriting a file per update."""
     cfg = resolve_config(demo_config_root, "demo_source", "prod", demo_spec)
     spark = FakeSpark()
     state_module.ensure_state_table(spark, cfg, STATE_TABLE)
     statement = spark.sql_statements[0]
     assert f"CREATE TABLE IF NOT EXISTS {STATE_TABLE}" in statement
-    assert "PARTITIONED BY" not in statement
+    assert "PARTITIONED BY (source_key)" in statement
+    assert "'delta.enableDeletionVectors' = 'true'" in statement
+
+
+def test_ensure_keeps_the_configured_properties_alongside_deletion_vectors(demo_config_root, demo_spec):
+    """Deletion vectors must be ADDED to whatever table_properties configuration already
+    carries, not replace it - losing autoOptimize on this table was not the point."""
+    cfg = resolve_config(demo_config_root, "demo_source", "prod", demo_spec)
+    spark = FakeSpark()
+    state_module.ensure_state_table(spark, cfg, STATE_TABLE)
+    statement = spark.sql_statements[0]
+    assert "'delta.autoOptimize.optimizeWrite' = 'true'" in statement

@@ -297,10 +297,30 @@ def test_the_control_table_is_read_when_one_is_configured(demo_config_root, disp
     _add_control_table(demo_config_root)
     spark = FakeSpark(
         existing_tables={CONTROL_TABLE},
-        rows_by_table={CONTROL_TABLE: [{"source_key": "demo_source", "batch_limit": 77}]},
+        rows_by_table={CONTROL_TABLE: [{"source_key": "demo_source", "demo_batch_limit": 77}]},
     )
     runner.run("demo_source", "prod", config_root=demo_config_root, spark=spark)
     assert dispatch_demo[0].cfg.get("batch_limit") == 77
+
+
+def test_the_control_column_owner_registry_is_built_from_every_known_source():
+    """framework/runner.py is the one place allowed to know source types by name; this is
+    what it hands framework/control.py so a column belonging to a different source type is
+    caught rather than silently ignored (docs/build_log/DECISIONS.md D-01 point 4)."""
+    assert runner._CONTROL_COLUMN_OWNERS["kafka_checkpoint_reset_id"] == "kafka"
+    assert runner._CONTROL_COLUMN_OWNERS["kafka_failure_mode"] == "kafka"
+
+
+def test_a_column_for_a_different_source_type_is_rejected_end_to_end(demo_config_root, dispatch_demo, fake_delta):
+    """The same check, exercised through the full runner.run() path rather than calling
+    framework/control.py directly."""
+    _add_control_table(demo_config_root)
+    spark = FakeSpark(
+        existing_tables={CONTROL_TABLE},
+        rows_by_table={CONTROL_TABLE: [{"source_key": "demo_source", "kafka_checkpoint_reset_id": "INC1"}]},
+    )
+    with pytest.raises(ConfigError, match=r"'kafka_checkpoint_reset_id' is set for source_key 'demo_source'"):
+        runner.run("demo_source", "prod", config_root=demo_config_root, spark=spark)
 
 
 def test_an_explicit_control_dict_is_used_instead_of_reading_the_table(demo_config_root, dispatch_demo, fake_delta):
