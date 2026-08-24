@@ -32,14 +32,12 @@ dev = [
 
 # Job entrypoints. DAB `python_wheel_task.entry_point` refers to these names.
 #
-# `run-ingest` is the multi-source entrypoint (framework/runner.py). The three below it are
-# the Kafka-only entrypoints, still live until Stage 3 ports the Kafka source; they are
-# what resources/*.yml still name, so removing them now would break the bundle.
+# TWO, for every source type. `run-ingest` is the scheduled primary run and `run-replay`
+# takes the replay shape as a parameter, so onboarding a source - or a source TYPE - adds
+# a task to a job definition and nothing here.
 [project.scripts]
 run-ingest = "kafka_ingest.entrypoints.run_ingest:main"
-ingest-primary = "kafka_ingest.entrypoints.ingest_primary:main"
-replay-kafka = "kafka_ingest.entrypoints.replay_kafka:main"
-replay-curated = "kafka_ingest.entrypoints.replay_curated:main"
+run-replay = "kafka_ingest.entrypoints.run_replay:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
