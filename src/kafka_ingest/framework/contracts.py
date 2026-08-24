@@ -103,6 +103,12 @@ class RunResult:
 
     source_detail is a JSON string, not a map: a new source type must never force an
     ALTER TABLE on the shared audit table.
+
+    pending_work is what was STILL OUTSTANDING when the run ended - records not yet read,
+    files not yet processed. It defaults to None and None is a legitimate answer: a source
+    that cannot learn it without a second round trip to the system it just read must say
+    so rather than report a confident zero, because a zero here reads as "fully caught up"
+    and that is exactly the claim a permanently-lagging feed makes falsely.
     """
 
     rows_read: int
@@ -111,3 +117,4 @@ class RunResult:
     position_start: str | None  # JSON or scalar, as text
     position_end: str | None
     source_detail: str | None  # JSON
+    pending_work: int | None = None

@@ -103,11 +103,12 @@ AUDIT_DDL_COLUMNS = """
     event_ts              TIMESTAMP COMMENT 'When this transition was recorded',
     duration_ms           BIGINT    COMMENT 'Time spent in this layer',
     run_type              STRING    COMMENT 'primary, or a source-specific replay type',
-    rerun_id              STRING    COMMENT 'Set for a replay; NULL for a primary run',
+    rerun_id              STRING    COMMENT 'A replay id; on a primary run, a reset id that forked the identity',
     job_run_id            STRING    COMMENT 'The Databricks Workflows run id, when there is one',
     position_start        STRING    COMMENT 'THREE MEANINGS by source_type: Kafka offsets, a cursor, a file boundary',
     position_end          STRING    COMMENT 'Upper read boundary. Same three meanings as position_start',
     source_detail         STRING    COMMENT 'JSON STRING, not a map - a new source type forces no ALTER TABLE',
+    pending_work          BIGINT    COMMENT 'Outstanding work at end of run. NULL means the source cannot know',
     error_class           STRING,
     error_message         STRING    COMMENT 'Truncated to 4000 characters',
     audit_date            DATE      COMMENT 'Partition key: date of event_ts'
@@ -136,6 +137,7 @@ AUDIT_SCHEMA = StructType(
         StructField("position_start", StringType()),
         StructField("position_end", StringType()),
         StructField("source_detail", StringType()),
+        StructField("pending_work", LongType()),
         StructField("error_class", StringType()),
         StructField("error_message", StringType()),
         StructField("audit_date", DateType()),
@@ -177,6 +179,12 @@ class AuditWriter:
         self.run_type = run_type
         self.job_run_id = job_run_id
         self.source_ref: str | None = None
+        # Seeded from configuration, then writable for the same reason source_ref is: a
+        # replay's id IS configuration, but a checkpoint-based source that deliberately
+        # forks its write identity mid-lifecycle knows an id the configuration layer never
+        # sees as `rerun_id`. Both end up in one column because `run_type` tells them
+        # apart - a primary run with a non-NULL rerun_id is a reset, by construction.
+        self.rerun_id: str | None = cfg.get("rerun_id")
 
     def emit(self, layer: str, status: str, txn_version: int = NO_TXN_VERSION, **details: Any) -> None:
         """Write one audit row. Never raises.
@@ -227,11 +235,12 @@ class AuditWriter:
             "event_ts": now,
             "duration_ms": _as_long(kw.get("duration_ms")),
             "run_type": self.run_type,
-            "rerun_id": cfg.get("rerun_id"),
+            "rerun_id": self.rerun_id,
             "job_run_id": self.job_run_id,
             "position_start": kw.get("position_start"),
             "position_end": kw.get("position_end"),
             "source_detail": detail if isinstance(detail, (str, type(None))) else json.dumps(detail),
+            "pending_work": _as_long(kw.get("pending_work")),
             "error_class": kw.get("error_class"),
             "error_message": (message or "")[:_ERROR_MESSAGE_LIMIT] or None,
             "audit_date": now.date(),

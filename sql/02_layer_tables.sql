@@ -3,12 +3,12 @@
 --
 -- THIS FILE IS OPTIONAL. Onboarding a topic requires NO manual DDL.
 --
--- The framework creates every table it owns on first run (src/kafka_ingest/tables.py):
---   landing / quarantine          from the constants in that module
+-- The framework creates every table it owns on first run:
+--   landing / quarantine          from the constants in sources/kafka/tables.py
 --   audit                         from framework/audit.py
 --   curated                       from a schema derived on the driver from the Avro reader
 --                                 schema, before any row is read - see
---                                 curated_writer.curated_schema()
+--                                 sources/kafka/curated.py curated_schema()
 -- All of them use CREATE TABLE IF NOT EXISTS, so this is a metadata no-op after run one.
 --
 -- This file exists for two other reasons: so an environment can be provisioned and GRANTed
@@ -21,13 +21,13 @@
 -- column lists in this file against the constants that would otherwise create the tables,
 -- so drift fails in CI rather than on a cluster:
 --   audit                  tests/test_framework_audit.py (framework/audit.py)
---   landing / quarantine   tests/test_audit_and_tables.py (kafka_ingest/tables.py)
+--   landing / quarantine   tests/test_kafka_tables.py (sources/kafka/tables.py)
 --
 -- CURATED IS NOT HERE ON PURPOSE. Its `payload` column is a STRUCT whose shape comes from
 -- the Avro reader schema, so a static copy here would go stale the first time a schema is
 -- registered. The framework creates it with explicit DDL at run time instead, from a schema
--- derived off the reader schema - see curated_writer.curated_schema() and
--- pipeline.ensure_curated().
+-- derived off the reader schema - see sources/kafka/curated.py curated_schema() and
+-- sources/kafka/tables.py ensure_curated().
 -- =====================================================================================
 -- TEMPLATE - NOT READY TO RUN AS-IS. See the note in sql/01_operational_config.sql:
 -- {catalog}, {ops_catalog} and {audit_schema} are rendered from conf/environments/<env>.yaml
@@ -67,7 +67,8 @@ CREATE TABLE IF NOT EXISTS {catalog}.landing.{topic_table} (
   kafka_headers         ARRAY<STRUCT<key: STRING, value: BINARY>>,
   value                 BINARY    COMMENT 'Raw Kafka value, verbatim, INCLUDING the 5-byte Confluent header',
   writer_schema_id      INT       COMMENT 'Parsed from wire bytes 1-4; NULL when not Confluent-framed',
-  wire_format_valid     BOOLEAN,
+  wire_format_valid     BOOLEAN   COMMENT 'FALSE when the value is NULL, under 5 bytes, or not 0x00-framed',
+  malformed_reason      STRING    COMMENT 'NULL_VALUE_TOMBSTONE | TRUNCATED_PAYLOAD | BAD_MAGIC_BYTE; NULL when valid',
   payload_bytes         INT,
   ce_id                 STRING    COMMENT 'CloudEvents attributes, read from ce_* Kafka headers',
   ce_source             STRING,
@@ -81,7 +82,7 @@ CREATE TABLE IF NOT EXISTS {catalog}.landing.{topic_table} (
   ingest_date           DATE      COMMENT 'Partition key',
   ingested_via          STRING    COMMENT 'primary | kafka_replay | curated_replay',
   replay_run_id         STRING,
-  batch_id              BIGINT,
+  txn_version           BIGINT    COMMENT 'The Delta txnVersion this row was written under, or -1',
   run_id                STRING    COMMENT 'Correlates with audit.ingest_audit.run_id'
 )
 USING DELTA
@@ -123,11 +124,12 @@ CREATE TABLE IF NOT EXISTS {ops_catalog}.{audit_schema}.ingest_audit (
   event_ts              TIMESTAMP COMMENT 'When this transition was recorded',
   duration_ms           BIGINT    COMMENT 'Time spent in this layer',
   run_type              STRING    COMMENT 'primary, or a source-specific replay type',
-  rerun_id              STRING    COMMENT 'Set for a replay; NULL for a primary run',
+  rerun_id              STRING    COMMENT 'A replay id; on a primary run, the reset id that forked its write identity',
   job_run_id            STRING    COMMENT 'The Databricks Workflows run id, when there is one',
   position_start        STRING    COMMENT 'THREE MEANINGS by source_type: Kafka offsets, a cursor, a file boundary',
   position_end          STRING    COMMENT 'Upper read boundary. Same three meanings as position_start',
   source_detail         STRING    COMMENT 'JSON STRING, not a map - a new source type forces no ALTER TABLE',
+  pending_work          BIGINT    COMMENT 'Work still outstanding when the run ended. NULL means the source cannot cheaply know',
   error_class           STRING,
   error_message         STRING    COMMENT 'Truncated to 4000 characters',
   audit_date            DATE      COMMENT 'Partition key: date of event_ts'
@@ -156,7 +158,7 @@ CREATE TABLE IF NOT EXISTS {catalog}.landing.rcm_claim_status_quarantine (
   kafka_headers         ARRAY<STRUCT<key: STRING, value: BINARY>>,
   value                 BINARY    COMMENT 'Raw bytes retained so a curated replay can recover this row',
   writer_schema_id      INT       COMMENT 'NULL when the wire format itself was unreadable',
-  quarantine_reason     STRING    COMMENT 'malformed_wire_format | schema_resolution_failed | avro_decode_failed',
+  quarantine_reason     STRING    COMMENT 'A wire-format reason (see landing.malformed_reason), schema_resolution_failed, or avro_decode_failed',
   quarantine_detail     STRING,
   quarantined_ts        TIMESTAMP,
   ce_id                 STRING,
@@ -171,7 +173,7 @@ CREATE TABLE IF NOT EXISTS {catalog}.landing.rcm_claim_status_quarantine (
   ingest_date           DATE,
   ingested_via          STRING,
   replay_run_id         STRING,
-  batch_id              BIGINT,
+  txn_version           BIGINT    COMMENT 'The Delta txnVersion this row was written under, or -1',
   run_id                STRING
 )
 USING DELTA

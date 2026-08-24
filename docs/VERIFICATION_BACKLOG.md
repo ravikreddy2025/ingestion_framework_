@@ -169,13 +169,19 @@ code must change -- see "If it fails").
 - **Status:** OPEN
 
 ### VB-05 -- Is `sources[0].latestOffset` populated in `StreamingQueryProgress` under `availableNow`?
-- **Stage / file:** `src/kafka_ingest/audit.py::StreamAuditListener.onQueryProgress` today;
-  will move to `framework/audit.py`.
-- **Why it matters:** The stream-layer audit row's `ending_offsets` is read from
-  `progress.sources[0].endOffset`. If `availableNow` handles this differently from a
-  continuous trigger (e.g. populates it only on the final micro-batch, or not at all until
-  the query fully drains), the audit trail -- the thing support reads first during an
-  incident -- silently under-reports without any error surfacing anywhere.
+- **Stage / file:** `sources/kafka/listener.py::record_progress` and `_pending` (moved here
+  in Stage 3 from the retired `kafka_ingest/audit.py`).
+- **Why it matters:** TWO things now depend on this progress payload, and they fail
+  differently. `position_start` / `position_end` come from `startOffset` / `endOffset`: if
+  `availableNow` populates those only on the final micro-batch, or not at all until the
+  query drains, the audit trail silently under-reports and support reads it first during an
+  incident. `pending_work` (added Stage 3) is `sum(latestOffset - endOffset)`, and it is
+  what makes a permanently-lagging source visible at all -- Q16 in
+  `sql/03_support_queries.sql` is built on it. If `latestOffset` is absent the column is
+  NULL, which is DESIGNED to be the honest answer rather than a wrong one: NULL reads as
+  "the source could not tell", 0 would read as "fully caught up". So a missing
+  `latestOffset` does not corrupt anything -- it just means the lag question has no answer
+  on this runtime, and Q16 would quietly return nothing forever.
 - **How to check:**
   ```python
   # after a real availableNow run against a live topic:
@@ -185,9 +191,14 @@ code must change -- see "If it fails").
       print(p["batchId"], p.get("sources"))
   ```
 - **Expected:** Every micro-batch's progress event carries a populated `startOffset` /
-  `endOffset` per source, not just the final one.
-- **If it fails:** `audit._progress_dict` / `onQueryProgress` need a fallback (e.g. reading
-  offsets from the checkpoint's `offsets` directory) for the batches where Spark omits them.
+  `endOffset` per source, not just the final one -- AND a populated `latestOffset`.
+- **If it fails:** For `startOffset` / `endOffset`, `listener.record_progress` needs a
+  fallback (e.g. reading offsets from the checkpoint's `offsets` directory) for the batches
+  where Spark omits them. For `latestOffset` specifically, do NOT substitute a computed
+  value from a Kafka admin client -- that is a runtime dependency this project does not
+  take. Either accept that `pending_work` is always NULL for Kafka and say so on the column,
+  or drop Q16's Kafka rows. Check `runs_that_could_not_tell` in Q16 to see which case you
+  are in.
 - **Status:** OPEN
 
 ### VB-10 -- Does the `from_avro` writer/reader startup self-check pass on the target runtime?
@@ -453,4 +464,45 @@ code must change -- see "If it fails").
   make the script run -- if `kafka_failure_mode` cannot be constrained in DDL, the
   equivalent check belongs in `framework/control.py` where the column is read, and this
   file must say so.
+- **Status:** OPEN
+
+### VB-18 -- Does the magic-byte comparison behave the same way on the target DBR?
+- **Stage / file:** `sources/kafka/wire.py::malformed_reason_col` and `writer_schema_id_col`.
+- **Why it matters:** Both functions decide whether a record is Confluent-framed by
+  comparing byte 0 against `0x00`. The obvious way to write that is to compare the BINARY
+  column against a Python bytes literal (`F.substring("value", 1, 1) != F.lit(bytearray([0]))`),
+  and how Spark treats a BINARY-to-bytes comparison -- and whether `lit()` even accepts a
+  `bytearray` -- is exactly the kind of thing that has moved between versions. So both
+  functions instead compare HEX TEXT: `hex(substring(value, 1, 1)) = '00'`, whose semantics
+  are not in question on any version.
+
+  The consequence of getting it wrong is not an error. A comparison that always evaluated
+  false would classify EVERY record as `BAD_MAGIC_BYTE`, and under `FAILFAST` that fails the
+  first batch loudly -- the good case. Under `QUARANTINE` it would send an entire healthy
+  topic to the quarantine table, run after run, reporting success each time.
+
+  This is not merely assumed: `tests/test_kafka_registry.py::test_each_malformed_input_gets_
+  its_own_reason` **executed and passed on a local Spark 3.5.2** during Stage 3, covering all
+  three reasons plus the valid case. That is strong evidence for the runtime the project
+  targets (DBR 16.4 LTS ships Spark 3.5.2 -- VB-14) but it is a local open-source Spark, not
+  Databricks Runtime, and photon/ANSI defaults differ.
+- **How to check:** Run the spark-marked tests on a real cluster:
+  ```
+  pytest -m spark tests/test_kafka_registry.py -q
+  ```
+  Or, in a notebook on the target DBR:
+  ```python
+  from kafka_ingest.sources.kafka import wire
+  rows = [(None,), (b"\x00\x01\x02",), (b"\x99nope",), (b"\x00\x00\x00\x12\x67\x02",)]
+  df = spark.createDataFrame(rows, "value BINARY")
+  df.select(wire.malformed_reason_col("value").alias("reason"),
+            wire.writer_schema_id_col("value").alias("schema_id")).show()
+  ```
+- **Expected:** `NULL_VALUE_TOMBSTONE`, `TRUNCATED_PAYLOAD`, `BAD_MAGIC_BYTE`, then
+  `reason = NULL` with `schema_id = 4711` on the well-formed row. Run it with
+  `spark.sql.ansi.enabled` both on and off -- neither should throw.
+- **If it fails:** Fix the comparison in `wire.py` only; every caller reads the column and
+  none re-derives the rule. Do NOT relax the branch order (NULL, then length, then byte 0):
+  measuring before indexing is what keeps a zero-length value from throwing rather than
+  being classified.
 - **Status:** OPEN

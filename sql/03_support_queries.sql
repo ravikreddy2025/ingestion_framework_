@@ -235,14 +235,37 @@ WHERE source_key = 'rcm_claim_status';
 --     Setting the wrong source type's column for this row fails loudly, naming both.
 --
 --     kafka_checkpoint_reset_id bypasses Kafka's checkpoint-reset guard AND forks the
---     Delta txnAppId - use ONLY after confirming the checkpoint is genuinely gone, and see
---     the column comment in sql/01_operational_config.sql before clearing it afterwards.
+--     Delta txnAppId - use ONLY after confirming the checkpoint is genuinely gone.
+--
+--     THE ID MUST BE ONE THAT HAS NEVER BEEN USED FOR THIS SOURCE. Reusing one keeps the
+--     OLD transaction identity, against which Delta already holds high versions, so every
+--     write would be skipped as a duplicate and the run would report success having
+--     ingested nothing. The job REFUSES to start in that state and names the id - but
+--     check with Q6d first rather than finding out from a failed run.
+--
+--     Do NOT clear the field afterwards: it self-neutralises once the checkpoint exists
+--     again, and reverting it would resurrect the exact collision it was set to avoid.
+--     Full procedure: docs/RUNBOOK_SUPPORT.md 5.4a.
 -- -------------------------------------------------------------------------------------
 UPDATE {ops_catalog}.{control_schema}.ingest_control
 SET kafka_checkpoint_reset_id = 'INC12345',
     notes                     = 'INC12345 - checkpoint lost in a workspace migration, confirmed gone',
     updated_by = current_user(), updated_at = current_timestamp()
 WHERE source_key = 'rcm_claim_status';
+
+-- -------------------------------------------------------------------------------------
+-- Q6d. SOURCE-SPECIFIC (kafka). Has this reset id been used before? RUN THIS FIRST.
+--     A primary run carrying a reset id records it in rerun_id, which is otherwise NULL
+--     on a primary run - so run_type tells the two meanings of that column apart. Any row
+--     here means that id is spent: use the current incident's id instead.
+-- -------------------------------------------------------------------------------------
+SELECT run_id, rerun_id, min(event_ts) AS first_used, max(event_ts) AS last_used
+FROM {ops_catalog}.{audit_schema}.ingest_audit
+WHERE source_key = 'rcm_claim_status'
+  AND run_type   = 'primary'
+  AND rerun_id IS NOT NULL
+GROUP BY run_id, rerun_id
+ORDER BY last_used DESC;
 
 -- -------------------------------------------------------------------------------------
 -- Q7. EMERGENCY STOP. Takes effect on the next scheduled run. No deploy, no PR.
@@ -406,3 +429,113 @@ FROM table_changes('{ops_catalog}.{control_schema}.ingest_state', 0)
 WHERE state_key = 'watermark' AND _change_type != 'update_preimage'
 ORDER BY updated_at DESC
 LIMIT 200;
+
+-- =====================================================================================
+-- STANDING HEALTH CHECKS - not incident queries. Run these on a schedule, or read them in
+-- the weekly review. Each answers a question that has no failure attached to it, which is
+-- exactly why nobody thinks to ask it.
+-- =====================================================================================
+
+-- -------------------------------------------------------------------------------------
+-- Q13. LAST COMMITTED END OFFSET PER PARTITION. Read this BEFORE any checkpoint reset.
+--
+--     A reset restarts the stream from `latest`, so these offsets are the LOWER BOUND of
+--     the gap the reset leaves behind - record them, then backfill with a bounded Kafka
+--     replay starting exactly here. This is step 1 of docs/RUNBOOK_SUPPORT.md 5.4a, and
+--     the rest of that procedure is worthless without it.
+--
+--     position_end holds a Kafka offsets JSON for a kafka source. The same column means a
+--     cursor value for a database source and a file boundary for a file source, so read
+--     source_type before reading this.
+-- -------------------------------------------------------------------------------------
+WITH last_completed AS (
+  SELECT position_end,
+         row_number() OVER (ORDER BY event_ts DESC) AS recency
+  FROM {ops_catalog}.{audit_schema}.ingest_audit
+  WHERE source_key = 'rcm_claim_status'
+    AND layer      = 'stream'
+    AND status     = 'COMPLETED'
+    AND position_end IS NOT NULL
+)
+SELECT offsets.key   AS kafka_partition,
+       offsets.value AS last_committed_end_offset
+FROM last_completed
+LATERAL VIEW explode(
+  from_json(get_json_object(position_end, '$["rcm.claim.status.v2"]'), 'map<string,bigint>')
+) AS offsets
+WHERE recency = 1
+ORDER BY int(offsets.key);
+
+-- -------------------------------------------------------------------------------------
+-- Q14. WHICH SOURCES ARE RUNNING WITH DATA-LOSS PROTECTION DISABLED?
+--
+--     fail_on_data_loss is STRUCTURAL - it lives in Git, not in this table - so it cannot
+--     be read from ingest_control and cannot be changed from here. It is recorded on every
+--     audit row instead, inside source_detail, precisely so this question is answerable
+--     without reading a Git branch that may since have moved on.
+--
+--     `false` means the source is allowed to skip records Kafka aged out before it read
+--     them: gaps become silent. That is a legitimate, signed-off setting for some feeds and
+--     a forgotten incident workaround for others, and the only way to tell is to ask the
+--     domain. Anything on this list with no owner behind it is a finding.
+-- -------------------------------------------------------------------------------------
+SELECT source_type,
+       source_key,
+       max(event_ts) AS last_seen,
+       get_json_object(max_by(source_detail, event_ts), '$.fail_on_data_loss') AS fail_on_data_loss
+FROM {ops_catalog}.{audit_schema}.ingest_audit
+WHERE layer = 'run'
+  AND audit_date >= current_date() - INTERVAL 7 DAYS
+  AND source_detail IS NOT NULL
+GROUP BY source_type, source_key
+HAVING lower(fail_on_data_loss) = 'false'
+ORDER BY source_key;
+
+-- -------------------------------------------------------------------------------------
+-- Q15. WHICH SOURCES LOST MORE THAN 5% OF THEIR LAST RUN TO QUARANTINE OR RESCUE?
+--
+--     A stream in QUARANTINE mode does not fail - that is the point, and it is also why a
+--     rising quarantine rate stays invisible until someone opens the quarantine table. The
+--     count is on the audit row, so this needs neither.
+--
+--     5% is a starting threshold, not a validated one: tune it per domain once there is a
+--     baseline. A source that normally sits at 0 and moves to 1% is a finding this misses.
+-- -------------------------------------------------------------------------------------
+WITH last_run AS (
+  SELECT source_type, source_key, run_id, record_count, quarantined_count, event_ts,
+         row_number() OVER (PARTITION BY source_key ORDER BY event_ts DESC) AS recency
+  FROM {ops_catalog}.{audit_schema}.ingest_audit
+  WHERE layer = 'run' AND status = 'COMPLETED'
+    AND quarantined_count IS NOT NULL
+    AND audit_date >= current_date() - INTERVAL 7 DAYS
+)
+SELECT source_type, source_key, run_id, event_ts,
+       record_count, quarantined_count,
+       round(100.0 * quarantined_count / nullif(record_count, 0), 2) AS pct_quarantined
+FROM last_run
+WHERE recency = 1
+  AND quarantined_count > 0.05 * record_count
+ORDER BY pct_quarantined DESC;
+
+-- -------------------------------------------------------------------------------------
+-- Q16. IS ANY SOURCE PERMANENTLY BEHIND?
+--
+--     pending_work is what was STILL OUTSTANDING when the run ended: Kafka lag for a
+--     streaming source, unprocessed files for a file source, NULL for a source that cannot
+--     cheaply know. NULL IS NOT ZERO and must not be read as "caught up" - for Kafka it
+--     means the runtime reported no latest offset (VB-05).
+--
+--     One run ending behind is normal on a busy topic. The same source ending behind on
+--     every run, with the figure GROWING, is a source that will never catch up.
+-- -------------------------------------------------------------------------------------
+SELECT source_type, source_key,
+       count(*)                       AS runs,
+       max(pending_work)              AS worst,
+       max_by(pending_work, event_ts) AS most_recent,
+       count_if(pending_work IS NULL) AS runs_that_could_not_tell
+FROM {ops_catalog}.{audit_schema}.ingest_audit
+WHERE layer = 'run' AND status = 'COMPLETED'
+  AND audit_date >= current_date() - INTERVAL 7 DAYS
+GROUP BY source_type, source_key
+HAVING max(pending_work) > 0
+ORDER BY most_recent DESC;

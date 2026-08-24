@@ -1,13 +1,21 @@
-"""Auth option construction, secret indirection and redaction."""
+"""sources/kafka/security.py - profiles and secrets into broker/registry options.
+
+The Kafka-shaped half of the security split. Everything here is about the SHAPE of an
+options map a Kafka client or the registry HTTP client understands - which is why it lives
+in the source package and not in framework/. The source-agnostic half (resolving a secret,
+never logging one) is tests/test_framework_security.py.
+"""
 
 from __future__ import annotations
 
 import pytest
 
-from kafka_ingest.config import ConfigError, KafkaClusterProfile, SchemaRegistryProfile
-from kafka_ingest.security import build_kafka_options, build_registry_auth, redact
+from kafka_ingest.framework.config import ConfigError
+from kafka_ingest.framework.logs import MASK, redact
+from kafka_ingest.sources.kafka.config import ClusterProfile, RegistryProfile
+from kafka_ingest.sources.kafka.security import build_kafka_options, build_registry_auth
 
-SASL = KafkaClusterProfile(
+SASL = ClusterProfile(
     name="cc",
     bootstrap_servers="broker:9092",
     auth_mode="sasl_scram_sha_512",
@@ -16,7 +24,7 @@ SASL = KafkaClusterProfile(
     sasl_password_key="pass-key",
 )
 
-MTLS = KafkaClusterProfile(
+MTLS = ClusterProfile(
     name="onprem",
     bootstrap_servers="broker:9094",
     auth_mode="mtls",
@@ -40,9 +48,13 @@ def test_sasl_options_use_the_right_login_module(secrets):
 
 
 def test_plain_and_scram_use_different_login_modules(secrets):
-    plain = KafkaClusterProfile(
-        name="cc", bootstrap_servers="b:9092", auth_mode="sasl_plain",
-        secret_scope="kv", sasl_username_key="u", sasl_password_key="p",
+    plain = ClusterProfile(
+        name="cc",
+        bootstrap_servers="b:9092",
+        auth_mode="sasl_plain",
+        secret_scope="kv",
+        sasl_username_key="u",
+        sasl_password_key="p",
     )
     assert "PlainLoginModule" in build_kafka_options(plain, secrets)["kafka.sasl.jaas.config"]
     assert "ScramLoginModule" in build_kafka_options(SASL, secrets)["kafka.sasl.jaas.config"]
@@ -54,16 +66,35 @@ def test_mtls_options_reference_volume_paths_and_never_inline_certs(secrets):
     assert options["kafka.ssl.keystore.location"].startswith("/Volumes/")
     assert options["kafka.ssl.truststore.location"].startswith("/Volumes/")
     assert "kafka.sasl.jaas.config" not in options
-    # Passwords are resolved, the files themselves are not read into the options map.
+    # Passwords are resolved; the files themselves are never read into the options map.
     assert options["kafka.ssl.key.password"] == "kv-test/key-pw/value"
 
 
+def test_a_store_that_is_not_on_a_volume_is_refused_not_warned_about():
+    """A keystore on a workspace path is either unreadable from the executors or
+    ungoverned, and either way it surfaces as an opaque SSL error on a cluster."""
+    with pytest.raises(ConfigError, match="Volume path"):
+        ClusterProfile(
+            name="bad",
+            bootstrap_servers="b:9094",
+            auth_mode="mtls",
+            truststore_path="/dbfs/certs/truststore.jks",
+            keystore_path="/Volumes/c/s/keystore.jks",
+        )
+
+
 def test_sasl_cluster_can_still_carry_a_private_ca_truststore(secrets):
-    """SASL_SSL against a self-managed cluster needs a truststore; Confluent Cloud does not."""
-    profile = KafkaClusterProfile(
-        name="cp", bootstrap_servers="b:9093", auth_mode="sasl_scram_sha_512",
-        secret_scope="kv", sasl_username_key="u", sasl_password_key="p",
-        truststore_path="/Volumes/c/s/ca.jks", truststore_password_key="ts",
+    """SASL_SSL against a self-managed cluster needs a truststore; a managed cloud cluster
+    on a public CA does not."""
+    profile = ClusterProfile(
+        name="cp",
+        bootstrap_servers="b:9093",
+        auth_mode="sasl_scram_sha_512",
+        secret_scope="kv",
+        sasl_username_key="u",
+        sasl_password_key="p",
+        truststore_path="/Volumes/c/s/ca.jks",
+        truststore_password_key="ts",
     )
     options = build_kafka_options(profile, secrets)
     assert options["kafka.security.protocol"] == "SASL_SSL"
@@ -71,9 +102,13 @@ def test_sasl_cluster_can_still_carry_a_private_ca_truststore(secrets):
 
 
 def test_extra_options_are_prefixed(secrets):
-    profile = KafkaClusterProfile(
-        name="cc", bootstrap_servers="b:9092", auth_mode="sasl_plain",
-        secret_scope="kv", sasl_username_key="u", sasl_password_key="p",
+    profile = ClusterProfile(
+        name="cc",
+        bootstrap_servers="b:9092",
+        auth_mode="sasl_plain",
+        secret_scope="kv",
+        sasl_username_key="u",
+        sasl_password_key="p",
         extra_options={"session.timeout.ms": "45000"},
     )
     assert build_kafka_options(profile, secrets)["kafka.session.timeout.ms"] == "45000"
@@ -87,9 +122,8 @@ def test_credential_that_would_break_the_jaas_string_fails_loudly(secrets):
 
 
 def test_registry_auth_is_independent_of_kafka_auth(secrets):
-    basic = SchemaRegistryProfile(
-        name="sr", url="https://sr", auth_mode="basic",
-        secret_scope="kv-sr", username_key="u", password_key="p",
+    basic = RegistryProfile(
+        name="sr", url="https://sr", auth_mode="basic", secret_scope="kv-sr", username_key="u", password_key="p"
     )
     auth = build_registry_auth(basic, secrets)
     assert auth.auth == ("kv-sr/u/value", "kv-sr/p/value")
@@ -99,9 +133,12 @@ def test_registry_auth_is_independent_of_kafka_auth(secrets):
 
 
 def test_registry_mtls_uses_client_cert_pair(secrets):
-    profile = SchemaRegistryProfile(
-        name="sr", url="https://sr", auth_mode="mtls",
-        client_cert_path="/Volumes/c/s/sr.pem", client_key_path="/Volumes/c/s/sr-key.pem",
+    profile = RegistryProfile(
+        name="sr",
+        url="https://sr",
+        auth_mode="mtls",
+        client_cert_path="/Volumes/c/s/sr.pem",
+        client_key_path="/Volumes/c/s/sr-key.pem",
         ca_bundle_path="/Volumes/c/s/ca.pem",
     )
     auth = build_registry_auth(profile, secrets)
@@ -110,10 +147,20 @@ def test_registry_mtls_uses_client_cert_pair(secrets):
     assert auth.auth is None
 
 
+def test_registry_certs_must_live_on_a_volume_too():
+    with pytest.raises(ConfigError, match="Volume path"):
+        RegistryProfile(
+            name="sr",
+            url="https://sr",
+            auth_mode="mtls",
+            client_cert_path="/tmp/sr.pem",
+            client_key_path="/Volumes/c/s/sr-key.pem",
+        )
+
+
 def test_registry_auth_repr_never_leaks_credentials(secrets):
-    basic = SchemaRegistryProfile(
-        name="sr", url="https://sr", auth_mode="basic",
-        secret_scope="kv", username_key="u", password_key="p",
+    basic = RegistryProfile(
+        name="sr", url="https://sr", auth_mode="basic", secret_scope="kv", username_key="u", password_key="p"
     )
     rendered = repr(build_registry_auth(basic, secrets))
     assert "value" not in rendered
@@ -121,8 +168,9 @@ def test_registry_auth_repr_never_leaks_credentials(secrets):
 
 
 def test_redaction_masks_every_credential_bearing_option(secrets):
+    """The audited/logged options map, over the profile with the most secrets in it."""
     masked = redact(build_kafka_options(MTLS, secrets))
     assert masked["kafka.ssl.keystore.location"] == "/Volumes/c/s/keystore.jks"
     for key, value in masked.items():
         if "password" in key or "jaas" in key:
-            assert value == "***REDACTED***", key
+            assert value == MASK, key

@@ -1,9 +1,11 @@
 # PRIMARY INGESTION - one job definition, every topic.
 #
-# A new topic is added by appending a task to the `tasks` list below with a different
-# topic_key. No new job, no new notebook, no code change.
+# A new source is added by appending a task to the `tasks` list below with a different
+# source-key. No new job, no new notebook, no code change - and this job serves every
+# source TYPE, not only Kafka: the entrypoint dispatches on the `source_type:` declared in
+# that source's own conf/sources/<key>.yaml.
 #
-# THE TASKS ARE DUPLICATED ON PURPOSE (for now). They differ only in task_key and topic-key,
+# THE TASKS ARE DUPLICATED ON PURPOSE (for now). They differ only in task_key and source-key,
 # so YAML anchors would remove the repetition - but bundle schema validation of anchors could
 # not be confirmed here, and a bundle that fails to parse blocks every deployment. The
 # duplication is visible and harmless; a broken bundle is neither. If you do introduce
@@ -42,8 +44,19 @@ resources:
         timezone_id: UTC
         pause_status: UNPAUSED
 
-      # Overlapping runs would contend on the same checkpoint. One at a time, always.
+      # ONE AT A TIME, ALWAYS. Two drivers on one checkpoint corrupt its offsets/
+      # directory, and the recovery from that is the checkpoint-reset procedure - a
+      # deliberate, single-use, incident-scoped bypass of the guard against silent data
+      # loss. Nothing this job could gain from overlapping runs is worth being one step
+      # from that.
       max_concurrent_runs: 1
+
+      # A run that arrives while one is in flight is DROPPED, not queued. Queueing would
+      # start the second run the moment the first finished, which for a checkpointed
+      # streaming source means a second drain of a topic that has just been drained -
+      # billed compute for an empty batch. The next scheduled run covers it.
+      queue:
+        enabled: false
 
       parameters:
         - name: config_root
@@ -79,47 +92,51 @@ resources:
 
         - task_key: vector_patient_events
           environment_key: ingest_env
-          max_retries: 2
-          # Retries are safe: the checkpoint has not advanced past a failed batch, and
-          # Delta's txnAppId/txnVersion markers suppress the duplicate landing write.
+          # Retries are safe by construction: the checkpoint has not advanced past a
+          # failed batch, so a retry re-reads the IDENTICAL offset range, and Delta's
+          # txnAppId/txnVersion markers suppress the duplicate landing write.
+          max_retries: 3
           min_retry_interval_millis: 300000
+          # Stated on every task, never folded into a YAML anchor: a timeout means the run
+          # did not finish in its window, and retrying it immediately usually means it will
+          # not finish in the next one either. These three had already drifted apart once.
           retry_on_timeout: false
           timeout_seconds: 10800
           python_wheel_task:
             package_name: kafka_ingest
-            entry_point: ingest-primary
+            entry_point: run-ingest
             named_parameters:
               config-root: "{{job.parameters.config_root}}"
               environment: "{{job.parameters.environment}}"
-              topic-key: vector_patient_events
+              source-key: vector_patient_events
               job-run-id: "{{job.run_id}}"
 
         - task_key: rcm_claim_status
           environment_key: ingest_env
-          max_retries: 2
+          max_retries: 3
           min_retry_interval_millis: 300000
           retry_on_timeout: false
           timeout_seconds: 10800
           python_wheel_task:
             package_name: kafka_ingest
-            entry_point: ingest-primary
+            entry_point: run-ingest
             named_parameters:
               config-root: "{{job.parameters.config_root}}"
               environment: "{{job.parameters.environment}}"
-              topic-key: rcm_claim_status
+              source-key: rcm_claim_status
               job-run-id: "{{job.run_id}}"
 
         - task_key: antifraud_txn_alerts
           environment_key: ingest_env
-          max_retries: 2
+          max_retries: 3
           min_retry_interval_millis: 300000
           retry_on_timeout: false
           timeout_seconds: 10800
           python_wheel_task:
             package_name: kafka_ingest
-            entry_point: ingest-primary
+            entry_point: run-ingest
             named_parameters:
               config-root: "{{job.parameters.config_root}}"
               environment: "{{job.parameters.environment}}"
-              topic-key: antifraud_txn_alerts
+              source-key: antifraud_txn_alerts
               job-run-id: "{{job.run_id}}"

@@ -21,25 +21,36 @@ resources:
         Re-pull a topic from a given offset or timestamp. Writes into an isolated
         checkpoint keyed by rerun_id. Landing inserts-if-absent, curated upserts.
         Rows are tagged ingested_via='kafka_replay' and replay_run_id=<rerun_id>.
-      max_concurrent_runs: 3   # different topics may be recovered in parallel
+      # ONE AT A TIME. A replay writes into its own checkpoint and its own Delta
+      # transaction identity, so two replays of DIFFERENT sources could in principle run
+      # together - but two runs of this one job cannot tell each other apart, and a second
+      # replay launched against the same source while the first is in flight would share
+      # both. Recovering two sources means running this twice, in sequence.
+      max_concurrent_runs: 1
+
+      # Dropped, not queued: a replay is a deliberate human action with parameters typed
+      # for one incident. A queued second run would fire later with parameters nobody is
+      # still watching.
+      queue:
+        enabled: false
 
       parameters:
-        - name: topic_key
+        - name: source_key
           default: ""
         - name: rerun_id
           # REQUIRED. Isolates BOTH the checkpoint path and the Delta txnAppId, which is
           # what stops a replay colliding with the primary stream's idempotency markers.
           default: ""
-        - name: starting_offsets
+        - name: replay_starting_offsets
           # Spark startingOffsets JSON. -2 = earliest, -1 = latest.
           default: ""
-        - name: starting_timestamp
+        - name: replay_starting_timestamp
           # ISO-8601 (2026-08-11T09:00:00Z) or epoch millis. Mutually exclusive with offsets.
           default: ""
-        - name: ending_offsets
+        - name: replay_ending_offsets
           # Optional. Present => bounded batch replay rather than a streaming replay.
           default: ""
-        - name: ending_timestamp
+        - name: replay_ending_timestamp
           default: ""
         - name: config_root
           default: ${workspace.file_path}/conf
@@ -61,19 +72,24 @@ resources:
           # No automatic retries. A replay is a deliberate human action; if it fails, a
           # human should read the audit rows before it runs again.
           max_retries: 0
+          retry_on_timeout: false
           timeout_seconds: 21600
           python_wheel_task:
             package_name: kafka_ingest
-            entry_point: replay-kafka
+            entry_point: run-replay
             named_parameters:
               config-root: "{{job.parameters.config_root}}"
               environment: "{{job.parameters.environment}}"
-              topic-key: "{{job.parameters.topic_key}}"
+              source-key: "{{job.parameters.source_key}}"
+              # HARDCODED, not a parameter. The two replay shapes fix different problems,
+              # and an operator picking the wrong one during an incident is the mistake
+              # two separate jobs exist to prevent.
+              run-type: kafka_replay
               rerun-id: "{{job.parameters.rerun_id}}"
-              starting-offsets: "{{job.parameters.starting_offsets}}"
-              starting-timestamp: "{{job.parameters.starting_timestamp}}"
-              ending-offsets: "{{job.parameters.ending_offsets}}"
-              ending-timestamp: "{{job.parameters.ending_timestamp}}"
+              replay-starting-offsets: "{{job.parameters.replay_starting_offsets}}"
+              replay-starting-timestamp: "{{job.parameters.replay_starting_timestamp}}"
+              replay-ending-offsets: "{{job.parameters.replay_ending_offsets}}"
+              replay-ending-timestamp: "{{job.parameters.replay_ending_timestamp}}"
               job-run-id: "{{job.run_id}}"
 
     replay_curated:
@@ -82,14 +98,16 @@ resources:
         Re-parse existing landing rows into curated against the current/corrected schema.
         Does not contact Kafka. Curated rows matching (topic, kafka_partition,
         kafka_offset) are updated in place.
-      max_concurrent_runs: 3
+      max_concurrent_runs: 1
+      queue:
+        enabled: false
 
       parameters:
-        - name: topic_key
+        - name: source_key
           default: ""
         - name: rerun_id
           default: ""
-        - name: landing_filter
+        - name: replay_landing_filter
           # REQUIRED. SQL predicate over the LANDING table, e.g.
           #   ingest_date BETWEEN '2026-08-01' AND '2026-08-03'
           #   writer_schema_id = 5513
@@ -115,14 +133,16 @@ resources:
         - task_key: replay_curated
           environment_key: ingest_env
           max_retries: 0
+          retry_on_timeout: false
           timeout_seconds: 21600
           python_wheel_task:
             package_name: kafka_ingest
-            entry_point: replay-curated
+            entry_point: run-replay
             named_parameters:
               config-root: "{{job.parameters.config_root}}"
               environment: "{{job.parameters.environment}}"
-              topic-key: "{{job.parameters.topic_key}}"
+              source-key: "{{job.parameters.source_key}}"
+              run-type: curated_replay
               rerun-id: "{{job.parameters.rerun_id}}"
-              landing-filter: "{{job.parameters.landing_filter}}"
+              replay-landing-filter: "{{job.parameters.replay_landing_filter}}"
               job-run-id: "{{job.run_id}}"

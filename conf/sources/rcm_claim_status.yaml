@@ -5,7 +5,7 @@
 #   1. A DIFFERENT cluster AND registry from the Vector topic - the framework does not
 #      assume one Kafka or one Schema Registry across the platform.
 #   2. reader_schema_mode: pinned_id  - a deliberate CONTRACT FREEZE.
-#   3. on_deser_error: quarantine     - a deliberate deviation from the FAILFAST default.
+#   3. failure_mode: QUARANTINE       - a deliberate deviation from the FAILFAST default.
 #
 # Both deviations override conf/defaults.yaml and are documented inline. Copy the pattern,
 # not the values.
@@ -61,4 +61,4 @@ source:
   # This is ALSO the emergency lever for a stuck stream - see docs/DESIGN.md, scenario 2.
   # DO NOT copy this setting to a new topic just to make it stop failing. Ask first whether
   # the records are genuinely expected.
-  on_deser_error: quarantine
+  failure_mode: QUARANTINE

@@ -297,6 +297,22 @@ Start from [`conf/topics/_TEMPLATE.yaml`](../conf/topics/_TEMPLATE.yaml).
 | `cluster` | Must match a key in `clusters.yaml`. Load fails and lists valid names if wrong. |
 | `registry` | Must match a key in `registries.yaml`. Unrelated namespace to `cluster`. |
 | `subject` | Usually `<topic>-value` (TopicNameStrategy). **Verify** — RecordNameStrategy subjects look completely different. |
+| `min_partitions` | Roughly **4× this topic's partition count**. Confirm the partition count with the producing team at onboarding. The platform default assumes a mid-sized topic; leave it wrong and the topic reads at a fraction of the parallelism it could, silently. Over-setting is cheap — it only ever splits offset ranges, never merges them. |
+
+#### 🔴 MUST READ — the schedule is not a free choice
+
+**The ingestion schedule must be at most ONE THIRD of this topic's Kafka retention, and you
+must confirm that retention with the producing team at onboarding.**
+
+The cadence lives in `resources/job_ingest_primary.yml`, not in this file, which is exactly
+why it gets forgotten. A daily job against a 24-hour retention has no margin at all: one
+failed run, one long weekend, one paused schedule during a change freeze, and records age
+out before they are ever read. What you get then is not an error — with
+`fail_on_data_loss: true` the run fails loudly, which is the good case; with it set to
+`false` the gap is silent.
+
+One third is the working rule because it survives two consecutive missed runs. If the
+producing team cannot state a retention, that is the finding, not a reason to guess.
 
 Table names are **not** set here — see "Table naming" above. `table_name:` is the only
 sanctioned per-topic override; `landing_table` / `curated_table` / `quarantine_table` /
@@ -308,7 +324,7 @@ sanctioned per-topic override; `landing_table` / `curated_table` / `quarantine_t
 |---|---|---|
 | `consumer_group_prefix` | — | Spark manages its own group; this is the identifiable prefix. Replays get a distinct suffix automatically. |
 | `starting_offsets` | `earliest` | **First run only** — the checkpoint wins afterwards. `latest` when history would wrongly re-trigger consumers. |
-| `max_offsets_per_trigger` | *unset* | Splits a backlog into several bounded microbatches under `availableNow`. Omit for low-volume topics. |
+| `max_offsets_per_trigger` | `1000000` | Splits a backlog into several bounded microbatches under `availableNow` — it does **not** cap what a run consumes. It always has a value: unset would mean the entire backlog arrives as ONE microbatch, so a first run on a retained topic becomes a single enormous batch whose failure costs the whole run. |
 | `curated_dedup_keys` | *empty* | Collapses duplicates **within one microbatch**. Business fields are nested, so write them as **`payload.<field>`** — a bare name is rejected with a clear error. |
 | `reader_schema_id` | — | **Required** when `reader_schema_mode: pinned_id`. |
 | `table_properties` | *(inherited from `conf/defaults.yaml`)* | Overrides the whole map for this topic. See "Table properties" above. |
@@ -332,8 +348,7 @@ table and job parameters cannot override it.
 | `trigger` | `availableNow` | Drains what is available then stops — the only trigger giving a scheduled run a natural end. |
 | `fail_on_data_loss` | `true` | `false` means silently accepting gaps; needs explicit domain sign-off. |
 | `reader_schema_mode` | `registry_latest` | The curated **`payload` struct's shape** follows the subject's latest version; each record is still **decoded** with its own writer schema. |
-| `on_deser_error` | `fail` | Loud failure beats silently NULLed fields. Use `quarantine` only for a known, accepted source of bad records. |
-| `include_headers` | `true` | Cheap, and occasionally the only lineage available. |
+| `failure_mode` | `FAILFAST` | Loud failure beats silently NULLed fields. Use `QUARANTINE` only for a known, accepted source of bad records. The two values are the same two the CHECK constraint on `ingest_control.kafka_failure_mode` allows — the column and the setting are one lever. |
 | `curated_dedup_order_by` | `kafka_timestamp` | Change only if the producer sets no timestamp. |
 
 ### Environment-specific overrides for one topic — `environments:`
@@ -416,26 +431,43 @@ onboarded topic works the moment its YAML merges. Duplicate rows **are** an erro
 | Column | Overrides | Typical use |
 |---|---|---|
 | `enabled` | — | `false` = **emergency stop**. Job runs, consumes nothing, writes a `skipped_disabled` audit row so silence is never ambiguous. |
-| `trigger` | YAML `trigger` | Rare. |
-| `max_offsets_per_trigger` | YAML | Lower it to get a huge backlog through in survivable chunks. |
-| `on_deser_error` | YAML | Flip to `quarantine` to get a failing topic moving, then investigate. |
-| `fail_on_data_loss` | YAML | Only with domain sign-off. |
-| `reader_schema_mode` / `reader_schema_id` | YAML | Emergency contract freeze without a PR. |
+| `kafka_max_offsets_per_trigger` | YAML `max_offsets_per_trigger` | Lower it to get a huge backlog through in survivable chunks. |
+| `kafka_failure_mode` | YAML `failure_mode` | Flip to `QUARANTINE` to get a failing topic moving, then investigate. Records keep their raw bytes and are recoverable by a curated replay. |
 
-### Checkpoint-reset override — incident use only
+`fail_on_data_loss`, `reader_schema_mode` and `trigger` are **not** in this table any more.
+They are structural: accepting silent gaps, or changing which schema fixes the payload
+struct's shape, needs domain sign-off and a PR, not a 3am `UPDATE`. **Q14** in
+`sql/03_support_queries.sql` lists every source currently running with data-loss protection
+disabled, precisely because that setting cannot be seen from the control table.
+
+There is no free-form JSON escape hatch for a source-specific setting
+(`docs/build_log/DECISIONS.md` D-01 removed it): a setting either has a dedicated column
+here, or it is not operationally overridable at all.
+
+### Checkpoint-reset override — incident use only, and SINGLE-USE
 
 | Column | Overrides | Typical use |
 |---|---|---|
-| `checkpoint_reset_id` | Bypasses `guard_against_checkpoint_reset` | Set **only** after confirming a topic's primary checkpoint is genuinely gone. See [`RUNBOOK_SUPPORT.md` §5.4a](RUNBOOK_SUPPORT.md#5-4a-restarting-the-primary-after-a-genuine-checkpoint-loss). |
+| `kafka_checkpoint_reset_id` | Bypasses the checkpoint-reset guard | Set **only** after confirming a topic's primary checkpoint is genuinely gone, and **only to an id this source has never used**. See [`RUNBOOK_SUPPORT.md` §5.4a](RUNBOOK_SUPPORT.md#5-4a-restarting-the-primary-after-a-genuine-checkpoint-loss). |
 
 Unlike every other row in this table, this is **not a toggle** — it is a one-way fork of the
-topic's Delta transaction identity (`_make_txn_app_id` in `pipeline.py`), which is what makes
-the restart safe rather than merely permitted: a fresh identity has no prior committed
-versions for Delta to silently skip against. **Never blank it back out once set** — reverting
-to `NULL` reverts to the pre-incident identity and its stale watermark, reproducing the exact
-bug the guard exists to catch. It is rejected outright in topic YAML (`load_structural`
-raises `ConfigError`) — a value there would silently re-apply the bypass on every future
-deploy, with no incident behind it.
+source's Delta transaction identity (`KafkaConfig.txn_app_id`), which is what makes the
+restart safe rather than merely permitted: a fresh identity has no prior committed versions
+for Delta to silently skip against.
+
+**It is single-use.** Reusing an id keeps the identity the last reset created, against which
+Delta already holds high versions, so every write would be skipped as a duplicate and the run
+would report success having ingested nothing — the very failure the guard exists to catch.
+The job **refuses to start** in that state and names the spent id; run **Q6d** in
+`sql/03_support_queries.sql` first rather than finding out from a failed run.
+
+**Never blank it back out once set.** Once the checkpoint exists again the field is inert for
+the guard — it only forks the app id, which must stay forked. Reverting to `NULL` reverts to
+the pre-incident identity and its stale watermark.
+
+It is rejected outright in source YAML — the spec declares it operational-only, so a value
+in Git is a startup error rather than a bypass that silently re-applies on every future
+deploy with no incident behind it.
 
 This does **not** replace a Kafka replay for the data missed during the outage — the two are
 independent; see RUNBOOK_SUPPORT.md §5.4a for the full sequence.
