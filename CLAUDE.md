@@ -60,6 +60,8 @@ stage you were asked to run. Progress and decisions so far are in `docs/build_lo
 - Never report a command as passing if you did not run it.
 
 **Working method**
+- `docs/build_log/DECISIONS.md` holds questions the human has already answered. They are
+  settled -- do not re-open them.
 - Stage reports go in `docs/build_log/STAGE_<n>_REPORT.md`. Read every file there before
   starting work -- each stage runs in a fresh session and that log carries reasoning the code
   does not.
