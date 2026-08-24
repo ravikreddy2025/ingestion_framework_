@@ -190,6 +190,59 @@ environment at deploy time:
 
 ---
 
+## D-07 -- Oracle is ingested via JDBC, not queried via Lakehouse Federation
+
+**Decided:** Oracle data is extracted with the Spark JDBC connector and landed in Databricks.
+Unity Catalog's Lakehouse Federation was considered and rejected.
+
+**Why**, recorded because this is the first question any reviewing architect asks:
+
+1. **This is a lift-and-shift migration.** Transformations that today run on top of Oracle are
+   being moved to Databricks. They need the data present in Databricks, not proxied to Oracle
+   at query time.
+2. **Federation gives no landing copy.** The design point of landing is a retained,
+   time-partitioned mirror of what the source held -- that is what makes replay, audit and
+   historical reprocessing possible. Federation reads live Oracle state and keeps nothing.
+3. **Query-time dependency on Oracle is the thing the migration removes.** Federating would
+   leave every migrated transformation dependent on Oracle availability, Oracle load, and the
+   network between them -- reintroducing the coupling the migration exists to break.
+
+**What would change it:** a use case that only needs to *read* current Oracle state
+interactively, with no transformation, no history and no tolerance for a copy. That is not
+this workload, and if one appears it should use federation directly rather than being added
+to this framework.
+
+**Work this implies:** Stage 7 records this in `docs/DESIGN.md` as a considered-and-rejected
+alternative, with the three reasons above. Stage 4 needs nothing from it beyond proceeding.
+
+---
+
+## D-08 -- BigQuery: approach undecided, build nothing
+
+**Status: OPEN. This is the one entry in this file that is not settled.**
+
+The right approach for BigQuery is not yet known. Do not implement it, and do not let its
+possible shapes influence the framework's design.
+
+**The question to answer before any BigQuery work starts** is not "how do we build it" but
+"which of these is it", because each looks like a different existing source:
+
+| Approach | Looks like | Implication |
+|---|---|---|
+| Direct connector read, bounded query + watermark | **Oracle** | Reuses the cursor/watermark machinery almost exactly |
+| Export to GCS, then read the exported objects | **Files** | Reuses Auto Loader; adds an export-orchestration step this framework does not currently own |
+| Federation | Neither | No ingestion path needed at all -- but D-07's reasoning likely rules it out for the same reasons |
+
+**Also unresolved and worth settling at the same time:** which connector is available on the
+target runtime, whether cross-cloud egress from GCP to Azure is acceptable in cost and
+policy, and who owns the GCP-side credentials.
+
+**Until then:** Stage 6 writes the contract notes and the "adding a source type" section only.
+No `sources/bigquery/` package, no config keys, no register file. The framework's extensibility
+is proved by the grep gate, not by speculatively building a fourth source.
+
+---
+
 ## Work list produced by these decisions
 
 Apply as a short pass on its own branch **before Stage 3**, since all of it is Stage 2
