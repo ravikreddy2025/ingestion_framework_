@@ -506,3 +506,64 @@ code must change -- see "If it fails").
   measuring before indexing is what keeps a zero-length value from throwing rather than
   being classified.
 - **Status:** OPEN
+
+### VB-19 -- Does the rendered `TO_TIMESTAMP` watermark literal compare correctly against the cursor column?
+- **Stage / file:** Stage 4a. `sources/oracle/query.py` `_literal()`.
+- **Why it matters:** Spark's JDBC source takes the extraction query as a parenthesised
+  subquery in `dbtable` and offers no way to bind parameters to it, so a cursor watermark has
+  to be rendered as a SQL literal. `_literal()` renders
+  `TO_TIMESTAMP('2026-08-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')` rather than a bare string,
+  deliberately, so the comparison does not depend on the session's `NLS_DATE_FORMAT` -- which
+  is set by whoever configured the database, not by us. Two things remain unverified: that
+  the format model is accepted as written by the target Oracle version, and how the resulting
+  TIMESTAMP compares against a cursor column of type `DATE` (VB-03's question, arriving here
+  as a predicate rather than as a type mapping). If the comparison silently loses the time
+  component, a cursor run re-reads or skips up to a day of rows every run, and the row count
+  looks plausible either way.
+- **How to check:** In a SQL session against the real source database, with a real cursor
+  column:
+  ```sql
+  SELECT COUNT(*) FROM CLAIMS.CLAIM_HEADER
+   WHERE LAST_UPDATE_DT >  TO_TIMESTAMP('2026-08-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')
+     AND LAST_UPDATE_DT <= TO_TIMESTAMP('2026-08-01 12:00:00', 'YYYY-MM-DD HH24:MI:SS');
+  -- and the same bounds a second way, as a control:
+  SELECT COUNT(*) FROM CLAIMS.CLAIM_HEADER
+   WHERE LAST_UPDATE_DT >  TO_DATE('2026-08-01 00:00:00', 'YYYY-MM-DD HH24:MI:SS')
+     AND LAST_UPDATE_DT <= TO_DATE('2026-08-01 12:00:00', 'YYYY-MM-DD HH24:MI:SS');
+  ```
+  Repeat with a fractional-second literal and the `.FF` model, against a `TIMESTAMP` column.
+- **Expected:** Both statements parse, and the two counts agree. No `ORA-01861` (literal does
+  not match format string) and no implicit-conversion warning.
+- **If it fails:** Change the format model, or the function, in `_literal()` in
+  `sources/oracle/query.py` -- it is the only place a watermark becomes SQL, and every
+  predicate goes through it. If `DATE` columns need `TO_DATE` and `TIMESTAMP` columns need
+  `TO_TIMESTAMP`, that is a third `cursor_type` value, not a branch inside `_literal()`.
+- **Status:** OPEN
+
+### VB-20 -- Is `SYSTIMESTAMP` the right anchor for the dynamic date window, and whose clock is it?
+- **Stage / file:** Stage 4a. `sources/oracle/query.py` `_dynamic_date_filter()`.
+- **Why it matters:** `dynamic_date_filter` renders
+  `<column> >= SYSTIMESTAMP - INTERVAL '7' DAY`, so the window is anchored on the SOURCE
+  database's clock and time zone. That is the intent -- the window is about how much history
+  the source retains -- but it is an assumption about a machine nobody here can see. If the
+  Oracle server runs in a different time zone from the data in that column (a UTC column on a
+  local-time server, or the reverse), every run silently reads a window shifted by the offset:
+  too little data at one end, and no error at either. The failure is worst at the boundary of
+  a small window, where a `PT12H` window could miss half of it.
+- **How to check:**
+  ```sql
+  SELECT SYSTIMESTAMP, SYSDATE, CURRENT_TIMESTAMP, DBTIMEZONE, SESSIONTIMEZONE FROM DUAL;
+  SELECT MIN(LAST_UPDATE_DT), MAX(LAST_UPDATE_DT) FROM CLAIMS.CLAIM_HEADER;
+  SELECT COUNT(*) FROM CLAIMS.CLAIM_HEADER
+   WHERE LAST_UPDATE_DT >= SYSTIMESTAMP - INTERVAL '7' DAY;
+  ```
+  Compare `MAX(LAST_UPDATE_DT)` against `SYSTIMESTAMP`: a gap of a whole number of hours is
+  the signature of a time-zone mismatch rather than of a quiet feed.
+- **Expected:** `SYSTIMESTAMP` and the column's own maximum are within minutes of each other,
+  and the counted window matches what the source team says seven days holds.
+- **If it fails:** The anchor changes in one function, `_dynamic_date_filter()`. Options in
+  order of preference: `CURRENT_TIMESTAMP` (session time zone), or an explicit
+  `SYS_EXTRACT_UTC(SYSTIMESTAMP)` for a UTC-stored column. Do NOT compute the boundary in
+  Python -- that anchors the window on the Databricks driver's clock, which is a third clock
+  and no closer to the data.
+- **Status:** OPEN

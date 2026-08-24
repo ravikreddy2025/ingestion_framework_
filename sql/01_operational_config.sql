@@ -69,6 +69,15 @@ CREATE TABLE IF NOT EXISTS {ops_catalog}.{control_schema}.ingest_control (
   -- silently skip every write again.
   kafka_checkpoint_reset_id     STRING  COMMENT 'Incident use only. Never clear after use.',
 
+  -- ---- oracle-only levers -------------------------------------------------------------
+  -- See sources/oracle/spec.py SOURCE_SPEC.control_columns for which setting each maps to.
+  -- Both change how hard the extract leans on the source database, and NEITHER changes
+  -- which rows it returns - that is what makes them safe to turn without a PR. Everything
+  -- that decides WHAT is extracted (source_schema, source_table, filter_criteria,
+  -- merge_keys, the cursor) is structural and an override of it is ignored.
+  oracle_fetch_size             INT     COMMENT 'JDBC rows per round trip. The driver''s own default is TEN. Lower it when rows are wide.',
+  oracle_num_partitions         INT     COMMENT 'Parallel JDBC connections. Needs a partition_column in the source file; 1 means a serial read.',
+
   -- ---- replay controls, framework-owned ------------------------------------------------
   -- Populated to park a replay intent durably. The replay JOB PARAMETERS win over these,
   -- so an urgent one-off needs no UPDATE first. Clear these once the replay is done.
@@ -83,6 +92,13 @@ CREATE TABLE IF NOT EXISTS {ops_catalog}.{control_schema}.ingest_control (
   CONSTRAINT source_key_present CHECK (source_key IS NOT NULL),
   CONSTRAINT kafka_failure_mode_valid CHECK (
     kafka_failure_mode IS NULL OR kafka_failure_mode IN ('FAILFAST', 'QUARANTINE')
+  ),
+  -- Zero is not "the default" for either: sources/oracle/config.py refuses both, and the
+  -- constraint refuses them here so the UPDATE fails at the keyboard rather than the run
+  -- failing at 3am.
+  CONSTRAINT oracle_tuning_positive CHECK (
+    (oracle_fetch_size     IS NULL OR oracle_fetch_size     > 0) AND
+    (oracle_num_partitions IS NULL OR oracle_num_partitions > 0)
   )
 )
 USING DELTA

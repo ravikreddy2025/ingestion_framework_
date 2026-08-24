@@ -806,3 +806,123 @@ def demo_config_root(tmp_path: Path) -> str:
         encoding="utf-8",
     )
     return str(tmp_path)
+
+
+# --------------------------------------------------------------------------------------
+# Oracle fixtures.
+#
+# The tree is synthetic EXCEPT for conf/defaults/oracle.yaml, which is copied from the
+# repository. That file carries the landing-table pattern, the fetch size and the
+# partition count - the three shipped values whose absence or mis-spelling would be a real
+# outage - so the tests resolve the same layer 1b a job resolves, not a paraphrase of it.
+# --------------------------------------------------------------------------------------
+
+REPO_CONF = Path(__file__).resolve().parent.parent / "conf"
+
+# The source file every Oracle test starts from. `write_oracle_source` replaces or extends
+# it, so a test states only the setting it is about.
+ORACLE_SOURCE_DEFAULTS = {
+    "jdbc_ref": "oracle_demo",
+    "domain": "claims",
+    "source_schema": "CLAIMS",
+    "source_table": "CLAIM_HEADER",
+}
+
+
+@pytest.fixture
+def oracle_config_root(tmp_path: Path) -> str:
+    """A minimal but valid conf/ tree for one Oracle source, with every layer represented."""
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "defaults").mkdir()
+    (tmp_path / "environments").mkdir()
+
+    (tmp_path / "defaults.yaml").write_text(
+        textwrap.dedent(
+            """
+            defaults:
+              audit_table: "{ops_catalog}.audit.ingest_audit"
+              state_table: "{ops_catalog}.ingestion.ingest_state"
+              control_table: "{ops_catalog}.ingestion.ingest_control"
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    # Layer 1b, verbatim from the repository - see the note above.
+    (tmp_path / "defaults" / "oracle.yaml").write_text(
+        (REPO_CONF / "defaults" / "oracle.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    for environment, catalog in (("dev", "cat_dev"), ("prod", "cat_prod")):
+        (tmp_path / "environments" / f"{environment}.yaml").write_text(
+            textwrap.dedent(
+                f"""
+                vars:
+                  catalog: {catalog}
+                  ops_catalog: ops_{environment}
+                defaults: {{}}
+                defaults_by_type: {{}}
+                jdbc:
+                  oracle_demo:
+                    host: "oracle-{environment}.corp.internal"
+                    secret_scope: kv-oracle-{environment}
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+
+    # A register of one. Its CONTENTS are not read until sub-step 4b builds a connection
+    # from them; what 4a asserts is that a jdbc_ref naming something absent from it fails.
+    (tmp_path / "jdbc.yaml").write_text(
+        textwrap.dedent(
+            """
+            jdbc:
+              oracle_demo:
+                port: 1521
+                service_name: CLAIMSPDB
+                username_key: oracle-user
+                password_key: oracle-password
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    write_oracle_source(str(tmp_path))
+    return str(tmp_path)
+
+
+def write_oracle_source(config_root, source_key="demo_oracle", **settings) -> str:
+    """Write conf/sources/<source_key>.yaml with the defaults plus whatever a test states.
+
+    A setting passed as None is REMOVED rather than written as a null, so a test can say
+    "this source does not set merge_keys at all" - which is a different configuration from
+    setting it to an empty list, and the difference is load-bearing.
+    """
+    import yaml
+
+    merged = {**ORACLE_SOURCE_DEFAULTS, **settings}
+    document = {"source_type": "oracle", "source": {k: v for k, v in merged.items() if v is not None}}
+    path = Path(config_root) / "sources" / f"{source_key}.yaml"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    return source_key
+
+
+def make_oracle_cfg(config_root, source_key="demo_oracle", environment="dev", **job_parameters):
+    """The source's own frozen config, resolved through the REAL five-layer path.
+
+    Uses framework/tables.py itself rather than a stand-in: rendering the landing pattern
+    and rejecting a name Unity Catalog cannot hold is part of what is being tested.
+    """
+    from kafka_ingest.framework import tables
+    from kafka_ingest.framework.config import resolve_config
+    from kafka_ingest.sources import oracle
+    from kafka_ingest.sources.oracle import config as oracle_config
+
+    resolved = resolve_config(config_root, source_key, environment, oracle.SOURCE_SPEC, job_parameters=job_parameters)
+    return oracle_config.build(resolved, tables)
+
+
+@pytest.fixture
+def oracle_cfg(oracle_config_root):
+    """The default source: a full extract of CLAIMS.CLAIM_HEADER."""
+    return make_oracle_cfg(oracle_config_root)
