@@ -243,6 +243,59 @@ is proved by the grep gate, not by speculatively building a fourth source.
 
 ---
 
+## D-09 -- Oracle: the four 4a defaults stand, and support can switch full vs delta
+
+**Decided** in review of sub-step 4a. The first four confirm what 4a built; the fifth is
+new work, folded into **sub-step 4b**.
+
+1. **`num_partitions` defaults to 1.** A serial read is the safe wrong answer; a parallel
+   read against a table whose value distribution nobody checked is not. Onboarding asks the
+   source team for the partition column and sets both keys together.
+2. **A cursor source with no `merge_keys` fails the load.** Not a warning. `merge_keys: []`
+   remains the explicit waiver, and it is what a table with no stable key writes down.
+3. **`source_schema` is configured per table**, in that table's own source file. There is no
+   platform-wide default schema, so `conf/defaults/oracle.yaml` ships without one.
+4. **The target is `{catalog}.oracle_<source_schema>.<source_table>`**, the table name
+   unchanged from the source. Lower-cased for Unity Catalog; Oracle's upper-case name is what
+   the audit row's `source_ref` carries.
+
+5. **Support can switch a source between full and delta, and can bound a delta run for a
+   replay, without a deploy.** This is the new work. It makes `incremental_mode`
+   OPERATIONALLY OVERRIDABLE, which is a deliberate exception to the rule that structural
+   fields decide what is extracted -- so the guardrails below are part of the decision, not
+   an implementation detail:
+
+   - New control column **`oracle_incremental_mode`** (`full` | `cursor` | `filter`),
+     declared in `sources/oracle/spec.py` `control_columns` like the two tuning knobs.
+   - Switching to `full` re-extracts everything. It is safe by construction where
+     `merge_keys` are set (the MERGE absorbs the re-read) and DUPLICATES ROWS where they are
+     waived. That asymmetry must be stated on the column comment and in the runbook.
+   - **A full run must not advance the watermark**, and must not clear it: the source has no
+     cursor bounds during that run, so it has nothing trustworthy to advance to. Switching
+     back to `cursor` then re-reads from the last genuine delta boundary, which the MERGE
+     absorbs. This is the same ordering rule as 4c's, applied to a mode change.
+   - **Replay bounds an interval explicitly**: `replay_cursor_start` / `replay_cursor_end`,
+     operational-ONLY (a bound checked into Git would re-apply on every future deploy),
+     carried in the framework-owned `replay_controls` JSON exactly as Kafka's replay bounds
+     are. They replace the stored watermark for that run only.
+   - **A replay never writes `ingest_state`.** Already a 4c invariant; the replay bounds make
+     it reachable, so 4c asserts it against these keys specifically.
+   - Everything else stays structural. `cursor_column`, `cursor_type`, `merge_keys`,
+     `filter_criteria`, `source_schema`, `source_table` are NOT overridable: switching which
+     column is the cursor, or what the filter says, is a change to what the table means and
+     belongs in a PR.
+
+**Work this implies (sub-step 4b, and 4c for the lifecycle):**
+
+| # | Change | Files |
+|---|---|---|
+| 1 | `incremental_mode` into `operational_keys` + `oracle_incremental_mode` control column | `sources/oracle/spec.py`, `sql/01_operational_config.sql`, tests |
+| 2 | `replay_cursor_start` / `replay_cursor_end` as operational-only replay controls | `sources/oracle/spec.py`, `sources/oracle/config.py`, tests |
+| 3 | A full run leaves the watermark alone; a replay never writes state | `sources/oracle/run.py` (4c), tests |
+| 4 | The full-vs-delta switch and its duplicate-row caveat, as an operator procedure | `docs/CONFIGURATION.md`, `docs/RUNBOOK_SUPPORT.md` (4d) |
+
+---
+
 ## Work list produced by these decisions
 
 Apply as a short pass on its own branch **before Stage 3**, since all of it is Stage 2

@@ -198,6 +198,15 @@ sql/01_operational_config.sql   the two oracle_* control columns (D-01)
 
 ## 5. Decisions for the human
 
+**Answered in review, and now settled in `DECISIONS.md` D-09:** 1 (`num_partitions` stays
+1), 3 (a missing `merge_keys` fails the load), plus confirmation that `source_schema` is
+configured per table and that the target is `oracle_<source_schema>.<source_table>`. D-09
+also adds NEW work to 4b: `incremental_mode` becomes operationally overridable so support
+can switch a source between full and delta without a deploy, and a replay can bound the
+cursor interval explicitly. The five entries below are left as written -- they are the
+record of what was decided and why.
+
+
 1. **`num_partitions` ships as 1, not 8.** The stage file's example shows 8. A platform-wide
    default above 1 would make every source that has not yet chosen a `partition_column` a
    config error on day one, and choosing a partition column needs the value distribution
