@@ -228,6 +228,7 @@ def _audit_result(log: RunLog, audit: Any, result: RunResult) -> None:
         position_start=result.position_start,
         position_end=result.position_end,
         source_detail=result.source_detail,
+        pending_work=result.pending_work,
     )
 
 
@@ -240,6 +241,7 @@ _AUDIT_FIELD_NAMES = {
     "position_start": "position_start",
     "position_end": "position_end",
     "source_detail": "source_detail",
+    "pending_work": "pending_work",
     "error_class": "error_class",
     "error_message": "error_message",
 }
