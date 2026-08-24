@@ -485,8 +485,8 @@ def _validate_complete(spec: SourceSpec, settings: Mapping[str, Any], origin: st
 def validate_override_keys(spec: SourceSpec, overrides: Mapping[str, Any], origin: str) -> None:
     """An operational override naming a key no source of this type has is an error.
 
-    Shared with framework/control.py so that a typo in the control table's
-    `source_overrides` JSON produces the same class of error a YAML typo produces.
+    Shared with framework/control.py so that a typo in a control-table column, or in the
+    `replay_controls` JSON, produces the same class of error a YAML typo produces.
     """
     unknown = sorted(set(overrides) - known_keys(spec))
     if unknown:

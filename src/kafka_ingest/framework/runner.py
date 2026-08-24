@@ -32,6 +32,14 @@ from .logs import RunLog
 
 _SOURCES = {"kafka": kafka, "oracle": oracle, "file": file_source}
 
+# Every source type's own control-table columns, keyed by column name -> the source_type
+# that owns it. Built once, here, because this is the one place in framework/ allowed to
+# know source types by name; framework/control.py receives this as plain data and uses it
+# only to catch a column set for the wrong source type (docs/build_log/DECISIONS.md D-01).
+_CONTROL_COLUMN_OWNERS = {
+    column: source_type for source_type, module in _SOURCES.items() for column in module.SOURCE_SPEC.control_columns
+}
+
 # The framework interprets exactly one run_type. Everything else is a source-specific
 # replay shape (a Kafka offset replay, a database window re-extract, a file re-read), which
 # only that source knows how to execute - so the framework carries the string and does not
@@ -166,7 +174,7 @@ def _read_control(
     control_table = structural.get("control_table")
     if not control_table:
         return {}
-    return control_module.read_control(spark, control_table, source_key, spec)
+    return control_module.read_control(spark, control_table, source_key, spec, _CONTROL_COLUMN_OWNERS)
 
 
 def _ensure_framework_tables(spark: Any, cfg: ResolvedConfig) -> None:

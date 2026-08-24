@@ -1,7 +1,7 @@
 """The operational control table: layer 4 of the five-layer configuration.
 
-One row per `source_key` in `{ops_catalog}.ingestion.ingest_control`, editable by the
-support team with no deploy. This module turns that row into the plain override dict
+One row per `source_key` in `{ops_catalog}.{control_schema}.ingest_control`, editable by
+the support team with no deploy. This module turns that row into the plain override dict
 framework/config.py merges over the YAML layers, and does nothing else - it never applies
 an override itself, so there is exactly one place where precedence between layers lives.
 
@@ -13,9 +13,33 @@ THREE RULES, EACH LOAD-BEARING
    this source enabled?", and silently taking either one is how an emergency stop gets
    ignored.
 3. EVERY OVERRIDE IS VALIDATED against that source's SOURCE_SPEC, producing the same
-   unknown-key error a YAML typo produces. Without this, `source_overrides` is a hole in
-   the middle of validation everything else is careful about: `{"btach_limit": 100}` would
-   parse, merge, and do nothing at all.
+   unknown-key error a YAML typo produces. Without this a control column would be a hole in
+   the middle of validation everything else is careful about.
+
+ONE SHARED TABLE, PREFIXED COLUMNS (docs/build_log/DECISIONS.md D-01)
+-----------------------------------------------------------------------
+Every source type's row lives in the SAME physical table, so a column meaning the exact
+same thing for every type stays unprefixed and framework-owned (`enabled`,
+`replay_rerun_id`) - see `_FRAMEWORK_SETTING_COLUMNS` below - while a column specific to
+ONE source type is named `<source_type>_<setting>` and declared on that type's own
+`SOURCE_SPEC.control_columns` (column name -> setting name). This module reads whichever
+columns the CALLER'S spec declares and never hardcodes a source type's name - `runner.py`
+is the one place in framework/ allowed to know those.
+
+There is deliberately no free-form JSON escape hatch for a source-specific setting any
+more (the former `source_overrides` column is gone): a setting either has a dedicated
+column, or it is not operationally overridable from this table. `replay_controls` stays
+JSON and stays unprefixed - it carries structured, incident-scoped replay parameters whose
+SHAPE differs per source type, which is a different job from a standing override.
+
+A COLUMN SET FOR THE WRONG SOURCE TYPE IS AN ERROR, NOT A SILENT IGNORE
+-------------------------------------------------------------------------
+Because the table is shared, a column that belongs to some OTHER source type can be
+populated on this row by mistake - a copy-pasted template, or a typo in the prefix. That is
+caught by `other_control_columns`, a column -> owning-source-type map built once in
+`runner.py` from every known `SOURCE_SPEC.control_columns` and passed in here; a column in
+that map but not in THIS spec's own `control_columns` is rejected rather than silently
+ignored, naming both the column and the mismatch.
 
 STRUCTURAL FIELDS ARE IGNORED, NOT REJECTED
 -------------------------------------------
@@ -26,10 +50,10 @@ run at 3am.
 
 WHAT THIS MODULE READS
 ----------------------
-The named columns in `_SETTING_COLUMNS` below, plus two JSON columns. Everything else on
-the table - notes, attribution, anything a future admin adds - is ignored on purpose. The
-named columns are the levers every source type is expected to share; anything specific to
-one source type goes in `source_overrides` and is validated against that type's spec.
+`_FRAMEWORK_SETTING_COLUMNS` below, the calling source's own `spec.control_columns`, and
+one JSON column (`replay_controls`). Everything else on the table - notes, attribution,
+another source type's columns with nothing set, anything a future admin adds - is ignored
+on purpose.
 
 NO PYSPARK IMPORT: the session arrives as an argument.
 """
@@ -46,28 +70,36 @@ from .contracts import SourceSpec
 
 LOG = logging.getLogger(__name__)
 
-# Control-table column -> the configuration setting it overrides. The two differ only where
-# the column reads better with a prefix on a table a human queries by hand.
-_SETTING_COLUMNS = {
+# Control-table columns that mean the exact same thing for EVERY source type, so they stay
+# unprefixed and the framework - not any one SOURCE_SPEC - owns the mapping. Everything
+# type-specific comes from the calling spec's own `control_columns` instead.
+_FRAMEWORK_SETTING_COLUMNS = {
     "enabled": "enabled",
-    "failure_mode": "failure_mode",
-    "batch_limit": "batch_limit",
-    "checkpoint_reset_id": "checkpoint_reset_id",
     "replay_rerun_id": "rerun_id",
 }
 
-# JSON object columns, merged over the named columns in this order. `replay_controls` is
-# last because it is the most specific: an incident-scoped replay setting should win over a
-# standing override parked in source_overrides.
-_JSON_COLUMNS = ("source_overrides", "replay_controls")
+# JSON object columns, merged over the named columns. Just the one now that
+# `source_overrides` is gone - see the module docstring.
+_JSON_COLUMNS = ("replay_controls",)
 
 # source_key is interpolated into the WHERE clause. It is a deployed YAML filename stem,
 # never free-form input, and this refuses anything that is not.
 _SAFE_KEY = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 
-def read_control(spark: Any, control_table: str, source_key: str, spec: SourceSpec) -> dict[str, Any]:
+def read_control(
+    spark: Any,
+    control_table: str,
+    source_key: str,
+    spec: SourceSpec,
+    other_control_columns: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     """The layer-4 override dict for one source. Empty when there is nothing to override.
+
+    `other_control_columns` is column name -> owning source_type for every OTHER known
+    source type's control columns, so a column belonging to a different type can be caught
+    rather than silently ignored. `runner.py` builds and passes it; a direct caller (a test,
+    a notebook) that omits it simply loses that one check.
 
     Returns plain data. Applying it - including deciding that a structural key is ignored -
     is framework/config.py's job.
@@ -76,8 +108,10 @@ def read_control(spark: Any, control_table: str, source_key: str, spec: SourceSp
     if row is None:
         return {}
     _check_declared_source_type(row, control_table, source_key, spec)
+    _check_no_foreign_control_columns(row, source_key, spec, other_control_columns or {})
 
-    overrides = {setting: row[column] for column, setting in _SETTING_COLUMNS.items() if row.get(column) is not None}
+    setting_columns = {**_FRAMEWORK_SETTING_COLUMNS, **spec.control_columns}
+    overrides = {setting: row[column] for column, setting in setting_columns.items() if row.get(column) is not None}
     for column in _JSON_COLUMNS:
         overrides.update(_parse_json_column(row.get(column), control_table, source_key, column))
 
@@ -126,6 +160,26 @@ def _check_declared_source_type(row: Mapping[str, Any], control_table: str, sour
             f"{control_table} row for source_key '{source_key}' declares source_type "
             f"'{declared}', but that source is a '{spec.source_type}'. Fix the row - the "
             "overrides on it were written for a different kind of source."
+        )
+
+
+def _check_no_foreign_control_columns(
+    row: Mapping[str, Any], source_key: str, spec: SourceSpec, other_control_columns: Mapping[str, str]
+) -> None:
+    """A prefixed column that belongs to a DIFFERENT source type is an error, not a silent
+    ignore (docs/build_log/DECISIONS.md D-01 point 4).
+
+    A column this spec itself declares is exempt even if some other type happens to declare
+    the identical name; everything else in `other_control_columns` is, by construction, a
+    column this row's own source type has no business setting.
+    """
+    for column, owner_type in other_control_columns.items():
+        if column in spec.control_columns or row.get(column) is None:
+            continue
+        raise ConfigError(
+            f"'{column}' is set for source_key '{source_key}', whose source_type is "
+            f"'{spec.source_type}' - '{column}' belongs to source_type '{owner_type}'. Fix "
+            "the row, or clear the column if it was set by mistake."
         )
 
 

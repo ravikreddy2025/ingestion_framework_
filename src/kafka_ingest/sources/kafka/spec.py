@@ -29,4 +29,19 @@ SOURCE_SPEC = SourceSpec(
     # here is what lets that pattern survive configuration load; framework/tables.py
     # renders it when Stage 3 supplies the token.
     target_tokens=frozenset({"topic_table"}),
+    # ALSO not a stub, for the same reason: docs/build_log/DECISIONS.md D-01 settles the
+    # control table's physical column shape for every source type up front, independently
+    # of when each source is actually built. These three columns are Kafka's only
+    # operational levers in the shared `ingest_control` table.
+    #
+    # The setting names on the right are NOT yet in `operational_keys` above - that stays
+    # Stage 3's job, once the ported Kafka source actually reads them. Until then a control
+    # row that sets one of these columns fails loudly with an unknown-key error rather than
+    # doing nothing, which is the correct, honest state for a lever with no implementation
+    # behind it yet.
+    control_columns={
+        "kafka_failure_mode": "failure_mode",
+        "kafka_max_offsets_per_trigger": "max_offsets_per_trigger",
+        "kafka_checkpoint_reset_id": "checkpoint_reset_id",
+    },
 )

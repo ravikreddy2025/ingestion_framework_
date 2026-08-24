@@ -19,7 +19,8 @@ docs/build_log/STAGE_1_REPORT.md for the full argument.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Mapping
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,15 @@ class SourceSpec:
     config.py leaves them alone instead of failing on them, and tables.render() fills them
     at run time. Everything NOT named here still has to resolve at load, which is what
     keeps a genuine typo a startup error. See framework/tables.py.
+
+    control_columns is the same idea applied to the operational control table
+    (framework/control.py): the one shared `ingest_control` table holds every source
+    type's operational levers side by side, so a column meaning ONE thing for every type
+    stays unprefixed and framework-owned (`enabled`, `replay_rerun_id`), while a column
+    specific to this source type is named `<source_type>_<setting>` and declared here,
+    mapping the COLUMN NAME to the SETTING NAME it overrides. framework/control.py reads
+    whatever a spec declares and never names a source type itself - see
+    docs/build_log/DECISIONS.md D-01.
     """
 
     source_type: str
@@ -56,6 +66,7 @@ class SourceSpec:
     mutually_exclusive: tuple[tuple[str, ...], ...]
     layers: tuple[str, ...]  # ("landing",) / ("landing", "curated", "quarantine")
     target_tokens: frozenset[str] = frozenset()
+    control_columns: Mapping[str, str] = MappingProxyType({})
 
 
 @dataclass(frozen=True)
