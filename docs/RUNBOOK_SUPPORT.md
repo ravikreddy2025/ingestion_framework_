@@ -187,7 +187,7 @@ Ask platform/infra to revoke the Kafka consumer credential if it was topic-speci
 The framework will **refuse to start** if landing still holds rows for that topic but the
 checkpoint is gone. That guard is protecting you (see section 5.4). If step 4 did not `DROP
 TABLE` the landing table (retention policy said keep it), you have two options: `DROP TABLE`
-it now, or keep the history and set `checkpoint_reset_id` per 5.4a instead - either way the
+it now, or keep the history and set a fresh `kafka_checkpoint_reset_id` per 5.4a instead - either way the
 re-onboarded stream needs a transaction identity with no prior commits, and those are the two
 ways to get one. Onboarding under a new `topic_key` also works, and needs neither.
 
@@ -286,7 +286,7 @@ complete 5.4a below. Do not treat "the replay finished" as "the incident is clos
 Use this only once you have confirmed the checkpoint is truly gone (not a transient Volume
 access error - see the `NOT the same as the checkpoint being missing` message, which is a
 different, unrelated failure and means the Volume, not the checkpoint, needs attention) and
-you accept starting that topic's primary stream over from batch 0.
+you accept starting that topic's primary stream over from `latest`.
 
 **Do not try to work around this any other way.** In particular, do not delete or truncate
 landing rows to make the guard's row-count check pass - that satisfies the code but not the
@@ -295,27 +295,93 @@ which rows currently exist, indefinitely by default, so a plain restart under th
 identity would silently skip every write below the old watermark. The framework does not
 special-case that combination for you.
 
-```sql
-UPDATE {ops_catalog}.ingestion.ingestion_topic_control
-SET checkpoint_reset_id = 'INC12345',
-    change_reason  = 'INC12345 - primary checkpoint deleted, restarting under a fresh identity',
-    updated_by = current_user(), updated_at = current_timestamp()
-WHERE topic_key = 'rcm_claim_status';
+**THE RESET ID MUST BE ONE THIS SOURCE HAS NEVER USED.** The reset works by forking the
+source's Delta transaction identity, so the restarted stream has no committed versions to
+collide with. Reusing an id keeps the identity the last reset created - against which Delta
+already holds high versions - and every write would be skipped as a duplicate, exactly like
+the failure this whole procedure exists to escape. The job refuses to start in that state
+and names the spent id, but check first rather than finding out from a failed run.
+
+Run these five steps in order. Steps 1 and 5 are the ones people skip, and they are the two
+that decide whether any data is lost.
+
+---
+
+**Step 1 - Record where the stream actually got to. DO THIS FIRST.**
+
+The restart begins at `latest`, so everything between the last committed offset and the
+restart is a gap only this query can tell you the size of. Once the stream restarts, the
+evidence is gone.
+
+Run **Q13** in `sql/03_support_queries.sql` (*"last committed end offset per partition"*),
+substituting your source key and topic name. Paste the result into the incident:
+
+```
+kafka_partition   last_committed_end_offset
+0                 45231
+1                 44870
+2                 45009
 ```
 
-Next scheduled trigger, the job logs `Checkpoint-reset override engaged` and starts a fresh
-stream: new checkpoint, and a new Delta transaction identity that has no committed history to
-collide with. This is what makes the restart safe, not merely permitted.
+**Step 2 - Check the reset id you are about to use has never been used.**
 
-**Never blank `checkpoint_reset_id` back out afterward.** It is not a toggle - once a topic
-has used it, that value IS the topic's transaction identity going forward. Clearing it
-reverts to the original identity, which still carries the pre-incident watermark, and would
-silently reproduce the exact bug this override exists to avoid. Leaving it set is correct and
-permanent; `change_reason` and `updated_at` already give you the audit trail of when and why.
+Run **Q6d**. Any row means that id is spent - use the current incident's id instead.
 
-**Still run the replay (5.5)** for whatever window was missed between the checkpoint loss and
-this restart - the two are independent: this step recovers the *stream*, the replay recovers
-the *data*.
+```sql
+SELECT run_id, rerun_id, min(event_ts) AS first_used, max(event_ts) AS last_used
+FROM {ops_catalog}.{audit_schema}.ingest_audit
+WHERE source_key = 'rcm_claim_status'
+  AND run_type   = 'primary'
+  AND rerun_id IS NOT NULL
+GROUP BY run_id, rerun_id
+ORDER BY last_used DESC;
+```
+
+**Step 3 - Set a FRESH reset id.**
+
+```sql
+UPDATE {ops_catalog}.{control_schema}.ingest_control
+SET kafka_checkpoint_reset_id = 'INC12345',
+    notes                     = 'INC12345 - primary checkpoint lost, restarting under a fresh identity',
+    updated_by = current_user(), updated_at = current_timestamp()
+WHERE source_key = 'rcm_claim_status';
+```
+
+On the next scheduled trigger the job logs `kafka_checkpoint_reset_engaged` and starts a
+fresh stream: a new checkpoint, and a new Delta transaction identity with no committed
+history to collide with. That fork is what makes the restart safe, not merely permitted.
+
+**Step 4 - Backfill the gap with a bounded Kafka replay.**
+
+The primary is now healthy but the window between step 1's offsets and the restart is
+missing. Run the replay job (section 5.5) with `--replay-starting-offsets` set to **exactly
+the offsets from step 1** and an ending bound at the restart point. The replay uses its own
+checkpoint and its own transaction identity, so it cannot collide with the stream you have
+just restarted.
+
+**Step 5 - Clear nothing.**
+
+`kafka_checkpoint_reset_id` is **not** a toggle, and it does not need tidying up. Once the
+checkpoint exists again the field is inert for the guard - it only forks the app id, which
+must STAY forked. Blanking it would revert to the original identity, which still carries the
+pre-incident watermark, and would silently reproduce the exact bug this override exists to
+avoid. Leaving it set is correct and permanent; `notes` and `updated_at` are the audit
+trail of when and why, and Q6d is what stops it being reused.
+
+---
+
+**Checklist**
+
+| | Step | Where |
+|---|---|---|
+| [ ] | Confirmed the checkpoint is genuinely gone, not an unreadable Volume | the error message |
+| [ ] | Recorded the last committed end offset per partition | Q13 |
+| [ ] | Confirmed the reset id has never been used for this source | Q6d |
+| [ ] | Set a fresh `kafka_checkpoint_reset_id` | Q6c |
+| [ ] | Primary ran and logged `kafka_checkpoint_reset_engaged` | driver log, or Q1 |
+| [ ] | Backfilled the gap with a bounded replay from step 1's offsets | 5.5 |
+| [ ] | Verified the gap is closed | 5.7 |
+| [ ] | Left `kafka_checkpoint_reset_id` set | - |
 
 ### 5.5 Kafka replay - data is missing at source
 
@@ -415,7 +481,7 @@ been off - run it after any incident involving Q6b, so nothing gets left off by 
 ## 6. Escalate to the development team when
 
 - Q9 returns duplicate rows - the idempotency mechanism is not behaving as designed
-- The `REFUSING TO RUN` guard fires and `checkpoint_reset_id` (section 5.4a) does not
+- The `REFUSING TO RUN` guard fires and a FRESH `kafka_checkpoint_reset_id` (section 5.4a) does not
   resolve it - a Kafka replay alone never resolves this guard, by design (5.4)
 - The same error recurs after both a re-run and a `quarantine` flip
 - An error mentions `from_avro`, `reader/writer schema`, or a self-check failure
@@ -441,7 +507,7 @@ the Q2 output for that batch, and `error_class` / `error_message`.
 | `reader_schema_mode` / `reader_schema_id` | Checkpoint root |
 | `fail_on_data_loss` *(needs domain sign-off)* | Broker endpoints and secret scopes |
 | All replay parameters | Adding or removing a topic's config file |
-| `checkpoint_reset_id` *(incident use only, section 5.4a)* | Anything in Python |
+| `kafka_checkpoint_reset_id` *(incident use only, single-use, section 5.4a)* | Anything in Python |
 
 The split is deliberate: things with production blast radius get code review, things needed
 at 3am do not.
