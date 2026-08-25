@@ -56,6 +56,22 @@ stages:
           - script: ruff check src tests
             displayName: Lint (ruff)
 
+          # CORE.md section 7 / CLAUDE.md's own grep. Proves adding a source type never
+          # touches framework/ beyond the one _SOURCES dict entry - see
+          # docs/DESIGN.md section 12 "Adding a source type". Grep exits 1 when it finds NO
+          # matches (the passing case, `|| true` absorbs that) and the step fails only when
+          # MATCHES is non-empty - do not "simplify" this to trust grep's own exit code, the
+          # two meanings are opposite here.
+          - script: |
+              MATCHES=$(grep -rInE '\b(kafka|oracle|bigquery|autoloader|cloudFiles|jdbc)\b' src/kafka_ingest/framework/ | grep -v 'runner.py:.*_SOURCES' || true)
+              if [ -n "$MATCHES" ]; then
+                echo "$MATCHES"
+                echo "##[error]framework/ names a source type outside the runner.py _SOURCES dispatch dict. The spine has leaked - see CLAUDE.md's Invariants and docs/DESIGN.md section 12."
+                exit 1
+              fi
+              echo "Source-isolation gate: clean - framework/ names no source type outside _SOURCES."
+            displayName: Source-isolation gate (CORE section 7 grep)
+
           # Report-only for now: the codebase has never been type-checked, so failing the
           # build on it today would block work rather than improve it. Remove the
           # continueOnError once the backlog it reports is empty.
