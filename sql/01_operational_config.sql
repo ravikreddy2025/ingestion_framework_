@@ -91,6 +91,17 @@ CREATE TABLE IF NOT EXISTS {ops_catalog}.{control_schema}.ingest_control (
   -- resumes from the last genuine delta boundary.
   oracle_incremental_mode       STRING  COMMENT 'full | cursor | filter. Recovery lever. Duplicates rows where merge_keys are waived.',
 
+  -- ---- file-only levers (added in Stage 5) ---------------------------------------------
+  -- See sources/file/spec.py SOURCE_SPEC.control_columns for which setting each maps to.
+  -- Mirrors Kafka's three levers exactly (docs/build_log/DECISIONS.md D-01): this source is
+  -- checkpoint-based too, and reuses the SAME reset mechanism rather than a second design.
+  file_failure_mode             STRING  COMMENT 'FAILFAST | QUARANTINE. What a batch holding a rescued (schema-mismatched) row does to the run.',
+  file_max_files_per_trigger    BIGINT  COMMENT 'Caps how many files one microbatch reads.',
+  -- Bypasses the checkpoint-reset guard AND forks the Delta txnAppId, exactly as
+  -- kafka_checkpoint_reset_id does - see that column's comment above for the full warning;
+  -- it applies here verbatim. Do NOT blank it back out once used.
+  file_checkpoint_reset_id      STRING  COMMENT 'Incident use only. Never clear after use.',
+
   -- ---- replay controls, framework-owned ------------------------------------------------
   -- Populated to park a replay intent durably. The replay JOB PARAMETERS win over these,
   -- so an urgent one-off needs no UPDATE first. Clear these once the replay is done.
@@ -105,6 +116,12 @@ CREATE TABLE IF NOT EXISTS {ops_catalog}.{control_schema}.ingest_control (
   CONSTRAINT source_key_present CHECK (source_key IS NOT NULL),
   CONSTRAINT kafka_failure_mode_valid CHECK (
     kafka_failure_mode IS NULL OR kafka_failure_mode IN ('FAILFAST', 'QUARANTINE')
+  ),
+  CONSTRAINT file_failure_mode_valid CHECK (
+    file_failure_mode IS NULL OR file_failure_mode IN ('FAILFAST', 'QUARANTINE')
+  ),
+  CONSTRAINT file_max_files_per_trigger_positive CHECK (
+    file_max_files_per_trigger IS NULL OR file_max_files_per_trigger > 0
   ),
   -- Zero is not "the default" for either: sources/oracle/config.py refuses both, and the
   -- constraint refuses them here so the UPDATE fails at the keyboard rather than the run
