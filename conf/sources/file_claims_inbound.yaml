@@ -1,0 +1,41 @@
+# =====================================================================================
+# claims/inbound/*.csv  ->  {catalog}.files_claims.claims_inbound
+#
+# The worked file-source example: a pipe-delimited CSV drop, a provided schema, and a
+# business date carried in the file name. Copy _TEMPLATE_file.yaml rather than this file
+# when onboarding a new drop zone - the template carries the four questions the landing-
+# zone owner has to answer first.
+#
+# PREREQUISITE, once per environment: `CREATE SCHEMA IF NOT EXISTS <catalog>.files_claims;`
+# The framework creates tables, never schemas (docs/build_log/DECISIONS.md D-02).
+# =====================================================================================
+
+source_type: file
+
+source:
+
+  storage_ref: adls_landing_prod
+  # The account and container come from storage_ref, which differs per environment - this
+  # source file only ever names the path WITHIN it.
+  source_path: "claims/inbound/"
+  path_glob: "*.csv"
+  file_format: csv
+  format_options:
+    header: "true"
+    delimiter: "|"
+    encoding: "UTF-8"
+
+  domain: rcm
+
+  target_schema: files_claims
+  target_table: claims_inbound
+
+  schema_mode: provided
+  schema: "claim_id STRING, member_id STRING, status STRING, submitted_at STRING, amount DECIMAL(18,2)"
+
+  # The producer stamps the business date into the file name rather than a column -
+  # `filename_columns` promotes it rather than leaving it to a downstream parse.
+  filename_columns:
+    business_date: "claims_(\\d{8})\\.csv"
+
+  landing_partition_by: [ingest_date]

@@ -702,3 +702,68 @@ code must change -- see "If it fails").
   and not a tweak to this one. Do NOT widen the interval without merge keys - that trades
   silent loss for silent duplication.
 - **Status:** OPEN
+
+### VB-26 -- Does session-scoped `spark.conf.set()` reliably authenticate `abfss://` reads on the target compute, applied per-run rather than cluster-scoped?
+- **Stage / file:** Stage 5 (Files). `framework/security.py` `apply_session_options()`,
+  `sources/file/security.py` `build_storage_options()`, called from `sources/file/run.py`
+  around the Auto Loader read.
+- **Why it matters:** `kafka.*` options and JDBC properties reach their reader as
+  `.option()` calls scoped to that one read. ADLS Gen2 credentials do not work that way:
+  the Hadoop `abfss://` FileSystem reads `fs.azure.account.key.<account>.dfs.core.windows.net`
+  (and the OAuth equivalents) from the SparkSession's/SparkContext's Hadoop configuration,
+  set with `spark.conf.set()` - which is documented as the mechanism for direct ADLS Gen2
+  access, but has never run against a real Databricks workspace from this codebase. Two
+  things are unverified: whether a value set via `spark.conf.set()` immediately before
+  `readStream.load()` is visible where the FileSystem actually opens the path (the driver
+  for listing, the executors for reading file contents), and whether this is safe at all on
+  SERVERLESS jobs compute, where the session may not be as exclusively-owned as a classic
+  cluster - two file sources scheduled concurrently on shared serverless capacity setting
+  different accounts' credentials into the same session is a collision this mechanism does
+  not defend against.
+- **How to check:**
+  ```python
+  spark.conf.set("fs.azure.account.key.<account>.dfs.core.windows.net", "<key>")
+  df = spark.read.format("csv").load("abfss://<container>@<account>.dfs.core.windows.net/<path>")
+  df.count()
+  ```
+  Run it as a wheel task (not a notebook, which may already carry cluster-scoped
+  credentials that would mask a real failure), and on the serverless environment
+  `resources/job_ingest_file.yml` targets specifically.
+- **Expected:** The read succeeds using only the session-scoped value, with no
+  cluster-level or notebook-level credential already present.
+- **If it fails:** If executors cannot see a driver-set `spark.conf` value, the credential
+  has to be staged differently - a Unity Catalog external location + storage credential
+  (governed access, no key in this codebase at all) is the documented alternative and would
+  replace `sources/file/security.py` entirely rather than patch it. If serverless sessions
+  are shared across concurrent jobs, `apply_session_options()`'s restore-previous-value
+  behaviour needs revisiting - the fix is likely narrowing this source to classic compute
+  with one job per storage account, not a code change here.
+- **Status:** OPEN
+
+### VB-27 -- Does a Delta append reconcile an incoming DataFrame's columns by NAME when its order differs from the target table's?
+- **Stage / file:** Stage 5 (Files). `sources/file/landing.py` `project()` vs
+  `sources/file/tables.py` `landing_columns()`.
+- **Why it matters:** Unlike Kafka's and Oracle's landing projections, this source's
+  projected column order is NOT guaranteed to match its own DDL: `_rescued_data` stays
+  wherever Auto Loader's own read schema places it (typically near the end, but not
+  specified), while the DDL always declares it in `FIXED_METADATA_DDL`'s fixed position -
+  see the note in `tables.py` `landing_columns()`. Delta is documented as reconciling an
+  append by column NAME rather than position, which is why this was not written as an
+  explicit `.select()` in the configured DDL order - but every other landing table in this
+  framework happens to be order-matched by construction, so this project has never actually
+  exercised Delta's append-by-name path. If it turns out to be positional instead, every
+  row after the first would land shifted into the wrong columns with no error at all.
+- **How to check:**
+  ```python
+  # create a table with columns (a, b, c), then append a DataFrame with columns (c, a, b)
+  spark.sql("CREATE TABLE scratch.order_probe (a STRING, b STRING, c STRING) USING DELTA")
+  df = spark.createDataFrame([("C", "A", "B")], "c STRING, a STRING, b STRING")
+  df.write.format("delta").mode("append").saveAsTable("scratch.order_probe")
+  spark.table("scratch.order_probe").show()  # does 'A' land in column a, or in column c?
+  ```
+- **Expected:** `A` lands in `a`, `B` in `b`, `C` in `c` - i.e. reconciliation by name.
+- **If it fails:** `sources/file/landing.py` `project()` must end with an explicit
+  `.select()` naming every column in the exact order `tables.landing_columns()` declares,
+  the same discipline Kafka's and Oracle's projections already follow (their tests assert
+  the order matches for exactly this reason).
+- **Status:** OPEN

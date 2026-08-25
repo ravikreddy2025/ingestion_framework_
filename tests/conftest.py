@@ -1148,3 +1148,149 @@ class FakeJdbcSpark(FakeSpark):
 
     def options_for(self, index):
         return self.reads[index].options_used
+
+
+# --------------------------------------------------------------------------------------
+# File fixtures.
+#
+# The tree is synthetic EXCEPT for conf/defaults/file.yaml, which is copied from the
+# repository - the same reasoning as the Oracle fixtures: that file carries the shipped
+# `max_files_per_trigger`, `schema_mode`, checkpoint/schema-location roots and so on, so a
+# test resolves the same layer 1b a job resolves rather than a paraphrase of it.
+# --------------------------------------------------------------------------------------
+
+FILE_SOURCE_DEFAULTS = {
+    "storage_ref": "adls_demo",
+    "domain": "claims",
+    "source_path": "claims/inbound/",
+    "file_format": "csv",
+    "target_schema": "files_claims",
+    "target_table": "claims_inbound",
+    "schema_mode": "provided",
+    "schema": "claim_id STRING, amount DECIMAL(18,2)",
+}
+
+
+@pytest.fixture
+def file_config_root(tmp_path: Path) -> str:
+    """A minimal but valid conf/ tree for one file source, with every layer represented."""
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "defaults").mkdir()
+    (tmp_path / "environments").mkdir()
+
+    (tmp_path / "defaults.yaml").write_text(
+        textwrap.dedent(
+            """
+            defaults:
+              audit_table: "{ops_catalog}.audit.ingest_audit"
+              state_table: "{ops_catalog}.ingestion.ingest_state"
+              control_table: "{ops_catalog}.ingestion.ingest_control"
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    # Layer 1b, verbatim from the repository - see the note above.
+    (tmp_path / "defaults" / "file.yaml").write_text(
+        (REPO_CONF / "defaults" / "file.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    for environment, catalog in (("dev", "cat_dev"), ("prod", "cat_prod")):
+        (tmp_path / "environments" / f"{environment}.yaml").write_text(
+            textwrap.dedent(
+                f"""
+                vars:
+                  catalog: {catalog}
+                  ops_catalog: ops_{environment}
+                defaults: {{}}
+                defaults_by_type: {{}}
+                storage:
+                  adls_demo:
+                    account: "acct-{environment}"
+                    container: "landing"
+                    secret_scope: kv-adls-{environment}
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+
+    # A register of one. Its CONTENTS are not read until run() builds a connection from
+    # them; what the config tests assert is that a storage_ref naming something absent from
+    # it fails.
+    (tmp_path / "storage.yaml").write_text(
+        textwrap.dedent(
+            """
+            storage:
+              adls_demo:
+                auth_mode: account_key
+                account_key_secret_key: adls-demo-key
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    write_file_source(str(tmp_path))
+    return str(tmp_path)
+
+
+def write_file_source(config_root, source_key="demo_file", **settings) -> str:
+    """Write conf/sources/<source_key>.yaml with the defaults plus whatever a test states.
+
+    A setting passed as None is REMOVED rather than written as a null - see
+    write_oracle_source's docstring for why that distinction is load-bearing.
+    """
+    import yaml
+
+    merged = {**FILE_SOURCE_DEFAULTS, **settings}
+    document = {"source_type": "file", "source": {k: v for k, v in merged.items() if v is not None}}
+    path = Path(config_root) / "sources" / f"{source_key}.yaml"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    return source_key
+
+
+def make_file_cfg(config_root, source_key="demo_file", environment="dev", run_type="primary", **job_parameters):
+    """The source's own frozen config, resolved through the REAL five-layer path."""
+    from kafka_ingest.framework import tables
+    from kafka_ingest.framework.config import resolve_config
+    from kafka_ingest.sources import file as file_source
+    from kafka_ingest.sources.file import config as file_config_module
+
+    resolved = resolve_config(
+        config_root, source_key, environment, file_source.SOURCE_SPEC, job_parameters=job_parameters
+    )
+    return file_config_module.build(resolved, run_type, tables)
+
+
+def make_file_ctx(
+    config_root,
+    source_key="demo_file",
+    environment="dev",
+    run_type="primary",
+    spark=None,
+    existing_tables=(),
+    **job_parameters,
+):
+    """A RunContext of stand-ins, built through the real config resolution path."""
+    from kafka_ingest.framework.config import resolve_config
+    from kafka_ingest.framework.contracts import RunContext
+    from kafka_ingest.sources import file as file_source
+
+    cfg = resolve_config(config_root, source_key, environment, file_source.SOURCE_SPEC, job_parameters=job_parameters)
+    return RunContext(
+        cfg=cfg,
+        spark=spark if spark is not None else FakeSpark(existing_tables=existing_tables),
+        audit=RecordingAudit(run_type=run_type),
+        state=None,
+        writers=RecordingWriters(),
+        tables=RecordingTables(existing_tables),
+        log=RecordingLog(),
+        run_id=f"{source_key}-{run_type}-test",
+        run_type=run_type,
+        run_sequence=1,
+    )
+
+
+@pytest.fixture
+def file_cfg(file_config_root):
+    """The default source: a provided-schema CSV drop with no filename_columns."""
+    return make_file_cfg(file_config_root)

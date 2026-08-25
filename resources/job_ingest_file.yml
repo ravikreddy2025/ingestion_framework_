@@ -1,0 +1,91 @@
+# FILE INGESTION - one job definition, every file source.
+#
+# A new drop zone is added by appending a task below with a different source-key. No new
+# job, no code change. Separate from resources/job_ingest_primary.yml and
+# resources/job_ingest_oracle.yml for the same operational reasons those two are separate
+# from each other:
+#
+#   * the SCHEDULE is different in kind again - a landing zone's cadence is bounded by how
+#     often the producer actually drops files, negotiated with whoever owns it.
+#   * "pause all file ingestion" is a thing an operator asks for when a landing zone is
+#     misbehaving, and it should be one pause_status, not a per-task edit in a job that also
+#     serves Kafka or Oracle.
+#
+# THE TASKS ARE DUPLICATED ON PURPOSE, for the same reason as job_ingest_primary.yml and
+# job_ingest_oracle.yml: YAML anchors would remove the repetition, but bundle schema
+# validation of anchors could not be confirmed here (VB-13) and a bundle that fails to
+# parse blocks every deployment.
+#
+# SERVERLESS COMPUTE DEPENDENCY
+# -----------------------------
+# The environment below targets serverless jobs compute, which needs egress to every ADLS
+# account in conf/storage.yaml via Network Connectivity Configuration (VB-12). If
+# serverless cannot reach the account, swap `environment_key: file_env` for a
+# `job_cluster_key` and configure it there.
+
+resources:
+  jobs:
+
+    ingest_file:
+      name: "[${bundle.target}] File Ingest"
+      description: >-
+        Scheduled Auto Loader (cloudFiles) ingestion of ADLS drop zones into landing.
+        Behaviour per source is controlled by the control table named in
+        conf/defaults.yaml; structure by conf/ in Git. Auto Loader's own checkpoint tracks
+        which files have been processed - see docs/DESIGN.md for the checkpoint-reset
+        guard this source shares with Kafka's.
+
+      schedule:
+        # 04:00 UTC daily, after both the Kafka and Oracle windows so the three do not
+        # compete for the same serverless capacity.
+        quartz_cron_expression: "0 0 4 * * ?"
+        timezone_id: UTC
+        pause_status: UNPAUSED
+
+      # ONE AT A TIME, ALWAYS. Two drivers on one Auto Loader checkpoint corrupt its state,
+      # the same reason Kafka's primary stream is single-flight.
+      max_concurrent_runs: 1
+
+      # A run that arrives while one is in flight is DROPPED, not queued - the next
+      # scheduled run drains whatever is still there, exactly as Kafka's availableNow does.
+      queue:
+        enabled: false
+
+      parameters:
+        - name: config_root
+          default: ${workspace.file_path}/conf
+        - name: environment
+          default: ${bundle.target}
+
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+
+      environments:
+        - environment_key: file_env
+          spec:
+            client: "3"
+            dependencies:
+              - ./dist/*.whl
+
+      tasks:
+
+        - task_key: file_claims_inbound
+          environment_key: file_env
+          # Retries are safe by construction: Structured Streaming re-executes a failed
+          # batch over the identical file set (the checkpoint records offsets before
+          # foreachBatch runs, and commits only after it returns cleanly), and Delta's
+          # txnAppId/txnVersion markers suppress the duplicate landing write - the same
+          # mechanics as Kafka's, see docs/DESIGN.md.
+          max_retries: 3
+          min_retry_interval_millis: 300000
+          retry_on_timeout: false
+          timeout_seconds: 10800
+          python_wheel_task:
+            package_name: kafka_ingest
+            entry_point: run-ingest
+            named_parameters:
+              config-root: "{{job.parameters.config_root}}"
+              environment: "{{job.parameters.environment}}"
+              source-key: file_claims_inbound
+              job-run-id: "{{job.run_id}}"

@@ -87,3 +87,18 @@ jdbc:
     host: "oracle-billing-dev01.corp.internal"
     sid: BILLDEV
     secret_scope: kv-oracle-dev
+
+# Overrides named profiles in conf/storage.yaml. The profile must already exist there -
+# conf/storage.yaml stays the single register of which storage accounts we read from.
+# Account, container and secret scope differ per environment; the auth mode and the secret
+# KEY NAMES do not, so they stay in the register.
+storage:
+  adls_landing_prod:
+    account: "adlsclaimsdev01"
+    container: "landing"
+    secret_scope: kv-adls-dev
+
+  adls_claims_service_principal:
+    account: "adlsclaimsdev01"
+    container: "landing"
+    secret_scope: kv-adls-dev
