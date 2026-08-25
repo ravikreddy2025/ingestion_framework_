@@ -5,21 +5,61 @@
 # Read only when a source file declares `source_type: file`, so nothing here is ever
 # applied to a Kafka or Oracle source.
 #
-# EMPTY UNTIL STAGE 5. Deliberately: a key written here before the file source reads it is
-# a key that silently does nothing, which is the single worst outcome this project can
-# produce. Stage 5 fills it in alongside sources/file/spec.py, and the two must agree - a
-# default for a key the spec does not list is rejected as an unknown key.
-#
-# What is expected to land here (from CORE section 11 - none of it is settled, and none of
-# it is written as config until the code that reads it exists):
-#   * the schemaLocation root - a checkpoint-like resource with its own lifecycle
-#   * the landing target-name pattern
-#   * rescued-data and file-metadata column behaviour, which varies by format - see VB-06
-#
 # PLACEHOLDERS
 #   {catalog}      and any other key under `vars:` in the environment file
 #   {source_key}   the source's config filename without .yaml
 #   {domain}       the source's `domain:` value
+#   {target_schema} / {target_table}   deferred - only sources/file/config.py fills these,
+#                   from the source's own `target_schema:` / `target_table:` settings. See
+#                   SOURCE_SPEC.target_tokens in sources/file/spec.py.
 # =====================================================================================
 
-defaults: {}
+defaults:
+
+  # --- WHERE THIS LANDS -----------------------------------------------------------------
+  # {catalog} never appears in a source file (CORE section 6) - only this pattern does, and
+  # only sources/file/config.py fills {target_schema} / {target_table}, exactly as
+  # conf/defaults/oracle.yaml fills {source_schema} / {source_table}.
+  landing_table: "{catalog}.{target_schema}.{target_table}"
+  landing_partition_by: [ingest_date]
+
+  # --- HOW MUCH TO EXTRACT PER MICROBATCH ------------------------------------------------
+  # Unset would mean one unbounded microbatch on the FIRST run over a landing zone with
+  # years of files - a first run's failure would then cost the whole run, the exact hazard
+  # Kafka's max_offsets_per_trigger guards against.
+  max_files_per_trigger: 1000
+
+  # --- SCHEMA -----------------------------------------------------------------------------
+  # provided | hints | infer. PROVIDED IS THE DEFAULT DELIBERATELY: `infer` is convenient
+  # in dev and a source of SILENT TYPE DRIFT in prod - a producer adding a column, or a
+  # numeric column that happens to look like a date in one file's sample, changes the
+  # inferred schema with no review and no error. A source overrides this explicitly with
+  # `schema: "..."` once it knows its own shape. See docs/CONFIGURATION.md for the full
+  # explanation, not only this comment.
+  schema_mode: provided
+
+  # --- READING THE FILES ------------------------------------------------------------------
+  path_glob: "*"
+
+  # Auto Loader directory-listing vs file-notification mode (VB-07). LISTING IS THE
+  # DEFAULT: it needs no Event Grid / Queue Storage provisioning, which notification mode
+  # does and which this tenancy may not have permission to create. Listing costs more as
+  # the file count under a path grows - see docs/CONFIGURATION.md before switching a
+  # high-volume source to it.
+  listing_mode: directory
+
+  # FAILFAST | QUARANTINE. What a batch containing a rescued row (one that did not fit the
+  # configured schema) does to the RUN - see sources/file/run.py. FAILFAST is the default
+  # for the same reason Kafka's is: a support engineer should decide to accept malformed
+  # rows, not have them land silently by default.
+  failure_mode: FAILFAST
+
+  # --- CHECKPOINT AND SCHEMA-LOCATION ROOTS -----------------------------------------------
+  # Same pattern as Kafka's checkpoint_root (conf/defaults/kafka.yaml): a Volume path, one
+  # subdirectory per source_key, enforced Volume-backed in sources/file/config.py.
+  #
+  # cloudFiles.schemaLocation is a SEPARATE checkpoint-like resource from the stream
+  # checkpoint, with its own lifecycle (STAGE_5 brief) - see the note in
+  # sources/file/run.py's module docstring for how the checkpoint-reset guard treats it.
+  checkpoint_root: "/Volumes/{catalog}/ingestion/checkpoints/file"
+  schema_location_root: "/Volumes/{catalog}/ingestion/schemas/file"

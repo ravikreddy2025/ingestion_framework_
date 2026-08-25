@@ -69,3 +69,15 @@ jdbc:
     host: "oracle-billing01.corp.internal"
     sid: BILLPRD
     secret_scope: kv-oracle-prod
+
+# Overrides named profiles in conf/storage.yaml - see conf/environments/dev.yaml.
+storage:
+  adls_landing_prod:
+    account: "adlsclaims01"
+    container: "landing"
+    secret_scope: kv-adls-prod
+
+  adls_claims_service_principal:
+    account: "adlsclaims01"
+    container: "landing"
+    secret_scope: kv-adls-prod

@@ -1,0 +1,113 @@
+# =====================================================================================
+# FILE SOURCE ONBOARDING TEMPLATE
+#
+# 1. Copy this file to conf/sources/<your_source_key>.yaml
+#      The FILENAME becomes the source_key: it keys the operational control table, keys
+#      this source's checkpoint and schema-location paths, and appears in every audit row.
+#      lower_snake_case, and conventionally <domain>_<what>, e.g. claims_inbound_files.
+# 2. Replace the <ANGLE_BRACKET> placeholders.
+# 3. ASK WHOEVER OWNS THE LANDING ZONE THESE QUESTIONS BEFORE YOU FILL IN ANYTHING ELSE:
+#
+#      a. WHAT IS THE FULL SCHEMA of the files, and does the producer ever add a column
+#         without warning? `schema_mode: provided` (the default) is what this framework
+#         ships with precisely because `infer` accepts that silently - see the note on
+#         `schema_mode` below.
+#      b. ARE FILES EVER REWRITTEN IN PLACE rather than written once under a new name? Auto
+#         Loader tracks files it has already seen; a file rewritten under the SAME path
+#         after being processed is not re-read. See docs/DESIGN.md's file failure-scenario
+#         table.
+#      c. DOES THE FILE NAME CARRY DATA (a business date, a batch id) that belongs in a
+#         column? That is what `filename_columns` is for - do not parse it out downstream.
+#      d. HOW MANY FILES LAND PER DAY, roughly? It decides whether `listing_mode: directory`
+#         (the default, needs no extra infrastructure) is affordable, or whether
+#         `notification` is worth the Event Grid / Queue Storage provisioning it needs -
+#         see VB-07.
+#
+# 4. CREATE THE TARGET SCHEMA FIRST. The framework creates TABLES, never SCHEMAS
+#    (docs/build_log/DECISIONS.md D-02): `CREATE SCHEMA IF NOT EXISTS <catalog>.<target_schema>;`
+#    must be run, in EVERY environment, before the first run.
+# 5. Confirm the storage_ref profile exists in conf/storage.yaml AND has an account,
+#    container and secret scope in every conf/environments/<env>.yaml.
+# 6. Add a task to resources/job_ingest_file.yml with the new source-key.
+# 7. Run `pytest tests/test_shipped_config.py` - it validates every source in EVERY
+#    environment, so it catches a value that works in prod but breaks in dev.
+# 8. Open a PR. No Python changes are needed, ever, to add a file source.
+#
+# WHAT YOU DO **NOT** PUT HERE
+#   Catalogs, account URLs, secrets, secret scopes. Those live in conf/defaults/file.yaml
+#   (common), conf/storage.yaml (the storage register) and conf/environments/<env>.yaml (per
+#   environment). Hardcoding any of them here silently breaks the other environments.
+#
+# This file is inert: source_key "_TEMPLATE_file" is never scheduled, and the config
+# validator skips underscore-prefixed files.
+# =====================================================================================
+
+source_type: file
+
+source:
+
+  # -------------------------------------------------------------------- MUST CHANGE --
+  storage_ref: <storage_profile_name>
+
+  # The path WITHIN the container only - never a full URL. The account and container come
+  # from storage_ref, which is what lets the same source file resolve to a different
+  # account per environment.
+  source_path: "<CHANGE_ME_path>/"
+
+  file_format: <csv|json|parquet|avro>
+
+  domain: <vector|rcm|gma|antifraud|dwh_pes>
+
+  # Where this lands. A file source has no natural source-side schema/table the way Oracle
+  # does, so these are your own choice rather than a derivation - question (a) above should
+  # already have settled what belongs in this table.
+  target_schema: <files_target_schema>
+  target_table: <target_table>
+
+  # -------------------------------------------------------------------------- MUST-READ --
+  # `provided` (the platform default - see conf/defaults/file.yaml) needs `schema:` below.
+  # `infer` is convenient in dev and a source of SILENT TYPE DRIFT in prod: a new column, or
+  # a numeric column that happens to look like a date in one file's sample, changes the
+  # inferred schema with no review and no error anywhere. Set `provided` before onboarding
+  # anything that reaches production.
+  # schema_mode: provided
+  # schema: "<CHANGE_ME_column1> <type1>, <CHANGE_ME_column2> <type2>, ..."
+
+  # ------------------------------------------------------- OPTIONAL - omit to inherit --
+  # Every line below has a platform default. Delete what you do not need.
+
+  # Only files matching this glob, relative to source_path. "*" (the default) means every
+  # file - narrow it if the same directory holds more than one file shape.
+  # path_glob: "*.csv"
+
+  # Reader options SPECIFIC TO file_format. An unknown key for the configured format is
+  # rejected - see docs/CONFIGURATION.md for the known set per format.
+  # format_options:
+  #   header: "true"
+  #   delimiter: "|"
+  #   encoding: "UTF-8"
+
+  # Question (c) above. Each value is a regex with EXACTLY ONE capture group, matched
+  # against the full file path - checked at config load, not at the first file that reaches
+  # it.
+  # filename_columns:
+  #   business_date: "claims_(\\d{8})\\.csv"
+
+  # Delta partitioning for landing. ingest_date - the date this framework WROTE the row,
+  # not a date in the data - is the platform default and bounds partition growth.
+  # landing_partition_by: [ingest_date]
+
+  # Question (d) above. directory (the default) needs no extra infrastructure; notification
+  # needs Event Grid + Queue Storage provisioning this tenancy may not permit - see VB-07.
+  # listing_mode: directory
+
+  # How many files one microbatch reads. Lower it to get a huge backlog through in
+  # survivable chunks; the platform default (1000) is what stops an unbounded FIRST run
+  # from becoming one enormous batch.
+  # max_files_per_trigger: 1000
+
+  # FAILFAST | QUARANTINE. What happens to a batch containing a row that did not fit the
+  # configured schema (Auto Loader's rescued-data column is non-NULL for it). FAILFAST (the
+  # default) refuses the batch; QUARANTINE lands it and only reports the count - flip it via
+  # ingest_control.file_failure_mode to unblock a stuck source, no deploy required.
+  # failure_mode: FAILFAST
