@@ -6,8 +6,10 @@ with them - which is also exactly the part that has to be right. Whether Delta h
 txnAppId is Delta's problem; whether this code SUPPLIES one is ours.
 
 THE THREE THINGS THIS FILE EXISTS FOR
-  * the checkpoint-reset guard, including the reuse refusal - the state that would report
-    success and ingest nothing
+  * that this source wires its own checkpoint path, landing table and control column into
+    the shared checkpoint-reset guard (framework/checkpoint.py) correctly - the guard's own
+    behaviour matrix, including the reuse refusal, is tested once in
+    tests/test_framework_checkpoint.py
   * append vs MERGE per layer, and the partition predicate each MERGE carries
   * that a failure is audited against the layer it happened in, and the cache is released
 """
@@ -32,17 +34,22 @@ AUDIT_TABLE = "cat_dev.audit.ingest_audit"
 
 
 # --------------------------------------------------------------------------------------
-# The startup guard
+# The startup guard - the full behaviour matrix lives in tests/test_framework_checkpoint.py
+# now that the guard itself is a shared framework function. What is left here is WIRING:
+# does this source's run() feed ITS OWN checkpoint path, landing table, reset id and
+# control column into that shared guard correctly.
 # --------------------------------------------------------------------------------------
 
 
 @pytest.fixture
-def checkpoint(tmp_path, monkeypatch):
+def checkpoint(monkeypatch):
     """Control whether the guard believes the checkpoint exists.
 
-    Patches the probe rather than creating directories: the real one is an os.stat() on a
-    Volume path, and what matters is which of its three answers the guard acts on.
+    Patches the shared probe in framework/checkpoint.py rather than creating directories:
+    the real one is an os.stat() on a Volume path, and what matters here is only that this
+    source's run() reaches the shared guard at all.
     """
+    from kafka_ingest.framework import checkpoint as checkpoint_guard
 
     def _set(exists=True, error=None):
         def probe(_path):
@@ -50,7 +57,7 @@ def checkpoint(tmp_path, monkeypatch):
                 raise error
             return exists
 
-        monkeypatch.setattr(kafka_run, "_checkpoint_offsets_exist", probe)
+        monkeypatch.setattr(checkpoint_guard, "_checkpoint_offsets_exist", probe)
 
     return _set
 
@@ -66,171 +73,33 @@ def _ctx(config_root, existing_tables=(), landing_rows=(), audit_rows=(), **kwar
     return make_kafka_ctx(config_root, spark=spark, existing_tables=existing_tables, **kwargs)
 
 
-def _guard(ctx):
-    from kafka_ingest.sources.kafka import config as kafka_config
-
-    cfg = kafka_config.build(ctx.cfg, ctx.run_type, ctx.tables)
-    kafka_run._guard_against_checkpoint_reset(ctx, cfg)
-
-
-def test_the_guard_allows_a_run_whose_checkpoint_is_intact(config_root, checkpoint):
-    checkpoint(exists=True)
-    _guard(_ctx(config_root, existing_tables=("cat_dev.landing.demo_events_v1",), landing_rows=[{"topic": "x"}]))
-
-
-def test_the_guard_allows_a_genuine_first_run(config_root, checkpoint):
-    """No checkpoint AND no landing rows for this topic is what a first run looks like."""
-    checkpoint(exists=False)
-    _guard(_ctx(config_root, existing_tables=("cat_dev.landing.demo_events_v1",), landing_rows=[]))
-
-
-def test_the_guard_allows_a_run_when_the_landing_table_does_not_exist_yet(config_root, checkpoint):
-    checkpoint(exists=False)
-    _guard(_ctx(config_root))
-
-
 def test_the_guard_refuses_when_the_checkpoint_vanished_but_data_exists(config_root, checkpoint):
-    """The state that would report success and ingest nothing: batch ids restart at 0 and
-    Delta skips every write as a duplicate."""
+    """The refusal must name THIS source's own control column, not some other source's -
+    proof that kafka's cfg.landing_table and control column reach the shared guard."""
     checkpoint(exists=False)
     ctx = _ctx(config_root, existing_tables=("cat_dev.landing.demo_events_v1",), landing_rows=[{"topic": "x"}])
     with pytest.raises(RuntimeError) as exc:
-        _guard(ctx)
+        kafka_run.run(ctx, secrets=object())
     message = str(exc.value)
     assert "REFUSING TO RUN" in message
-    assert "skip every write" in message.lower() or "SKIP every write" in message
-    # It must name the alternative, or the next move is to delete landing rows to get past it.
-    assert "replay" in message and "kafka_checkpoint_reset_id" in message
+    assert "kafka_checkpoint_reset_id" in message
 
 
-def test_the_guard_never_blocks_a_replay(config_root, checkpoint):
+def test_the_guard_never_blocks_a_replay(config_root, checkpoint, monkeypatch):
     """A replay has its own checkpoint and its own app id by construction, so neither
-    collision is possible."""
+    collision is possible - proof that kafka's cfg.is_replay reaches the shared guard."""
     checkpoint(exists=False)
-    _guard(
-        _ctx(
-            config_root,
-            existing_tables=("cat_dev.landing.demo_events_v1",),
-            landing_rows=[{"topic": "x"}],
-            run_type=RUN_TYPE_KAFKA_REPLAY,
-            rerun_id="INC1",
-            replay_starting_offsets=OFFSETS,
-        )
-    )
-
-
-def test_an_unreadable_checkpoint_volume_is_not_treated_as_a_missing_checkpoint(config_root, monkeypatch, tmp_path):
-    """os.path.exists() would swallow this and return False, making an unreachable Volume
-    indistinguishable from a deleted checkpoint - and the guard turns "absent" into a hard
-    refusal, so a false absent blocks a healthy stream."""
-    import os
-
-    def deny(_path):
-        raise PermissionError("no access to the Volume from this compute profile")
-
-    monkeypatch.setattr(os, "stat", deny)
-    with pytest.raises(RuntimeError, match="NOT the same as the checkpoint being missing"):
-        kafka_run._checkpoint_offsets_exist(str(tmp_path))
-
-
-# --------------------------------------------------------------------------------------
-# checkpoint_reset_id: single-use
-# --------------------------------------------------------------------------------------
-
-
-def test_a_fresh_reset_id_lets_the_guard_through_and_says_so_loudly(config_root, checkpoint):
-    checkpoint(exists=False)
-    ctx = _ctx(
-        config_root,
-        existing_tables=("cat_dev.landing.demo_events_v1", AUDIT_TABLE),
-        landing_rows=[{"topic": "x"}],
-        audit_rows=[],
-        checkpoint_reset_id="INC-1042",
-    )
-    _guard(ctx)
-    assert "kafka_checkpoint_reset_engaged" in ctx.log.events("WARNING")
-    fields = ctx.log.fields("kafka_checkpoint_reset_engaged")
-    assert fields["checkpoint_reset_id"] == "INC-1042"
-    # The warning has to say NOT to clear it: reverting would restore the old identity.
-    assert "clear" in fields["note"]
-
-
-def test_a_reused_reset_id_is_refused(config_root, checkpoint):
-    """THE THIRD SILENT-DATA-LOSS STATE, and the nastiest of the three.
-
-    The guard is bypassed, batch ids restart at 0, and the app id is UNCHANGED because it
-    is derived from the same reset id - so Delta still holds high versions against it and
-    skips every write. The run reports success and ingests nothing.
-    """
-    checkpoint(exists=False)
-    ctx = _ctx(
-        config_root,
-        existing_tables=("cat_dev.landing.demo_events_v1", AUDIT_TABLE),
-        landing_rows=[{"topic": "x"}],
-        audit_rows=[{"rerun_id": "INC-1042", "run_type": "primary", "run_id": "an-older-run"}],
-        checkpoint_reset_id="INC-1042",
-    )
-    with pytest.raises(RuntimeError) as exc:
-        _guard(ctx)
-    message = str(exc.value)
-    assert "INC-1042" in message, "the refusal must name the spent id"
-    assert "single-use" in message
-    assert "SKIPPED AS A DUPLICATE" in message
-    assert "UNUSED" in message, "the refusal must say what to do instead"
-
-
-def test_a_stale_reset_id_is_inert_once_the_checkpoint_exists_again(config_root, checkpoint):
-    """Case 2 of the three. The field stays set forever - clearing it would revert the app
-    id to the identity the reset forked away from - so the guard must not trip on it, and
-    must not warn about it either once there is nothing to bypass."""
-    checkpoint(exists=True)
-    ctx = _ctx(
-        config_root,
-        existing_tables=("cat_dev.landing.demo_events_v1", AUDIT_TABLE),
-        landing_rows=[{"topic": "x"}],
-        audit_rows=[{"rerun_id": "INC-1042", "run_type": "primary", "run_id": "an-older-run"}],
-        checkpoint_reset_id="INC-1042",
-    )
-    _guard(ctx)
-    assert ctx.log.events("WARNING") == []
-
-
-def test_the_reuse_check_excludes_this_run_s_own_audit_rows(config_root, checkpoint):
-    """Otherwise the check would depend on being called before the reset id reaches the
-    audit writer - true today, and exactly the kind of ordering that breaks silently.
-
-    Asserted on the predicate rather than on rows, because the exclusion IS the predicate:
-    a stand-in that filtered would only prove the stand-in filters.
-    """
-    checkpoint(exists=False)
-    ctx = _ctx(
-        config_root,
-        existing_tables=("cat_dev.landing.demo_events_v1", AUDIT_TABLE),
-        landing_rows=[{"topic": "x"}],
-        audit_rows=[{"rerun_id": "INC-1042", "run_type": "primary", "run_id": "an-older-run"}],
-        checkpoint_reset_id="INC-1042",
-    )
-    with pytest.raises(RuntimeError):
-        _guard(ctx)
-    predicate = ctx.spark.table(AUDIT_TABLE).conditions[0]
-    assert "run_id <> 'demo_topic-primary-test'" in predicate
-    assert "run_type = 'primary'" in predicate
-    assert "rerun_id = 'INC-1042'" in predicate
-
-
-def test_the_reuse_check_treats_a_missing_audit_table_as_never_used(config_root, checkpoint):
-    """The audit table is best-effort evidence, which is normally a reason not to depend on
-    it. The failure direction here is the safe one: a missing row reads as "unused", so a
-    genuine first use proceeds under a forked identity. Refusing a legitimate reset would
-    be the more expensive mistake, and this cannot make it."""
-    checkpoint(exists=False)
+    monkeypatch.setattr(kafka_run._Session, "prepare", lambda self: None)
+    monkeypatch.setattr(kafka_run._Session, "run_streaming", lambda self: None)
     ctx = _ctx(
         config_root,
         existing_tables=("cat_dev.landing.demo_events_v1",),
         landing_rows=[{"topic": "x"}],
-        checkpoint_reset_id="INC-1042",
+        run_type=RUN_TYPE_KAFKA_REPLAY,
+        rerun_id="INC1",
+        replay_starting_offsets=OFFSETS,
     )
-    _guard(ctx)
+    kafka_run.run(ctx, secrets=object())  # must not raise
 
 
 def test_the_reset_id_is_recorded_on_the_audit_row_so_the_reuse_check_can_see_it(config_root, checkpoint, monkeypatch):
