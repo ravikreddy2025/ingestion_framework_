@@ -7,8 +7,8 @@ plausible and refers to something that does not exist. A task naming a source-ke
 YAML file behind it fails at 03:30 in an environment nobody is watching, with an argparse
 error nobody reads.
 
-Stage 6 generalises this over every job template; today it covers the Oracle job, which is
-the one Stage 4 added.
+Stage 6 generalises this over every job template; today it covers the Oracle job (Stage 4)
+and the file job (Stage 5).
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ RESOURCES = REPO / "resources"
 CONF = REPO / "conf"
 
 ORACLE_JOB = RESOURCES / "job_ingest_oracle.yml"
+FILE_JOB = RESOURCES / "job_ingest_file.yml"
 
 # The wheel entry points declared in pyproject.toml. A task naming anything else installs
 # fine and fails on the first run.
@@ -38,6 +39,12 @@ def _job(path: Path, name: str) -> dict:
 def oracle_job() -> dict:
     assert ORACLE_JOB.is_file(), f"{ORACLE_JOB} is missing"
     return _job(ORACLE_JOB, "ingest_oracle")
+
+
+@pytest.fixture(scope="module")
+def file_job() -> dict:
+    assert FILE_JOB.is_file(), f"{FILE_JOB} is missing"
+    return _job(FILE_JOB, "ingest_file")
 
 
 def test_the_oracle_job_runs_one_extract_at_a_time(oracle_job):
@@ -126,3 +133,62 @@ def test_every_oracle_query_the_runbook_cites_exists(oracle_job):
         assert f"-- Q{number}." in support_sql, f"sql/03 has no Q{number}"
     for cited in ("Q17", "Q18", "Q21", "Q23", "Q24"):
         assert cited in oracle_section[1], f"the Oracle playbook never cites {cited}"
+
+
+# --------------------------------------------------------------------------------------
+# The file job - mirrors the Oracle checks above exactly, minus the Oracle-only ones
+# (retry-interval floor, source-type check reused verbatim below).
+# --------------------------------------------------------------------------------------
+
+
+def test_the_file_job_runs_one_ingest_at_a_time(file_job):
+    """Two concurrent runs would corrupt the shared Auto Loader checkpoint - the same
+    reason Kafka's primary stream and the Oracle extract are both single-flight."""
+    assert file_job["max_concurrent_runs"] == 1
+
+
+def test_a_file_run_that_arrives_while_one_is_in_flight_is_dropped(file_job):
+    assert file_job["queue"]["enabled"] is False
+
+
+def test_every_file_task_calls_the_shipped_entrypoint_with_a_source_key(file_job):
+    for task in file_job["tasks"]:
+        wheel = task["python_wheel_task"]
+        assert wheel["package_name"] == "kafka_ingest"
+        assert wheel["entry_point"] in ENTRY_POINTS
+        assert wheel["named_parameters"]["source-key"], f"{task['task_key']}: no source-key"
+
+
+def test_every_file_task_names_a_source_that_actually_exists(file_job):
+    for task in file_job["tasks"]:
+        source_key = task["python_wheel_task"]["named_parameters"]["source-key"]
+        assert (CONF / "sources" / f"{source_key}.yaml").is_file(), f"{source_key}: no source file"
+
+
+def test_every_file_task_names_a_file_source(file_job):
+    """The job is separate from Kafka's and Oracle's for operational reasons - see the
+    module docstring in resources/job_ingest_file.yml - so a task naming another source
+    type would defeat that separation without failing anything."""
+    for task in file_job["tasks"]:
+        source_key = task["python_wheel_task"]["named_parameters"]["source-key"]
+        declared = yaml.safe_load((CONF / "sources" / f"{source_key}.yaml").read_text(encoding="utf-8"))
+        assert declared["source_type"] == "file", f"{source_key} is not a file source"
+
+
+def test_the_file_environment_is_taken_from_the_bundle_target(file_job):
+    parameters = {p["name"]: p["default"] for p in file_job["parameters"]}
+    assert parameters["environment"] == "${bundle.target}"
+    for task in file_job["tasks"]:
+        assert task["python_wheel_task"]["named_parameters"]["environment"] == "{{job.parameters.environment}}"
+
+
+def test_file_retry_settings_are_stated_on_every_task(file_job):
+    for task in file_job["tasks"]:
+        assert task["max_retries"] >= 1
+        assert task["retry_on_timeout"] is False
+        assert task["timeout_seconds"] > 0
+
+
+def test_the_file_onboarding_template_is_not_a_deployable_job(file_job):
+    for task in file_job["tasks"]:
+        assert not task["python_wheel_task"]["named_parameters"]["source-key"].startswith("_")

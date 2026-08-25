@@ -106,10 +106,10 @@ def test_every_dispatchable_source_exposes_exactly_the_contract(source_type):
     assert not {"read", "parse", "write", "validate"} & set(dir(module))
 
 
-# Kafka (Stage 3) and Oracle (Stage 4) are implemented; file is still a stub. The list is
-# derived from the dispatch dict rather than hardcoded, so implementing the last source
-# empties it and the test stops running rather than starting to lie.
-_IMPLEMENTED = {"kafka", "oracle"}
+# Kafka (Stage 3), Oracle (Stage 4) and file (Stage 5) are all implemented now. The list is
+# derived from the dispatch dict rather than hardcoded, so it emptied itself the moment the
+# last source landed rather than this file needing an edit to notice.
+_IMPLEMENTED = {"kafka", "oracle", "file"}
 _UNIMPLEMENTED = sorted(t for t in runner._SOURCES if t not in _IMPLEMENTED)
 
 

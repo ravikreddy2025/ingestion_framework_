@@ -27,7 +27,9 @@ import yaml
 
 from kafka_ingest.framework import tables
 from kafka_ingest.framework.config import ConfigError, available_environments, load_structural, resolve_config
+from kafka_ingest.sources import file as file_source
 from kafka_ingest.sources import kafka, oracle
+from kafka_ingest.sources.file import config as file_config
 from kafka_ingest.sources.kafka import config as kafka_config
 from kafka_ingest.sources.kafka.config import (
     RUN_TYPE_PRIMARY,
@@ -57,6 +59,7 @@ def _declared_type(path) -> str:
 
 KAFKA_KEYS = [p.stem for p in SOURCE_FILES if _declared_type(p) == "kafka"]
 ORACLE_KEYS = [p.stem for p in SOURCE_FILES if _declared_type(p) == "oracle"]
+FILE_KEYS = [p.stem for p in SOURCE_FILES if _declared_type(p) == "file"]
 
 # Every environment we ship. Most checks run against ALL of them, because the failure this
 # suite exists to prevent is a value that is valid in prod and broken in dev.
@@ -65,6 +68,7 @@ ENVIRONMENTS = available_environments(str(CONF_ROOT))
 # The full cross product - one test case per (source, environment), per source type.
 SOURCE_ENVS = [(s, e) for s in KAFKA_KEYS for e in ENVIRONMENTS]
 ORACLE_ENVS = [(s, e) for s in ORACLE_KEYS for e in ENVIRONMENTS]
+FILE_ENVS = [(s, e) for s in FILE_KEYS for e in ENVIRONMENTS]
 
 
 def _settings(source_key, environment="prod"):
@@ -92,7 +96,9 @@ def test_conf_directory_is_present_and_populated():
     assert (CONF_ROOT / "registries.yaml").is_file()
     assert KAFKA_KEYS, "no deployable Kafka source files found in conf/sources/"
     assert ORACLE_KEYS, "no deployable Oracle source files found in conf/sources/"
+    assert FILE_KEYS, "no deployable file source files found in conf/sources/"
     assert (CONF_ROOT / "jdbc.yaml").is_file()
+    assert (CONF_ROOT / "storage.yaml").is_file()
     assert ENVIRONMENTS, "no environment files found in conf/environments/"
 
 
@@ -196,10 +202,15 @@ def test_no_two_sources_share_a_landing_table():
     """Landing is ONE TABLE PER SOURCE. Two sources sharing one would interleave their
     rows, and a per-source replay or retention drop would take the other one with it.
 
-    Across source TYPES as well: a Kafka topic and an Oracle table both resolve to a name
-    in the same catalog, and nothing but this test would notice a collision.
+    Across source TYPES as well: a Kafka topic, an Oracle table and a file drop zone can
+    all resolve to a name in the same catalog, and nothing but this test would notice a
+    collision.
     """
-    landing = [_resolve(k).landing_table for k in KAFKA_KEYS] + [_resolve_oracle(k).landing_table for k in ORACLE_KEYS]
+    landing = (
+        [_resolve(k).landing_table for k in KAFKA_KEYS]
+        + [_resolve_oracle(k).landing_table for k in ORACLE_KEYS]
+        + [_resolve_file(k).landing_table for k in FILE_KEYS]
+    )
     assert len(set(landing)) == len(landing), f"sources share a landing table: {sorted(landing)}"
 
 
@@ -268,17 +279,19 @@ def test_no_shipped_source_checks_an_incident_lever_into_git(source_key):
         assert key not in settings, f"{source_key}: '{key}' is operational-only and must not be in YAML"
 
 
-@pytest.mark.parametrize("template", ["_TEMPLATE", "_TEMPLATE_oracle"])
+@pytest.mark.parametrize("template", ["_TEMPLATE", "_TEMPLATE_oracle", "_TEMPLATE_file"])
 def test_a_template_is_not_mistaken_for_a_deployable_source(template):
     """A template must stay inert - and must fail loudly if someone tries to deploy it.
 
-    Both are full of <ANGLE_BRACKET> placeholders by design, so "fails to resolve" IS the
-    correct behaviour and this asserts it rather than trusting the underscore convention.
+    Every template is full of <ANGLE_BRACKET> placeholders by design, so "fails to
+    resolve" IS the correct behaviour and this asserts it rather than trusting the
+    underscore convention.
     """
     assert (CONF_ROOT / "sources" / f"{template}.yaml").is_file(), f"{template} onboarding template missing"
     assert template not in SOURCE_KEYS
+    resolver = {"_TEMPLATE": _resolve, "_TEMPLATE_oracle": _resolve_oracle, "_TEMPLATE_file": _resolve_file}[template]
     with pytest.raises(ConfigError):
-        _resolve(template) if template == "_TEMPLATE" else _resolve_oracle(template)
+        resolver(template)
 
 
 # --------------------------------------------------------------------------------------
@@ -502,3 +515,73 @@ def test_every_jdbc_profile_the_sources_use_exists_in_the_register():
     register = yaml.safe_load((CONF_ROOT / "jdbc.yaml").read_text(encoding="utf-8"))["jdbc"]
     for source_key in ORACLE_KEYS:
         assert _resolve_oracle(source_key).jdbc_ref in register
+
+
+# --------------------------------------------------------------------------------------
+# FILE SOURCES
+#
+# The same resolution path, against the file spec. What differs from Kafka and Oracle: a
+# file source's failure is a storage account or container that does not exist in one
+# environment, or a `source_path` that was pasted in as a full URL instead of the path
+# WITHIN the container.
+# --------------------------------------------------------------------------------------
+
+
+def _resolve_file(source_key, environment="prod", run_type="primary", **job_parameters):
+    resolved = resolve_config(
+        str(CONF_ROOT), source_key, environment, file_source.SOURCE_SPEC, job_parameters=job_parameters
+    )
+    return file_config.build(resolved, run_type, tables)
+
+
+@pytest.mark.parametrize("source_key, environment", FILE_ENVS)
+def test_every_shipped_file_source_resolves(source_key, environment):
+    cfg = _resolve_file(source_key, environment)
+
+    assert cfg.source_key == source_key
+    assert cfg.domain, f"{source_key}: empty domain"
+    assert len(cfg.landing_table.split(".")) == 3
+    assert "{" not in cfg.landing_table
+    assert cfg.max_files_per_trigger > 0
+    assert cfg.checkpoint_path.startswith("/Volumes/")
+    assert cfg.schema_location_path.startswith("/Volumes/")
+
+
+@pytest.mark.parametrize("source_key, environment", FILE_ENVS)
+def test_every_file_source_reaches_a_real_storage_account_in_every_environment(source_key, environment):
+    """A storage profile with no account or no secret scope in ONE environment would only
+    fail when that environment was deployed."""
+    cfg = _resolve_file(source_key, environment)
+    assert cfg.full_source_path.startswith("abfss://")
+    assert "{" not in cfg.full_source_path
+    assert cfg.storage.secret_scope, f"{source_key}/{environment}: no secret scope"
+
+
+@pytest.mark.parametrize("source_key, environment", FILE_ENVS)
+def test_file_environments_never_share_a_catalog_or_a_checkpoint(source_key, environment):
+    """dev must not be able to write into prod's landing tables or share prod's checkpoint."""
+    cfg = _resolve_file(source_key, environment)
+    for other in [e for e in ENVIRONMENTS if e != environment]:
+        rival = _resolve_file(source_key, other)
+        assert cfg.landing_table != rival.landing_table
+        assert cfg.checkpoint_path != rival.checkpoint_path
+
+
+@pytest.mark.parametrize("source_key", FILE_KEYS)
+def test_every_file_source_checkpoint_path_is_unique_per_source(source_key):
+    assert _resolve_file(source_key).checkpoint_path.endswith(f"/{source_key}/primary")
+
+
+@pytest.mark.parametrize("source_key", FILE_KEYS)
+def test_no_shipped_file_source_checks_an_incident_lever_into_git(source_key):
+    """checkpoint_reset_id is operational-ONLY - a value in Git would silently re-apply on
+    every future deploy, bypassing the guard against silent data loss forever."""
+    settings = load_structural(str(CONF_ROOT), source_key, "prod", file_source.SOURCE_SPEC.target_tokens)
+    for key in sorted(file_source.SOURCE_SPEC.operational_keys - file_source.SOURCE_SPEC.structural_keys):
+        assert key not in settings, f"{source_key}: '{key}' is operational-only and must not be in YAML"
+
+
+def test_every_storage_profile_the_sources_use_exists_in_the_register():
+    register = yaml.safe_load((CONF_ROOT / "storage.yaml").read_text(encoding="utf-8"))["storage"]
+    for source_key in FILE_KEYS:
+        assert _resolve_file(source_key).storage_ref in register
