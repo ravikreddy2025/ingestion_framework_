@@ -1,19 +1,31 @@
 """Secrets, and the one rule about what must never reach a log line.
 
-TWO THINGS LIVE HERE, AND NEITHER KNOWS WHAT IT IS CONNECTING TO.
+THREE THINGS LIVE HERE, AND NONE OF THEM KNOWS WHAT IT IS CONNECTING TO.
 
-  SecretResolver   scope + key -> the secret value, via Databricks secret scopes backed
-                   by a cloud key vault. Scope and key NAMES come from configuration;
-                   nothing is hardcoded, and no secret VALUE ever appears in this
-                   repository or in a log line.
-  redact()         mask credential-bearing entries in an options map before it is logged
-                   or audited. Re-exported from framework/logs.py - see below.
+  SecretResolver        scope + key -> the secret value, via Databricks secret scopes
+                         backed by a cloud key vault. Scope and key NAMES come from
+                         configuration; nothing is hardcoded, and no secret VALUE ever
+                         appears in this repository or in a log line.
+  redact()               mask credential-bearing entries in an options map before it is
+                         logged or audited. Re-exported from framework/logs.py - see below.
+  apply_session_options() set Spark/Hadoop session configuration for the duration of one
+                         call, then restore whatever was there before. Added in Stage 5 for
+                         a source whose credentials are NOT read via `.option()` calls on
+                         the reader the way most connection maps in this framework are -
+                         they are read by the underlying Hadoop FileSystem from SESSION
+                         configuration instead (an `fs.azure.account.key...`-style entry,
+                         set with `spark.conf.set()`). This is the generic "set for one
+                         call, then put back" mechanism framework/writers.py already uses
+                         for the schema-evolution flag, pulled up here because a second
+                         source needing session-scoped auth would otherwise duplicate it.
+                         See VB-26.
 
 Turning a resolved secret into a connection options map is NOT here, and that is the
 whole point of the split: an options map is shaped by the system being connected to - its
 own option prefixes, its own property names, its own idea of what a credential looks like
 in a config string - so it belongs to that source type's own package. What every source
-shares is "read a secret" and "never log one", which is exactly what this module is.
+shares is "read a secret", "never log one", and now "apply it to the session and put it
+back" - which is exactly what this module is.
 
 CERTIFICATES are referenced by path and are never read, copied or staged by the driver.
 Whether the process that opens one can SEE that path is a compute-profile property, not
@@ -32,12 +44,20 @@ where a reader looks for it - names it.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Callable, Mapping
 
 from .config import ConfigError
 from .logs import MASK, is_sensitive, redact
 
-__all__ = ["MASK", "ConfigError", "SecretResolver", "get_dbutils", "is_sensitive", "redact"]
+__all__ = [
+    "MASK",
+    "ConfigError",
+    "SecretResolver",
+    "apply_session_options",
+    "get_dbutils",
+    "is_sensitive",
+    "redact",
+]
 
 
 class SecretResolver:
@@ -95,3 +115,30 @@ def get_dbutils() -> Any:
             "dbutils is not available in this context; secrets cannot be resolved. "
             "This code must run on Databricks compute."
         ) from exc
+
+
+def apply_session_options(spark: Any, options: Mapping[str, str]) -> Callable[[], None]:
+    """Set session/Hadoop configuration, and return a callable that restores it.
+
+    Mirrors framework/writers.py's handling of the schema-evolution session flag: capture
+    whatever was there before setting anything, so the restore puts back a PRIOR VALUE
+    rather than always unsetting - another job sharing this session may have set one of
+    these deliberately, and silently clearing it would be a surprising side effect.
+
+    Restoring is the caller's responsibility, in a `finally` around whatever needs the
+    options applied - this function does not know how long that is. No secret VALUE is
+    logged here; the caller has already resolved them, and this only sets them on the
+    session.
+    """
+    previous = {key: spark.conf.get(key, None) for key in options}
+
+    def _restore() -> None:
+        for key, prior_value in previous.items():
+            if prior_value is None:
+                spark.conf.unset(key)
+            else:
+                spark.conf.set(key, prior_value)
+
+    for key, value in options.items():
+        spark.conf.set(key, value)
+    return _restore
