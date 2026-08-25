@@ -22,6 +22,17 @@ STRUCTURAL vs OPERATIONAL, and the three interesting cases
 THE FILE SOURCE IS CHECKPOINT-BASED (STAGE_5 brief, "Decision, already made"). It reuses
 the SAME checkpoint-reset-id mechanism Kafka uses, not a second design - see the guard in
 run.py. `checkpoint_root` is therefore required with no safe fallback, exactly like Kafka's.
+
+`storage_ref` IS NOT IN `required_keys` (docs/build_log/DECISIONS.md D-13), even though it
+IS in `structural_keys` and every shipped source today sets it. A `source_path` under
+`/Volumes/<catalog>/<schema>/<volume>/...` is Unity-Catalog-governed and takes no storage
+credentials at all, so it has nothing for `storage_ref` to name - a blanket `required_keys`
+entry would make that legal, credential-free form fail with a missing-key error for the
+wrong reason. `sources/file/config.py`'s `build()` enforces the real rule instead: exactly
+one of `storage_ref` or a Volume-shaped `source_path`, depending on `source_path`'s own
+shape - the same kind of cross-field rule that already lives there for `schema_mode` /
+`schema`, because SourceSpec has no way to express "required only when a sibling key looks
+like X."
 """
 
 from __future__ import annotations
@@ -64,7 +75,6 @@ SOURCE_SPEC = SourceSpec(
     # to decide between inference and a provided schema with no explicit instruction at all.
     required_keys=frozenset(
         {
-            "storage_ref",
             "source_path",
             "path_glob",
             "file_format",

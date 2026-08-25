@@ -130,9 +130,17 @@ class _Session:
 
     def run_streaming(self) -> None:
         """Apply this source's ADLS session options for the duration of the query, then
-        put them back - see framework/security.py `apply_session_options`."""
-        storage_options = security.build_storage_options(self.cfg.storage, self.secrets)
-        restore = apply_session_options(self.ctx.spark, storage_options)
+        put them back - see framework/security.py `apply_session_options`.
+
+        A Unity Catalog Volume source (docs/build_log/DECISIONS.md D-13, `cfg.storage is
+        None`) applies NONE of this: it is governed by Unity Catalog grants on the Volume
+        itself, and this framework has no credential of its own to set or restore.
+        """
+        if self.cfg.storage is None:
+            restore = _no_op_restore
+        else:
+            storage_options = security.build_storage_options(self.cfg.storage, self.secrets)
+            restore = apply_session_options(self.ctx.spark, storage_options)
         try:
             query = (
                 build_stream_reader(self.ctx.spark, self.cfg)
@@ -238,6 +246,12 @@ class _Session:
 
 
 RESCUED_DATA_HINT = "see the _rescued_data column"
+
+
+def _no_op_restore() -> None:
+    """The `restore` callable for a Unity Catalog Volume source (D-13): there were no
+    session options to put back, because none were ever set."""
+    return None
 
 
 def _elapsed_ms(since: float) -> int:

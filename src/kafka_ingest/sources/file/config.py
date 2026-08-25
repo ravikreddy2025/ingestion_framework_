@@ -94,6 +94,13 @@ _KNOWN_FORMAT_OPTIONS = {
 # than the framework's generic one.
 _UC_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# docs/build_log/DECISIONS.md D-13: a source_path under this prefix is a Unity Catalog
+# Volume path. It is UC-governed - no fs.azure.* credential this framework could apply
+# would mean anything to it - so a Volume-shaped source_path takes no storage_ref and no
+# session options at all. Everything else (a path within a container named by storage_ref)
+# is unaffected.
+_UC_VOLUME_PREFIX = "/Volumes/"
+
 # A rerun/reset id becomes part of a Delta app id and a path segment.
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
@@ -156,9 +163,9 @@ class FileConfig:
     run_type: str
     domain: str
 
-    storage_ref: str
-    storage: StorageProfile
-    source_path: str  # path WITHIN the container only - see `full_source_path` below
+    storage_ref: str | None  # None for a Unity Catalog Volume source_path (D-13)
+    storage: StorageProfile | None  # None for a Unity Catalog Volume source_path (D-13)
+    source_path: str  # path WITHIN the container, or a full /Volumes/... path - see below
     path_glob: str
 
     file_format: str
@@ -201,15 +208,25 @@ class FileConfig:
         return f"{self.schema_location_root.rstrip('/')}/{self.source_key}"
 
     @property
-    def full_source_path(self) -> str:
-        """The `abfss://` URL Auto Loader actually reads.
+    def is_uc_volume_path(self) -> bool:
+        """docs/build_log/DECISIONS.md D-13: a /Volumes/... source_path is UC-governed -
+        no storage_ref, no session credentials, read directly as Auto Loader's own path."""
+        return self.source_path.startswith(_UC_VOLUME_PREFIX)
 
-        `source_path` never carries the account or container (CORE section 6, extended to
-        storage the way it already applies to a catalog name): both come from
+    @property
+    def full_source_path(self) -> str:
+        """The path Auto Loader actually reads.
+
+        A Unity Catalog Volume path (D-13) is already the full path this source reads - it
+        takes no account or container, because Unity Catalog governs it directly. Every
+        other `source_path` never carries the account or container (CORE section 6, extended
+        to storage the way it already applies to a catalog name): both come from
         `storage_ref`, which is the one thing that differs per environment - so the same
         source file resolves to a different account in dev and prod, exactly as an Oracle
         source's `jdbc_ref` does.
         """
+        if self.storage is None:
+            return self.source_path
         return f"abfss://{self.storage.container}@{self.storage.endpoint}/{self.source_path.lstrip('/')}"
 
     @property
@@ -261,7 +278,8 @@ def build(cfg: Any, run_type: str, tables: Any) -> FileConfig:
 
     target_schema = _uc_identifier(_required_text(cfg, "target_schema"), "target_schema", cfg.source_key)
     target_table = _uc_identifier(_required_text(cfg, "target_table"), "target_table", cfg.source_key)
-    storage_ref = _required_text(cfg, "storage_ref")
+    source_path = _required_text(cfg, "source_path")
+    storage_ref, storage = _storage(cfg, source_path)
 
     reset_id = cfg.get(CHECKPOINT_RESET_ID)
     if reset_id and not _SAFE_ID.match(str(reset_id)):
@@ -276,8 +294,8 @@ def build(cfg: Any, run_type: str, tables: Any) -> FileConfig:
         run_type=run_type,
         domain=str(cfg.get("domain") or ""),
         storage_ref=storage_ref,
-        storage=StorageProfile(name=storage_ref, **dict(cfg.profile("storage", storage_ref))),
-        source_path=_required_text(cfg, "source_path"),
+        storage=storage,
+        source_path=source_path,
         path_glob=_required_text(cfg, "path_glob"),
         file_format=str(cfg.get("file_format") or "").strip().lower(),
         format_options=_format_options(cfg),
@@ -334,6 +352,36 @@ def _validate(cfg: FileConfig) -> None:
             "from storage_ref, which is what makes the same source file resolve to a different "
             "account per environment."
         )
+
+
+def _storage(cfg: Any, source_path: str) -> tuple[str | None, StorageProfile | None]:
+    """`(storage_ref, storage)` for this source, decided by `source_path`'s own shape.
+
+    docs/build_log/DECISIONS.md D-13: a Volume-shaped source_path is Unity-Catalog-governed
+    and takes no storage_ref and no credentials of this framework's own; anything else is a
+    path within a container named by storage_ref, exactly as before D-13. The two forms are
+    mutually exclusive by construction here, not by SourceSpec.mutually_exclusive - that
+    field pairs two KEY NAMES that must not both be set, but this rule depends on the VALUE
+    of source_path, which SourceSpec has no way to express (the same reason schema_mode /
+    schema is checked in this module rather than there).
+    """
+    storage_ref = _text(cfg.get("storage_ref"))
+    if source_path.startswith(_UC_VOLUME_PREFIX):
+        if storage_ref:
+            raise ConfigError(
+                f"source '{cfg.source_key}': storage_ref '{storage_ref}' is set, but source_path "
+                f"'{source_path}' is a Unity Catalog Volume path. A Volume path is governed by Unity "
+                "Catalog directly - it takes no storage credentials and no storage_ref. Set one or "
+                "the other, not both."
+            )
+        return None, None
+    if not storage_ref:
+        raise ConfigError(
+            f"source '{cfg.source_key}': storage_ref is required when source_path is not a Unity "
+            f"Catalog Volume path (i.e. does not start with '{_UC_VOLUME_PREFIX}'). Set storage_ref to "
+            "a profile in conf/storage.yaml, or change source_path to a Volume path."
+        )
+    return storage_ref, StorageProfile(name=storage_ref, **dict(cfg.profile("storage", storage_ref)))
 
 
 def _format_options(cfg: Any) -> dict[str, str]:

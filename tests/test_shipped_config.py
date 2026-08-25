@@ -550,11 +550,20 @@ def test_every_shipped_file_source_resolves(source_key, environment):
 @pytest.mark.parametrize("source_key, environment", FILE_ENVS)
 def test_every_file_source_reaches_a_real_storage_account_in_every_environment(source_key, environment):
     """A storage profile with no account or no secret scope in ONE environment would only
-    fail when that environment was deployed."""
+    fail when that environment was deployed.
+
+    A Unity Catalog Volume source (docs/build_log/DECISIONS.md D-13) has no storage profile
+    at all - it is governed by Unity Catalog grants, not by anything this framework
+    resolves - so this test has nothing to check for one beyond "no placeholder survived".
+    """
     cfg = _resolve_file(source_key, environment)
-    assert cfg.full_source_path.startswith("abfss://")
     assert "{" not in cfg.full_source_path
-    assert cfg.storage.secret_scope, f"{source_key}/{environment}: no secret scope"
+    if cfg.is_uc_volume_path:
+        assert cfg.storage is None
+        assert cfg.storage_ref is None
+    else:
+        assert cfg.full_source_path.startswith("abfss://")
+        assert cfg.storage.secret_scope, f"{source_key}/{environment}: no secret scope"
 
 
 @pytest.mark.parametrize("source_key, environment", FILE_ENVS)
@@ -582,6 +591,12 @@ def test_no_shipped_file_source_checks_an_incident_lever_into_git(source_key):
 
 
 def test_every_storage_profile_the_sources_use_exists_in_the_register():
+    """A Unity Catalog Volume source (D-13) has no storage_ref to check - it names no
+    profile in this register at all, by construction."""
     register = yaml.safe_load((CONF_ROOT / "storage.yaml").read_text(encoding="utf-8"))["storage"]
     for source_key in FILE_KEYS:
-        assert _resolve_file(source_key).storage_ref in register
+        cfg = _resolve_file(source_key)
+        if cfg.is_uc_volume_path:
+            assert cfg.storage_ref is None
+        else:
+            assert cfg.storage_ref in register
