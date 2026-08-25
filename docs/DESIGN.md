@@ -611,5 +611,105 @@ of `schemaLocation`."
 - **Schema inference caching, or a schema registry for files.** `cloudFiles.schemaLocation`
   already is the former; there is no equivalent of Kafka's Schema Registry for file drops
   in this framework's scope.
-- **SAS-token and managed-identity storage auth.** Only `account_key` and
-  `service_principal` are implemented — see `sources/file/security.py`.
+- **SAS-token and managed-identity storage auth** (`docs/build_log/DECISIONS.md` D-12).
+  Only `account_key` and `service_principal` are implemented, stated here as a limitation,
+  not an oversight: each of the excluded modes needs either a token-provider class this
+  project cannot verify exists on the target runtime, or workspace-level Unity Catalog
+  wiring outside this repository's control, so adding one is a future code change with its
+  own verification, not a config guess — the same restraint `sources/oracle/config.py`
+  applies to JDBC auth (`auth_mode: basic` only). See `sources/file/security.py`'s module
+  docstring for the mechanism these two modes do use.
+- **A file replay job or entrypoint** (`docs/build_log/DECISIONS.md` D-10, settled). A
+  fresh, missing checkpoint already makes Auto Loader re-read the whole path on its own
+  (`cloudFiles.includeExistingFiles` defaults to `true`), files persist in ADLS so there is
+  no retention window to race the way a Kafka replay races broker retention, and this
+  source is landing-only, so there is no re-parse-from-landing shape either. Recovery
+  reuses the existing checkpoint-reset procedure deliberately — `docs/CONFIGURATION.md` §10
+  and `docs/RUNBOOK_SUPPORT.md` §9 carry the three-step version.
+
+### Unity Catalog Volume source paths, and the simplification they set up (D-13)
+
+`source_path` may name a Unity Catalog Volume directly
+(`/Volumes/<catalog>/<schema>/<volume>/...`) instead of a path within an ADLS container
+named by `storage_ref`. A Volume path is governed by Unity Catalog grants on the Volume
+itself: `sources/file/config.py` applies no `storage_ref` and builds no
+`fs.azure.*` session options for it, and `sources/file/run.py` applies no session
+configuration around the read at all in that case. The two forms are mutually exclusive —
+setting `storage_ref` alongside a Volume path is a config error naming both, because there
+is no honest answer to which one governs the read.
+
+This is **preferred**, not forced: the shipped worked example keeps its existing
+`storage_ref` form, since switching it was not asked for and doing so without confirming
+Volumes are reachable from the target compute for that workload would be exactly the kind
+of unverified assumption this project exists to keep out of shipped configuration (VB-28).
+
+**The planned simplification, if VB-28 comes back "Volumes everywhere":** `conf/storage.yaml`,
+`sources/file/security.py`, and `framework/security.py`'s `apply_session_options` (added in
+Stage 5 for exactly this source's session-scoped credentials, VB-26) all become deletable —
+a Volume path takes no credential from this framework at all. Not attempted now: narrowing to
+one credential path is a decision for whoever answers VB-28, not something to guess at while
+both are still plausibly needed in different environments. If that day comes,
+`apply_session_options` is worth a second look before deleting it outright — nothing else in
+the framework uses it today, but a future source needing session-scoped, non-`.option()`
+credentials (the same shape ADLS Gen2 has) would want it again.
+
+---
+
+## 12. Adding a source type
+
+Added in Stage 6. This is the falsifiable answer to CORE section 1's goal: "adding a source
+type is a new package under `sources/` and **zero changes** under `framework/`." A new
+package provides exactly these, nothing more:
+
+| # | What | Where |
+|---|---|---|
+| 1 | `SOURCE_SPEC` — the keys this source type accepts, structural/operational split, control columns, target tokens, mutually-exclusive pairs. **No PySpark import.** | `sources/<type>/spec.py` |
+| 2 | `run(ctx: RunContext) -> RunResult` — the one function. Everything else in the package (`config.py`, `security.py`, `reader.py`, ...) is this source's own, called from nowhere the framework can see. | `sources/<type>/run.py` |
+| 3 | One dict entry, `"<type>": <module>` | `framework/runner.py`'s `_SOURCES` |
+| 4 | Platform-wide defaults for every source of this type | `conf/defaults/<type>.yaml` |
+| 5 | A register file (`conf/<kind>.yaml`) — **only if** the type needs a new connection kind Kafka's/Oracle's/Files' registers do not already cover. Discovered by the framework listing `conf/*.yaml`, so adding one is a new file, not a code change. | `conf/<kind>.yaml` |
+| 6 | One job template, matching the operational shape (schedule, concurrency, retries) this source's runs actually need | `resources/job_ingest_<type>.yml` |
+| 7 | An inert onboarding template — the underscore prefix keeps it out of the deployable set | `conf/sources/_TEMPLATE_<type>.yaml` |
+
+**Nothing under `framework/` changes.** Every one of the seven items above lives in the new
+package, a new conf file, or a new resource file — `framework/config.py`, `control.py`,
+`state.py`, `audit.py`, `tables.py`, `writers.py`, `runner.py` (beyond the one `_SOURCES`
+line), `security.py`, `checkpoint.py` and `logs.py` are all untouched. The CORE section 7
+grep gate is what enforces this, mechanically rather than by review:
+
+```bash
+grep -rInE '\b(kafka|oracle|bigquery|autoloader|cloudFiles|jdbc)\b' framework/ \
+  | grep -v 'runner.py:.*_SOURCES'
+```
+
+If this returns anything for the new type's name, the spine has leaked and the new source is
+not the zero-`framework/`-change addition CORE section 1 asks for — see the CI step this
+stage adds in `azure-pipelines.yml`.
+
+**What is deliberately not in this list**, because CORE section 7 forbids it even for a
+fourth source type: a base class or shared interface for sources, a plugin registry or
+dynamic import by string, a config UI, or a generic connector abstraction. Kafka, Oracle and
+Files justify exactly the one abstraction already built (`SourceSpec` + `RunContext` +
+`RunResult`); nothing here raises that count.
+
+### BigQuery — contract notes only, no code (`docs/build_log/DECISIONS.md` D-08)
+
+D-08 is still open: the right shape for a BigQuery source is not yet known, and CORE section
+12 keeps it out of scope beyond this note. Two questions the eventual design must answer
+before any `sources/bigquery/` package exists:
+
+1. **Which connector, and is it available on the target runtime?** Databricks Runtime does
+   not bundle a BigQuery connector by default, the way it does not bundle the Oracle JDBC
+   driver (VB-22) — whichever connector is chosen needs the same "is it installed, which
+   version" verification Oracle's did.
+2. **Direct read, or export-to-GCS staging?** This decides which of the two existing sources
+   BigQuery ends up looking like, per D-08's own table: a bounded query plus a watermark
+   looks like **Oracle** (reuses the cursor/watermark machinery in `sources/oracle/` almost
+   exactly); exporting to GCS and reading the exported objects looks like **Files** (reuses
+   Auto Loader, at the cost of an export-orchestration step this framework does not
+   currently own). Federation was considered for Oracle and rejected (D-07) for reasons that
+   likely apply here too, but that is a question to settle explicitly, not assume.
+
+Also unresolved, per D-08: whether cross-cloud egress from GCP to Azure is acceptable in cost
+and policy, and who owns the GCP-side credentials. None of this is guessed at here — it is
+recorded so the eventual design starts from these questions rather than from a blank page.

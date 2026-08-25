@@ -26,8 +26,11 @@
 # 4. CREATE THE TARGET SCHEMA FIRST. The framework creates TABLES, never SCHEMAS
 #    (docs/build_log/DECISIONS.md D-02): `CREATE SCHEMA IF NOT EXISTS <catalog>.<target_schema>;`
 #    must be run, in EVERY environment, before the first run.
-# 5. Confirm the storage_ref profile exists in conf/storage.yaml AND has an account,
-#    container and secret scope in every conf/environments/<env>.yaml.
+# 5. IF source_path IS A UNITY CATALOG VOLUME PATH (preferred, D-13): confirm the job's
+#    compute can read that Volume, and set no storage_ref at all - Unity Catalog governs
+#    access to it directly. OTHERWISE confirm the storage_ref profile exists in
+#    conf/storage.yaml AND has an account, container and secret scope in every
+#    conf/environments/<env>.yaml.
 # 6. Add a task to resources/job_ingest_file.yml with the new source-key.
 # 7. Run `pytest tests/test_shipped_config.py` - it validates every source in EVERY
 #    environment, so it catches a value that works in prod but breaks in dev.
@@ -38,6 +41,15 @@
 #   (common), conf/storage.yaml (the storage register) and conf/environments/<env>.yaml (per
 #   environment). Hardcoding any of them here silently breaks the other environments.
 #
+# THERE IS NO REPLAY JOB OR ENTRYPOINT FOR THIS SOURCE, AND NONE IS PLANNED
+# (docs/build_log/DECISIONS.md D-10). A fresh (missing) checkpoint already makes Auto
+# Loader re-read the whole path on its own (`cloudFiles.includeExistingFiles` defaults to
+# `true`), so recovery is: delete the affected landing partition(s) FIRST (landing is
+# append-only - skipping this duplicates everything), set a fresh, previously unused
+# `file_checkpoint_reset_id`, then run the normal file job. To bound a re-read to fewer
+# files, narrow `source_path` or `path_glob` for that one run rather than looking for an
+# offset window - this source has none. Full procedure: docs/RUNBOOK_SUPPORT.md section 9.
+#
 # This file is inert: source_key "_TEMPLATE_file" is never scheduled, and the config
 # validator skips underscore-prefixed files.
 # =====================================================================================
@@ -47,11 +59,19 @@ source_type: file
 source:
 
   # -------------------------------------------------------------------- MUST CHANGE --
+  # TWO WAYS TO NAME source_path - PREFER THE UNITY CATALOG VOLUME FORM WHEN ONE IS
+  # AVAILABLE (docs/build_log/DECISIONS.md D-13). Uncomment exactly one pair below.
+  #
+  # (a) A Unity Catalog Volume path - UC-governed, no credentials of this framework's own,
+  #     no storage_ref at all. Prefer this if the landing zone is (or can be) a Volume.
+  # storage_ref: <omit this key entirely for a Volume path>
+  # source_path: "/Volumes/<catalog>/<schema>/<volume>/<CHANGE_ME_path>/"
+  #
+  # (b) An ADLS container reached through the storage register - the path WITHIN the
+  #     container only, never a full URL. The account and container come from storage_ref,
+  #     which is what lets the same source file resolve to a different account per
+  #     environment. Use this only where a Volume path is not available - see VB-28.
   storage_ref: <storage_profile_name>
-
-  # The path WITHIN the container only - never a full URL. The account and container come
-  # from storage_ref, which is what lets the same source file resolve to a different
-  # account per environment.
   source_path: "<CHANGE_ME_path>/"
 
   file_format: <csv|json|parquet|avro>

@@ -760,12 +760,39 @@ five-step procedure as Kafka's §5.4a, with `file_checkpoint_reset_id` in place 
 `cloudFiles.schemaLocation` is a **separate** checkpoint-like resource, covered by the same
 guard indirectly rather than directly — see `docs/DESIGN.md` §11 for the reasoning.
 
+### 🔴 MUST-READ — there is no replay job for this source, and none is planned
+
+`docs/build_log/DECISIONS.md` D-10: decided and settled. A fresh (missing) checkpoint
+already makes Auto Loader re-read the whole path on its own
+(`cloudFiles.includeExistingFiles` defaults to `true`), files persist in ADLS so there is no
+retention window to race against the way a Kafka replay races broker retention, and this
+source is landing-only, so there is no re-parse-from-landing shape either.
+
+**The generic `replay_rerun_id` control column does *not*, by itself, cause a re-read for
+this source.** It is read in exactly one place — `framework/audit.py` seeds the audit row's
+`rerun_id` label from it — and this source has no replay `run_type` to fork a separate
+checkpoint namespace the way Kafka's replay does. The lever that actually matters is
+**`file_checkpoint_reset_id`**, used together with the checkpoint being genuinely absent
+(deleted, or a source_key that has never run). That combination is exactly
+`docs/RUNBOOK_SUPPORT.md` §9.3/§9.4's checkpoint-loss procedure — reused deliberately here as
+the recovery path, not a second mechanism.
+
+**Recovery, in order — step 1 is not optional:**
+
+1. **Delete the affected landing partition(s) first.** Landing is append-only: a re-read
+   without this step appends everything again and silently duplicates the data.
+2. Set a fresh, previously unused `file_checkpoint_reset_id`.
+3. Run the normal file job.
+
+A **bounded** re-read narrows `source_path` or `path_glob` for that one run — there is no
+offset or timestamp window for this source, unlike Kafka's or Oracle's replay bounds.
+
 ### 🔴 MUST CHANGE
 
 | Key | What it is |
 |---|---|
-| `storage_ref` | A profile name from `conf/storage.yaml`. Never an account URL. |
-| `source_path` | The path **within** the container only — never a full `abfss://` URL. The account and container come from `storage_ref`, which is what lets the same source file resolve to a different account per environment. |
+| `storage_ref` | A profile name from `conf/storage.yaml`. Never an account URL. **Omit entirely** when `source_path` is a Unity Catalog Volume path — see the next row and `docs/build_log/DECISIONS.md` D-13. Required for every other `source_path`. |
+| `source_path` | **Two forms, prefer the first when available (D-13):** (a) a Unity Catalog Volume path, `/Volumes/<catalog>/<schema>/<volume>/...` — UC-governed, no `storage_ref`, no credentials this framework applies at all; or (b) the path **within** the container only — never a full `abfss://` URL — resolved against `storage_ref`, which is what lets the same source file resolve to a different account per environment. Setting `storage_ref` alongside form (a) is a config error naming both — there is no honest answer to which one governs the read. |
 | `file_format` | `csv` \| `json` \| `parquet` \| `avro`. |
 | `target_schema` / `target_table` | Where this lands. A file feed has no source-side schema/table the way Oracle's does, so these are your own choice, not a derivation — `{catalog}.<target_schema>.<target_table>`. The target schema must already exist: `CREATE SCHEMA IF NOT EXISTS <catalog>.<target_schema>;` in every environment, before the first run. |
 | `domain` | Owning team. Appears in every audit row. |
@@ -791,22 +818,42 @@ guard indirectly rather than directly — see `docs/DESIGN.md` §11 for the reas
 | `landing_table` | Derived from `target_schema` / `target_table`. |
 | `table_properties` | Platform-wide, from `conf/defaults.yaml`. |
 
+### Unity Catalog Volume source paths — no register, no credentials (D-13)
+
+When `source_path` is a Volume path, none of the rest of this subsection applies: the
+register below is not consulted, `sources/file/security.py` builds no options, and
+`sources/file/run.py` applies no session configuration around the read at all. Access is
+governed entirely by Unity Catalog grants on the Volume itself, verified with whoever owns
+it, not with anything in this repository. **Preferred over the register below when a Volume
+path is available** — see the onboarding template. VB-28 tracks whether Volumes are actually
+reachable in every environment this framework targets; until it is answered, both forms are
+supported and neither is assumed universal.
+
 ### Storage register — `conf/storage.yaml`
 
-Same register pattern as `conf/clusters.yaml` / `conf/registries.yaml` / `conf/jdbc.yaml`:
-the register records the auth mode and the secret **key names**; `conf/environments/<env>.yaml`
-overrides the account, container and secret **scope** per environment. Two auth modes:
+For every `source_path` that is **not** a Volume path. Same register pattern as
+`conf/clusters.yaml` / `conf/registries.yaml` / `conf/jdbc.yaml`: the register records the
+auth mode and the secret **key names**; `conf/environments/<env>.yaml` overrides the account,
+container and secret **scope** per environment. Two auth modes:
 
 | `auth_mode` | Session options this framework sets | Secret keys the register names |
 |---|---|---|
 | `account_key` | `fs.azure.account.key.<account>.dfs.core.windows.net` | `account_key_secret_key` |
 | `service_principal` | `fs.azure.account.auth.type.*` = OAuth, plus the client id/secret/endpoint options | `client_id_secret_key`, `client_secret_secret_key` (+ register-level `tenant_id`, not a secret) |
 
-Everything else Azure/ADLS supports (SAS tokens, managed identity, Unity Catalog credential
-passthrough) is deliberately not implemented — see `sources/file/security.py`'s module
-docstring. Adding one is a code change, not a config guess. **These credentials reach the
-read as SESSION configuration (`spark.conf.set()`), not as reader `.option()` calls** — see
-VB-26 for what is unverified about that mechanism on the target compute.
+**Everything else Azure/ADLS supports — SAS tokens, managed identity, and (for a
+`storage_ref`-governed path) Unity Catalog credential passthrough — is deliberately not
+implemented** (`docs/build_log/DECISIONS.md` D-12), stated here as a limitation, not an
+oversight: each needs either a token-provider class this project cannot verify exists on the
+target runtime, or workspace-level UC wiring outside this repository's control, so adding one
+is a future code change with its own verification, not a config guess — see
+`sources/file/security.py`'s module docstring. **These credentials reach the read as SESSION
+configuration (`spark.conf.set()`), not as reader `.option()` calls** — see VB-26 for what is
+unverified about that mechanism on the target compute.
+
+**If VB-28 comes back "Volumes everywhere":** this whole register, `sources/file/security.py`,
+and `framework/security.py`'s `apply_session_options` become deletable — see
+`docs/DESIGN.md` §11's note on the planned simplification. Not attempted now.
 
 ### Operational overrides — `ingest_control`
 
