@@ -600,3 +600,53 @@ def test_every_storage_profile_the_sources_use_exists_in_the_register():
             assert cfg.storage_ref is None
         else:
             assert cfg.storage_ref in register
+
+
+# --------------------------------------------------------------------------------------
+# THE MAINTENANCE JOB (docs/build_log/DECISIONS.md D-11)
+#
+# resources/job_maintenance.yml hand-writes one task per covered source, landing_table
+# included - nothing else checks that string against what the source's own config actually
+# derives. A drift here is silent: OPTIMIZE/VACUUM against the wrong table either no-ops
+# (table exists, wrong one) or fails every week (table does not exist), and either way
+# nobody notices until someone goes looking.
+# --------------------------------------------------------------------------------------
+
+MAINTENANCE_JOB = CONF_ROOT.parent / "resources" / "job_maintenance.yml"
+
+
+def _maintenance_tasks() -> list[dict]:
+    document = yaml.safe_load(MAINTENANCE_JOB.read_text(encoding="utf-8"))
+    return document["resources"]["jobs"]["maintenance"]["tasks"]
+
+
+def _resolved_landing_table(source_key: str) -> str:
+    """This source's OWN resolution path, dispatched by its declared source_type - the same
+    partition `_declared_type` drives for every other cross-product test in this file."""
+    declared = _declared_type(CONF_ROOT / "sources" / f"{source_key}.yaml")
+    resolver = {"kafka": _resolve, "oracle": _resolve_oracle, "file": _resolve_file}[declared]
+    return resolver(source_key).landing_table
+
+
+@pytest.mark.parametrize("task", _maintenance_tasks(), ids=lambda t: t["task_key"])
+def test_every_maintenance_task_names_a_source_that_actually_exists(task):
+    source_key = task["task_key"]
+    assert (CONF_ROOT / "sources" / f"{source_key}.yaml").is_file(), f"{source_key}: no source file"
+
+
+@pytest.mark.parametrize("task", _maintenance_tasks(), ids=lambda t: t["task_key"])
+def test_every_maintenance_task_s_landing_table_matches_what_the_source_resolves_to(task):
+    source_key = task["task_key"]
+    declared = task["sql_task"]["parameters"]["landing_table"]
+    assert declared.startswith("${var.data_catalog}."), (
+        f"{source_key}: job_maintenance.yml hardcodes a catalog in '{declared}' instead of "
+        "using ${var.data_catalog} - that silently breaks every environment but the one it "
+        "was copied from."
+    )
+    resolved = _resolved_landing_table(source_key)
+    declared_suffix = declared.removeprefix("${var.data_catalog}.")
+    resolved_suffix = resolved.split(".", 1)[1]
+    assert declared_suffix == resolved_suffix, (
+        f"{source_key}: job_maintenance.yml names landing_table '{declared}', but the source "
+        f"itself resolves to '{resolved}' (prod) - one of the two is stale."
+    )

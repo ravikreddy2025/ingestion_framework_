@@ -4,9 +4,16 @@
 # urgent, and it must never be able to make an ingestion run fail. If maintenance breaks,
 # ingestion keeps working and someone fixes maintenance on Monday.
 #
-# ONE TASK PER TOPIC, because landing is one table per topic. Adding a topic means adding a
-# task here with its landing table name - the same five-line copy as job_ingest_primary.yml.
-# The shared settings live in the anchor so they cannot drift between tasks.
+# ONE TASK PER SOURCE, because landing is one table per source. Adding a source means adding
+# a task here with its landing table name - the same five-line copy as job_ingest_primary.yml
+# / job_ingest_oracle.yml / job_ingest_file.yml. The shared settings live in the anchor so
+# they cannot drift between tasks.
+#
+# COVERAGE (docs/build_log/DECISIONS.md D-11): the three Kafka topics and the file source
+# below are covered. The Oracle source (oracle_claim_header) is NOT - that gap was flagged
+# in docs/build_log/STAGE_5_REPORT.md decision 8 as shared with the file source, and this
+# pass closes only the file half, per the instruction that produced D-11. Flagged again here
+# so it is not mistaken for closed.
 #
 # BEFORE THIS DEPLOYS, set `sql_warehouse_id` in databricks.yml. The default is a placeholder.
 #
@@ -116,3 +123,22 @@ resources:
               landing_retention_days: "{{job.parameters.landing_retention_days}}"
               vacuum_retention_hours: "{{job.parameters.vacuum_retention_hours}}"
               landing_table: "${var.data_catalog}.landing.antifraud_txn_alerts_v1"
+
+        # File source (Stage 5 / D-11). sql/04_maintenance.sql's OPTIMIZE/VACUUM shape is
+        # source-agnostic - it only needs a landing table name - so no SQL change was needed
+        # to cover this source, only this task.
+        - <<: *maintenance_task
+          task_key: file_claims_inbound
+          retry_on_timeout: false
+          sql_task:
+            warehouse_id: ${var.sql_warehouse_id}
+            file:
+              path: ../sql/04_maintenance.sql
+            parameters:
+              catalog: "{{job.parameters.catalog}}"
+              ops_catalog: "{{job.parameters.ops_catalog}}"
+              landing_retention_days: "{{job.parameters.landing_retention_days}}"
+              vacuum_retention_hours: "{{job.parameters.vacuum_retention_hours}}"
+              # Derived from target_schema/target_table in conf/sources/file_claims_inbound.yaml
+              # - see sources/file/config.py FileConfig.landing_table.
+              landing_table: "${var.data_catalog}.files_claims.claims_inbound"
