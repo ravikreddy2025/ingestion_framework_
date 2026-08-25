@@ -15,11 +15,8 @@ decides what a NON-ZERO rescued count means for the run itself: FAILFAST raises 
 land a batch quietly holding malformed rows; QUARANTINE lands it and only reports the count.
 
 THE FILE SOURCE IS CHECKPOINT-BASED (STAGE_5 brief, "Decision, already made"), so it takes
-on Kafka's checkpoint-reset guard exactly - not a second design. `_guard_against_
-checkpoint_reset` below mirrors sources/kafka/run.py's function of the same shape, adapted
-to this source's own fields: no `topic` filter is needed on the "already landed" check,
-because this source's landing table belongs to exactly one file source, unlike Kafka's
-shared per-cluster checkpoint namespace.
+on Kafka's checkpoint-reset guard exactly - not a second design. Both sources now call the
+one implementation in `framework/checkpoint.py::guard_against_checkpoint_reset`.
 
 `cloudFiles.schemaLocation` IS COVERED BY THE SAME GUARD AS THE STREAM CHECKPOINT
 -----------------------------------------------------------------------------------
@@ -36,21 +33,26 @@ option mechanism this run() applies before reading.
 
 from __future__ import annotations
 
-import os
 import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
 from ...framework import audit as audit_module
+from ...framework import checkpoint as checkpoint_guard
 from ...framework.contracts import RunContext, RunResult
 from ...framework.security import SecretResolver, apply_session_options
 from . import config as file_config
 from . import landing, security, tables
-from .config import RUN_TYPE_PRIMARY, FileConfig
+from .config import FileConfig
 from .reader import build_stream_reader
+from .spec import CHECKPOINT_RESET_ID, SOURCE_SPEC
 
 LAYER_LANDING = "landing"
+
+# This source's own control-table column for the reset id, reverse-looked-up once at
+# import time from SOURCE_SPEC.control_columns - see framework/checkpoint.py.
+_RESET_ID_CONTROL_COLUMN = checkpoint_guard.control_column_for(SOURCE_SPEC, CHECKPOINT_RESET_ID)
 
 
 def run(ctx: RunContext, secrets: Any = None) -> RunResult:
@@ -72,9 +74,16 @@ def run(ctx: RunContext, secrets: Any = None) -> RunResult:
         failure_mode=cfg.failure_mode,
     )
 
-    # BEFORE the reset id reaches the audit writer - see sources/kafka/run.py's guard for
-    # why the ordering is belt and braces rather than the only thing keeping it honest.
-    _guard_against_checkpoint_reset(ctx, cfg)
+    # BEFORE the reset id reaches the audit writer - see framework/checkpoint.py for why
+    # the ordering is belt and braces rather than the only thing keeping it honest.
+    checkpoint_guard.guard_against_checkpoint_reset(
+        ctx,
+        checkpoint_path=cfg.checkpoint_path,
+        landing_table=cfg.landing_table,
+        checkpoint_reset_id=cfg.checkpoint_reset_id,
+        is_replay=cfg.is_replay,
+        control_column=_RESET_ID_CONTROL_COLUMN,
+    )
     if cfg.checkpoint_reset_id:
         ctx.audit.rerun_id = cfg.checkpoint_reset_id
 
@@ -262,102 +271,3 @@ def _as_json(value: Any) -> str | None:
     if value is None:
         return None
     return value if isinstance(value, str) else json.dumps(value)
-
-
-# --------------------------------------------------------------------------------------
-# The startup guard - mirrors sources/kafka/run.py's, by design (STAGE_5 brief: "do not
-# write a second guard"). See that module for the full reasoning; this is the same shape
-# applied to this source's own fields.
-# --------------------------------------------------------------------------------------
-
-
-def _checkpoint_offsets_exist(checkpoint_path: str) -> bool:
-    """Is there an offsets directory under this checkpoint? Same probe as Kafka's, and the
-    same reason it is `os.stat()` rather than `os.path.exists()` - see sources/kafka/run.py."""
-    probe = os.path.join(checkpoint_path, "offsets")
-    try:
-        os.stat(probe)
-    except FileNotFoundError:
-        return False
-    except OSError as exc:
-        raise RuntimeError(
-            f"Could not determine whether the checkpoint exists at {probe}: {type(exc).__name__}: {exc}\n\n"
-            "This is NOT the same as the checkpoint being missing, so this job refuses to guess: "
-            "treating it as missing would block a healthy stream, and treating it as present would "
-            "disable the guard against silent data loss. Confirm the driver on this compute profile "
-            "can read the checkpoint Volume, then re-run."
-        ) from exc
-    return True
-
-
-def _guard_against_checkpoint_reset(ctx: RunContext, cfg: FileConfig) -> None:
-    """Refuse to run a primary stream in either state that would silently ingest nothing.
-
-    No `topic`-style filter on the "already landed" check: unlike Kafka's shared-checkpoint-
-    namespace-per-cluster shape, this source's landing table belongs to exactly this one
-    file source, so "does the landing table hold any rows at all" is the whole question.
-    """
-    if cfg.is_replay:
-        return
-    if _checkpoint_offsets_exist(cfg.checkpoint_path):
-        return
-
-    if cfg.checkpoint_reset_id:
-        if _reset_id_already_used(ctx, cfg):
-            raise RuntimeError(
-                f"REFUSING TO RUN: checkpoint_reset_id '{cfg.checkpoint_reset_id}' has ALREADY been "
-                f"used by an earlier run of '{cfg.source_key}', and the checkpoint is missing again "
-                f"({cfg.checkpoint_path}).\n\n"
-                "A reset id is single-use. It works by forking this source's Delta transaction "
-                "identity, so a restarted stream has no committed versions to collide with. Reusing "
-                "one keeps the OLD identity - against which Delta already holds high versions - so "
-                "batch ids would restart at 0 and EVERY WRITE WOULD BE SKIPPED AS A DUPLICATE. The "
-                "run would report success and ingest nothing.\n\n"
-                "Set file_checkpoint_reset_id to an UNUSED incident id and re-run. Do not clear the "
-                "field afterwards."
-            )
-        ctx.log.warning(
-            "file_checkpoint_reset_engaged",
-            source_key=cfg.source_key,
-            checkpoint_reset_id=cfg.checkpoint_reset_id,
-            txn_app_id=cfg.txn_app_id,
-            note=(
-                "starting this stream from batch 0 under a NEW transaction identity; do NOT clear "
-                "this field afterwards - reverting to the old identity would resurrect the exact "
-                "collision it was set to avoid"
-            ),
-        )
-        return
-
-    if not ctx.tables.table_exists(ctx.spark, cfg.landing_table):
-        return
-    already_landed = ctx.spark.table(cfg.landing_table).limit(1).count() > 0
-    if not already_landed:
-        return
-    raise RuntimeError(
-        f"REFUSING TO RUN: the checkpoint for '{cfg.source_key}' is missing ({cfg.checkpoint_path}) "
-        f"but {cfg.landing_table} already holds rows.\n\n"
-        "Running now would restart batch ids at 0, and Delta would silently SKIP every write as a "
-        "duplicate - the job would report success and ingest nothing.\n\n"
-        "Set file_checkpoint_reset_id to an unused incident id in the control table to restart under "
-        "a fresh identity - see docs/RUNBOOK_SUPPORT.md."
-    )
-
-
-def _reset_id_already_used(ctx: RunContext, cfg: FileConfig) -> bool:
-    """Has this reset id appeared on a primary run of this source before? Same audit-table
-    check as Kafka's, and the same reasoning: a missing row reads as "unused", which is the
-    correct default when the audit table is itself best-effort."""
-    audit_table = ctx.cfg.get("audit_table")
-    if not audit_table or not ctx.tables.table_exists(ctx.spark, audit_table):
-        return False
-    rows = (
-        ctx.spark.table(audit_table)
-        .where(
-            f"source_key = '{cfg.source_key}' AND run_type = '{RUN_TYPE_PRIMARY}' "
-            f"AND rerun_id = '{cfg.checkpoint_reset_id}' AND run_id <> '{ctx.run_id}'"
-        )
-        .limit(1)
-        .collect()
-    )
-    return bool(rows)

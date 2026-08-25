@@ -37,21 +37,22 @@ THE ONE FAILURE THAT LOOKS LIKE SUCCESS
 ---------------------------------------
 Delete the primary checkpoint and batch ids restart at 0, but Delta has already recorded
 higher versions for this app id - so every write is SKIPPED as a duplicate, the job reports
-success, and nothing is ingested. `_guard_against_checkpoint_reset` refuses to run in
-exactly that state, and `checkpoint_reset_id` is the deliberate, single-use way through it.
-Read that function before touching either.
+success, and nothing is ingested. `framework/checkpoint.py::guard_against_checkpoint_reset`
+refuses to run in exactly that state, and `checkpoint_reset_id` is the deliberate,
+single-use way through it. Read that function before touching either - it is shared with
+sources/file/run.py, the other checkpoint-based source.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
 from ...framework import audit as audit_module
+from ...framework import checkpoint as checkpoint_guard
 from ...framework.contracts import RunContext, RunResult
 from ...framework.security import SecretResolver
 from . import config as kafka_config
@@ -60,12 +61,17 @@ from .config import RUN_TYPE_CURATED_REPLAY, RUN_TYPE_KAFKA_REPLAY, KafkaConfig
 from .reader import build_batch_reader, build_stream_reader, resolve_trigger
 from .registry import SchemaRegistryClient
 from .security import build_registry_auth
+from .spec import CHECKPOINT_RESET_ID, SOURCE_SPEC
 
 LOG = logging.getLogger(__name__)
 
 LAYER_LANDING = "landing"
 LAYER_CURATED = "curated"
 LAYER_QUARANTINE = "quarantine"
+
+# This source's own control-table column for the reset id, reverse-looked-up once at
+# import time from SOURCE_SPEC.control_columns - see framework/checkpoint.py.
+_RESET_ID_CONTROL_COLUMN = checkpoint_guard.control_column_for(SOURCE_SPEC, CHECKPOINT_RESET_ID)
 
 # The txnVersion for an execution that is not a microbatch (a bounded batch replay, a
 # curated replay). Negative so it can never collide with a real batch id, and so
@@ -97,7 +103,14 @@ def run(ctx: RunContext, secrets: Any = None) -> RunResult:
     # BEFORE the reset id reaches the audit writer, so the history check below cannot see
     # this run's own rows. It excludes the current run_id as well, so the ordering is
     # belt and braces rather than the only thing keeping the check honest.
-    _guard_against_checkpoint_reset(ctx, cfg)
+    checkpoint_guard.guard_against_checkpoint_reset(
+        ctx,
+        checkpoint_path=cfg.checkpoint_path,
+        landing_table=cfg.landing_table,
+        checkpoint_reset_id=cfg.checkpoint_reset_id,
+        is_replay=cfg.is_replay,
+        control_column=_RESET_ID_CONTROL_COLUMN,
+    )
     if cfg.checkpoint_reset_id:
         # One column, two meanings, told apart by run_type: a replay's id on a replay run,
         # and the reset id that forked the write identity on a primary one. This is what
@@ -513,136 +526,3 @@ def _event_date_predicate(df: Any) -> str | None:
 
 def _elapsed_ms(since: float) -> int:
     return int((time.time() - since) * 1000)
-
-
-# --------------------------------------------------------------------------------------
-# The startup guard
-# --------------------------------------------------------------------------------------
-
-
-def _checkpoint_offsets_exist(checkpoint_path: str) -> bool:
-    """Is there an offsets directory under this checkpoint?
-
-    Deliberately NOT os.path.exists(): that swallows every OSError and returns False, so a
-    Volume the driver cannot reach right now would be indistinguishable from a checkpoint
-    someone deleted. The guard below turns "absent" into a hard refusal, so a false
-    "absent" blocks a perfectly healthy job.
-
-    os.stat() raises instead, which separates the three cases:
-      FileNotFoundError -> genuinely absent, the case the guard exists for
-      other OSError     -> we cannot tell; say so rather than guessing either way
-      no exception      -> present
-    """
-    probe = os.path.join(checkpoint_path, "offsets")
-    try:
-        os.stat(probe)
-    except FileNotFoundError:
-        return False
-    except OSError as exc:
-        raise RuntimeError(
-            f"Could not determine whether the checkpoint exists at {probe}: {type(exc).__name__}: {exc}\n\n"
-            "This is NOT the same as the checkpoint being missing, so this job refuses to guess: "
-            "treating it as missing would block a healthy stream, and treating it as present would "
-            "disable the guard against silent data loss. Confirm the driver on this compute profile "
-            "can read the checkpoint Volume, then re-run."
-        ) from exc
-    return True
-
-
-def _guard_against_checkpoint_reset(ctx: RunContext, cfg: KafkaConfig) -> None:
-    """Refuse to run a primary stream in either state that would silently ingest nothing.
-
-    The order of the branches IS the logic, so read them in order:
-
-    1. A REPLAY is never guarded. It has its own checkpoint and its own app id by
-       construction, so neither collision is possible.
-    2. THE CHECKPOINT EXISTS -> nothing to guard. This is also what makes a stale
-       `checkpoint_reset_id` inert rather than a permanent alarm: once the stream has a
-       checkpoint again, the field only forks the app id (which must stay forked) and no
-       longer bypasses anything.
-    3. THE CHECKPOINT IS GONE AND A RESET ID IS SET. This is the deliberate bypass - but
-       ONLY if the id has never been used before. Reusing one is the third of the three
-       silent-data-loss states, and the nastiest: the guard is bypassed, batch ids restart
-       at 0, and the app id is UNCHANGED, so Delta still holds high versions against it and
-       skips every write. The run reports success and ingests nothing. Hence the history
-       check, and hence a raise rather than a warning.
-    4. THE CHECKPOINT IS GONE WITH NO RESET ID -> the original silent-data-loss case.
-       Narrow on purpose: a genuine first run has no landing rows for this topic and is not
-       tripped, and the check never looks at curated, so pre-loading curated from a legacy
-       system does not trip it either.
-    """
-    if cfg.is_replay:
-        return
-    if _checkpoint_offsets_exist(cfg.checkpoint_path):
-        return
-
-    if cfg.checkpoint_reset_id:
-        if _reset_id_already_used(ctx, cfg):
-            raise RuntimeError(
-                f"REFUSING TO RUN: checkpoint_reset_id '{cfg.checkpoint_reset_id}' has ALREADY been "
-                f"used by an earlier run of '{cfg.source_key}', and the checkpoint is missing again "
-                f"({cfg.checkpoint_path}).\n\n"
-                "A reset id is single-use. It works by forking this source's Delta transaction "
-                "identity, so a restarted stream has no committed versions to collide with. Reusing "
-                "one keeps the OLD identity - against which Delta already holds high versions - so "
-                "batch ids would restart at 0 and EVERY WRITE WOULD BE SKIPPED AS A DUPLICATE. The "
-                "run would report success and ingest nothing.\n\n"
-                "Set kafka_checkpoint_reset_id to an UNUSED incident id (the current incident's, not "
-                "the old one's) and re-run. Do not clear the field afterwards. Full procedure: "
-                "docs/RUNBOOK_SUPPORT.md 5.4a."
-            )
-        ctx.log.warning(
-            "kafka_checkpoint_reset_engaged",
-            source_key=cfg.source_key,
-            checkpoint_reset_id=cfg.checkpoint_reset_id,
-            txn_app_id=cfg.txn_app_id,
-            note=(
-                "starting the primary stream from batch 0 under a NEW transaction identity; "
-                "do NOT clear this field afterwards - reverting to the old identity would "
-                "resurrect the exact collision it was set to avoid"
-            ),
-        )
-        return
-
-    if not ctx.tables.table_exists(ctx.spark, cfg.landing_table):
-        return
-    already_landed = ctx.spark.table(cfg.landing_table).where(f"topic = '{cfg.topic}'").limit(1).count() > 0
-    if not already_landed:
-        return
-    raise RuntimeError(
-        f"REFUSING TO RUN: the primary checkpoint for '{cfg.source_key}' is missing "
-        f"({cfg.checkpoint_path}) but {cfg.landing_table} already holds rows for topic "
-        f"'{cfg.topic}'.\n\n"
-        "Running now would restart batch ids at 0, and Delta would silently SKIP every write as a "
-        "duplicate - the job would report success and ingest nothing.\n\n"
-        "To reprocess data, use the kafka replay job with a new rerun_id (it uses its own checkpoint "
-        "and its own txnAppId). To restart the primary stream itself, set kafka_checkpoint_reset_id "
-        "to an unused incident id in the control table - see docs/RUNBOOK_SUPPORT.md 5.4a."
-    )
-
-
-def _reset_id_already_used(ctx: RunContext, cfg: KafkaConfig) -> bool:
-    """Has this reset id appeared on a PRIMARY run of this source before?
-
-    The audit table is best-effort evidence, which is normally a reason not to depend on it
-    - but the failure direction here is safe. A missing row means this reads as "unused",
-    so the run proceeds under a forked identity, which is the correct outcome for a genuine
-    first use. Being wrong the other way (refusing a legitimate reset) is the more expensive
-    mistake, and it is the one this cannot make.
-
-    The current run is excluded explicitly, so this does not depend on being called before
-    the reset id reaches the audit writer - though it is, and run() says so.
-    """
-    audit_table = ctx.cfg.get("audit_table")
-    if not audit_table or not ctx.tables.table_exists(ctx.spark, audit_table):
-        return False
-    rows = (
-        ctx.spark.table(audit_table)
-        .where(
-            f"source_key = '{cfg.source_key}' AND run_type = '{kafka_config.RUN_TYPE_PRIMARY}' "
-            f"AND rerun_id = '{cfg.checkpoint_reset_id}' AND run_id <> '{ctx.run_id}'"
-        )
-        .limit(1)
-        .collect()
-    )
-    return bool(rows)
