@@ -729,3 +729,95 @@ override of one is ignored and logged.
 A replay **never writes `ingest_state`**, so the scheduled delta load keeps its own position
 and an incident cannot strand production state at a bound somebody typed once. Both bounds
 are operational-only: a bound checked into Git would re-extract the same window forever.
+
+---
+
+## 10. File sources — `conf/sources/<source_key>.yaml`, `source_type: file`
+
+Added in Stage 5. Sections 1–9 describe Kafka and Oracle; this one is self-contained.
+
+Copy `conf/sources/_TEMPLATE_file.yaml` to onboard a drop zone. It carries the four
+questions whoever owns the landing zone has to answer first — the full schema and whether
+it drifts, whether files are ever rewritten in place, whether the file name carries data
+that belongs in a column, and roughly how many files land per day.
+
+**Use Auto Loader (`cloudFiles`), always `availableNow`** (CORE section 10 / the STAGE_5
+brief's decision, already made — not a per-source choice). **This source is
+checkpoint-based**, exactly like Kafka's primary stream, and reuses the *same*
+checkpoint-reset mechanism — see the MUST-READ block below rather than a second design.
+
+### 🔴 MUST-READ — this source shares Kafka's checkpoint-reset guard
+
+Deleting or losing this source's checkpoint restarts Auto Loader's internal batch
+numbering from zero. Delta has already recorded higher `txnVersion`s against this source's
+app id, so every write is silently **skipped as a duplicate** — the job reports success and
+ingests nothing. The framework refuses to start in that state with a message beginning
+`REFUSING TO RUN`, exactly Kafka's guard, applied to this source's own checkpoint and
+landing table. See `docs/RUNBOOK_SUPPORT.md` §9 for the restart procedure — it is the same
+five-step procedure as Kafka's §5.4a, with `file_checkpoint_reset_id` in place of
+`kafka_checkpoint_reset_id`.
+
+`cloudFiles.schemaLocation` is a **separate** checkpoint-like resource, covered by the same
+guard indirectly rather than directly — see `docs/DESIGN.md` §11 for the reasoning.
+
+### 🔴 MUST CHANGE
+
+| Key | What it is |
+|---|---|
+| `storage_ref` | A profile name from `conf/storage.yaml`. Never an account URL. |
+| `source_path` | The path **within** the container only — never a full `abfss://` URL. The account and container come from `storage_ref`, which is what lets the same source file resolve to a different account per environment. |
+| `file_format` | `csv` \| `json` \| `parquet` \| `avro`. |
+| `target_schema` / `target_table` | Where this lands. A file feed has no source-side schema/table the way Oracle's does, so these are your own choice, not a derivation — `{catalog}.<target_schema>.<target_table>`. The target schema must already exist: `CREATE SCHEMA IF NOT EXISTS <catalog>.<target_schema>;` in every environment, before the first run. |
+| `domain` | Owning team. Appears in every audit row. |
+
+### 🟡 NICE TO CHANGE
+
+| Key | Default | Change it when |
+|---|---|---|
+| `schema_mode` | `provided` | `provided` needs `schema:` — a DDL column-list string. **`infer` is a source of silent type drift in prod**: a new column, or a value that happens to look like a date in one file's sample, changes the inferred schema with no review and no error anywhere. `hints` narrows inference towards real types (`cloudFiles.inferColumnTypes`) without naming a schema at all — see the note in `sources/file/reader.py` for why this framework reads `hints` that way rather than as `cloudFiles.schemaHints`. |
+| `path_glob` | `*` | The same directory holds more than one file shape. |
+| `format_options` | `{}` | Reader options **specific to `file_format`** — an unknown key for the configured format is rejected (Spark would otherwise ignore it silently and produce a table full of wrong columns). Known options: **csv** — `header`, `delimiter`, `encoding`, `quote`, `escape`, `comment`, `nullValue`, `emptyValue`, `dateFormat`, `timestampFormat`, `multiLine`, `ignoreLeadingWhiteSpace`, `ignoreTrailingWhiteSpace`. **json** — `multiLine`, `encoding`, `dateFormat`, `timestampFormat`, `allowComments`, `primitivesAsString`. **parquet** — `mergeSchema`, `datetimeRebaseMode`. **avro** — `avroSchema`, `datetimeRebaseMode`, `ignoreExtension`. |
+| `filename_columns` | `{}` | The file name carries data (a business date, a batch id). Each value is a regex with **exactly one capture group**, matched against the full file path — checked at config load, not at the first file that reaches it. |
+| `landing_partition_by` | `[ingest_date]` | Rarely — `ingest_date` (the date this framework WROTE the row, not a date in the data) bounds partition growth and makes retention a partition drop. |
+| `listing_mode` | `directory` | `directory` needs no extra infrastructure; `notification` needs Event Grid + Queue Storage provisioning this tenancy may not permit — see VB-07. |
+| `max_files_per_trigger` | `1000` | Lower it to get a huge backlog through in survivable chunks. Unset is not "no limit" — the whole backlog would arrive as one microbatch on the first run, whose failure costs the whole run. Operationally overridable: `ingest_control.file_max_files_per_trigger`. |
+| `failure_mode` | `FAILFAST` | `FAILFAST` refuses a batch that contains a row Auto Loader could not fit the configured schema (its `_rescued_data` column is non-NULL). `QUARANTINE` lands it and only reports the count — flip it to unblock a stuck source, no deploy. There is no separate quarantine TABLE for this source: the rescued row lands in the SAME landing table, with whatever did not fit captured in `_rescued_data` rather than dropped. Operationally overridable: `ingest_control.file_failure_mode`. |
+
+### 🟢 NO CHANGE REQUIRED
+
+| Key | Why |
+|---|---|
+| `checkpoint_root` / `schema_location_root` | Volume-backed roots, platform-wide, following the same pattern as Kafka's `checkpoint_root`. |
+| `landing_table` | Derived from `target_schema` / `target_table`. |
+| `table_properties` | Platform-wide, from `conf/defaults.yaml`. |
+
+### Storage register — `conf/storage.yaml`
+
+Same register pattern as `conf/clusters.yaml` / `conf/registries.yaml` / `conf/jdbc.yaml`:
+the register records the auth mode and the secret **key names**; `conf/environments/<env>.yaml`
+overrides the account, container and secret **scope** per environment. Two auth modes:
+
+| `auth_mode` | Session options this framework sets | Secret keys the register names |
+|---|---|---|
+| `account_key` | `fs.azure.account.key.<account>.dfs.core.windows.net` | `account_key_secret_key` |
+| `service_principal` | `fs.azure.account.auth.type.*` = OAuth, plus the client id/secret/endpoint options | `client_id_secret_key`, `client_secret_secret_key` (+ register-level `tenant_id`, not a secret) |
+
+Everything else Azure/ADLS supports (SAS tokens, managed identity, Unity Catalog credential
+passthrough) is deliberately not implemented — see `sources/file/security.py`'s module
+docstring. Adding one is a code change, not a config guess. **These credentials reach the
+read as SESSION configuration (`spark.conf.set()`), not as reader `.option()` calls** — see
+VB-26 for what is unverified about that mechanism on the target compute.
+
+### Operational overrides — `ingest_control`
+
+Three columns, mirroring Kafka's three exactly (`docs/build_log/DECISIONS.md` D-01):
+
+| Column | Setting | Effect |
+|---|---|---|
+| `file_failure_mode` | `failure_mode` | `FAILFAST` ↔ `QUARANTINE` — see the NICE TO CHANGE row above. |
+| `file_max_files_per_trigger` | `max_files_per_trigger` | Lower it to get a huge backlog through in survivable chunks. |
+| `file_checkpoint_reset_id` | — | Bypasses the checkpoint-reset guard **and** forks the Delta transaction identity — see the MUST-READ block above and `docs/RUNBOOK_SUPPORT.md` §9. Single-use. Never blank it back out once set. |
+
+Everything that decides where this source reads from and where it lands —
+`storage_ref`, `source_path`, `target_schema`, `target_table`, `landing_partition_by` — is
+structural, and an override of one is ignored and logged.

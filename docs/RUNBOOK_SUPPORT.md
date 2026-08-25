@@ -607,3 +607,78 @@ The lever for "the delta load has been missing rows and we need a clean sweep".
   accept the change and recreate the table.
 * **Dropped or renamed table**: the read fails loudly. The source file is wrong, or the
   table is gone; both are a PR.
+
+## 9. File incident playbooks
+
+**This source shares Kafka's checkpoint-reset guard and its restart procedure** — the
+column names and table names below differ, the steps and the reasoning do not. Where a step
+is identical to §5.4a it says so rather than repeating five paragraphs.
+
+### 9.1 A file run failed once — transient
+
+Symptom: one failed run (a network blip against the storage account, a transient read
+error), the next run is fine.
+
+1. Q1/Q2 (generic, work for every source type) — confirm which layer failed and that it was
+   not a repeat of the same failure.
+2. Re-run the task. Structured Streaming re-executes the failed batch over the identical
+   file set — the checkpoint records which files it started with BEFORE `foreachBatch` runs,
+   and commits only after it returns cleanly — so a retry is not a second read of files
+   already landed, and Delta's `txnAppId`/`txnVersion` markers suppress any duplicate.
+
+### 9.2 A batch keeps failing on the same rescued rows — poison batch
+
+Symptom: the same run fails repeatedly, and the error names rows that did not fit the
+configured schema.
+
+1. Confirm `file_failure_mode` is `FAILFAST` (the platform default) — that is what turns a
+   non-empty rescued count into a refusal rather than a landed-with-a-warning batch.
+2. To unblock immediately, no deploy:
+   ```sql
+   UPDATE {ops_catalog}.{control_schema}.ingest_control
+   SET file_failure_mode = 'QUARANTINE',
+       notes = 'INC12345 - unblocking to investigate rescued rows, see _rescued_data',
+       updated_by = current_user(), updated_at = current_timestamp()
+   WHERE source_key = 'file_claims_inbound';
+   ```
+3. Re-run. The batch lands, with the mismatched rows' `_rescued_data` column populated —
+   query the landing table directly:
+   ```sql
+   SELECT *, _rescued_data FROM {catalog}.files_claims.claims_inbound
+   WHERE _rescued_data IS NOT NULL
+   ORDER BY ingest_ts DESC LIMIT 20;
+   ```
+4. Fix the root cause (a `schema:` update, a `format_options` correction) in a PR, THEN set
+   `file_failure_mode` back to NULL (inherit `FAILFAST`) — leaving it on `QUARANTINE`
+   indefinitely means the next genuinely bad batch lands silently instead of paging anyone.
+
+### 9.3 Someone deleted (or corrupted) the checkpoint
+
+**Identical to §5.4** with `file_checkpoint_reset_id` / `file_ingest::<source_key>` in place
+of `kafka_checkpoint_reset_id` / the Kafka app id. The framework refuses to start with a
+message beginning `REFUSING TO RUN`. Do not delete landing rows to silence it.
+
+### 9.4 Restarting after a genuine checkpoint loss
+
+Follow **§5.4a's five steps exactly**, substituting:
+
+| §5.4a step | This source's equivalent |
+|---|---|
+| Record where the stream got to (Q13, Kafka-specific) | There is no per-partition offset query for Auto Loader's own position format. Instead, read the last COMPLETED run's `position_end` from the audit table — it carries Auto Loader's own offset JSON verbatim (`sources/file/run.py` `_record_positions`): `SELECT position_end FROM {ops_catalog}.{audit_schema}.ingest_audit WHERE source_key = 'file_claims_inbound' AND layer = 'landing' AND status = 'COMPLETED' ORDER BY event_ts DESC LIMIT 1;` |
+| Check the reset id has never been used (Q6d) | Same query shape, generic across source types: `SELECT run_id, rerun_id, min(event_ts), max(event_ts) FROM {ops_catalog}.{audit_schema}.ingest_audit WHERE source_key = 'file_claims_inbound' AND run_type = 'primary' AND rerun_id IS NOT NULL GROUP BY run_id, rerun_id ORDER BY 4 DESC;` |
+| Set a fresh reset id | `UPDATE {ops_catalog}.{control_schema}.ingest_control SET file_checkpoint_reset_id = 'INC12345', notes = '...', updated_by = current_user(), updated_at = current_timestamp() WHERE source_key = 'file_claims_inbound';` |
+| Backfill the gap | **There is no file replay job in this stage** (unlike Kafka's). A gap between the recorded position and the restart has to be closed by re-presenting the missing files to the landing zone under new names, or waiting for `docs/build_log/DECISIONS.md`-style follow-up work to add one — flag this explicitly during the incident rather than assuming a tool exists. |
+| Clear nothing | Same: `file_checkpoint_reset_id` is not a toggle. Leaving it set is correct and permanent. |
+
+### 9.5 Emergency stop
+
+Same as every source type: `enabled = FALSE` in the control table for this `source_key`.
+The job runs, reads nothing, writes a `SKIPPED` audit row so silence is never ambiguous —
+Auto Loader's own checkpoint is untouched, so re-enabling resumes from where it left off.
+
+### 9.6 A landing zone owner reports files "disappearing"
+
+This framework never moves, renames or deletes a source file (`docs/DESIGN.md` §11,
+"Deliberately not built"). If files are vanishing from the landing zone, that is happening
+outside this job — check the storage account's own lifecycle policies and any other process
+with write access to the container before assuming this job is responsible.

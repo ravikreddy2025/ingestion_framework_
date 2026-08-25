@@ -502,3 +502,98 @@ version of a claim. Two consequences, both deliberate:
 
 A source with **no** cursor has no version identity, so its merge updates matched rows: the
 key identifies the row, a match means it changed, and the mirror would go stale otherwise.
+
+---
+
+## 11. Files — Auto Loader, the shared checkpoint-reset guard, and what is deliberately
+not built
+
+Added in Stage 5. Sections 1–10 describe Kafka and Oracle; this one is self-contained.
+(Sections 6–9 predate the framework/sources split and still refer to modules — `pipeline.py`,
+`curated_writer.py`, `conf/topics/`, `azure-pipelines.yml` — that no longer exist under
+those names; not corrected here, as it is outside this stage's scope, but worth flagging so
+nobody trusts them as current.)
+
+### Why Auto Loader, and why `availableNow` always
+
+CORE section 10 decided this ahead of Stage 5: Auto Loader (`cloudFiles`) over a hand-rolled
+processed-files ledger. A ledger is Auto Loader re-implemented with worse listing
+performance and a new correctness surface — tracking which files have been seen is exactly
+what `cloudFiles.schemaLocation` and the stream checkpoint already do. The consequence
+accepted knowingly: **this source is checkpoint-based**, exactly like Kafka's primary
+stream, with everything that implies about restart safety.
+
+There is no per-source `trigger:` the way Kafka has one — this source is always a bounded
+`availableNow` run, because that is the only shape a scheduled Workflows run has a natural
+end under, and there is no case in this framework's scope for a genuinely continuous file
+stream.
+
+### The checkpoint-reset guard is reused, not redesigned
+
+The STAGE_5 brief is explicit: "the file source is checkpoint-based... wire that in; do not
+write a second guard." `sources/file/run.py`'s `_guard_against_checkpoint_reset` mirrors
+`sources/kafka/run.py`'s function of the same name field-for-field — same three states (checkpoint
+intact / gone-with-a-fresh-reset-id / gone-with-no-reset-id-and-data-already-landed), same
+refusal message shape, same single-use reset-id check against the audit table.
+
+**It is a deliberate, small duplication, not a shared framework function.** Two sources
+(Kafka and this one) need it; CORE section 2 rule 4 sets the bar for a new abstraction at
+**three** implementations, and Oracle has no checkpoint at all — its correctness rests on
+`ingest_state`'s watermark instead. Promoting the guard to `framework/` today would be the
+premature abstraction rule 4 exists to prevent. If a third checkpoint-based source ever
+arrives, this is the first place to look.
+
+**What differs from Kafka's, and why:** Kafka's "already landed" check filters landing by
+`topic`, because one Kafka cluster's checkpoint namespace is shared across topics. A file
+source's landing table belongs to exactly one file source — there is no equivalent
+namespace to disambiguate — so the check here is simply "does the landing table hold any
+row at all."
+
+### `cloudFiles.schemaLocation` and the reset guard — the decision
+
+`schemaLocation` is a second checkpoint-like resource, living beside the stream checkpoint
+under the same Volume root, keyed by the same `source_key` (`sources/file/config.py`
+`checkpoint_path` / `schema_location_path` are siblings). **Decision: the reset guard covers
+the stream checkpoint directly and the schema location indirectly, through that shared
+`source_key` scoping — it is not probed or reset separately.**
+
+Reasoning: a `checkpoint_reset_id` forks the stream's Delta transaction identity so a
+restarted stream has no committed versions to collide with. It does **not** delete or move
+`schema_location_path` — nothing in this framework does, ever, matching the "do not build a
+processed-files ledger, do not build file archiving" scope boundary below. A fresh stream
+under a forked identity re-applies (`schema_mode: provided`) or re-infers
+(`hints`/`infer`) against whatever is already at that path for this `source_key`, which is
+unaffected by the reset. The failure mode this would NOT catch — a schema recorded before an
+incident no longer matching reality — is the same as an ordinary schema-mode-`infer` risk
+documented in `docs/CONFIGURATION.md`, not something specific to a reset. If Auto Loader's
+actual behaviour on encountering a stale schema location after a fresh-identity restart
+turns out to matter in practice, add a VB entry then — nothing here is asserted with
+confidence beyond "the guard's job is the Delta identity fork, and it does that regardless
+of `schemaLocation`."
+
+### Failure scenarios
+
+| # | Failure | Duplicates? | Rows lost? | Fix — no code change |
+|---|---|---|---|---|
+| 1 | A malformed file mid-batch (unparseable row) | No | No, if `failure_mode: QUARANTINE` | The batch lands with `_rescued_data` populated for that row; investigate and re-onboard the fix. Under `FAILFAST` (the default) the whole batch is refused and retries until fixed or the mode is flipped. |
+| 2 | A file rewritten in place, under the same path, after Auto Loader has already processed it | No | **Yes — silently** | Auto Loader tracks files it has SEEN, not their content hash by default; a rewrite under the same name is not re-read. Producers must write under a NEW name (a convention, not something this code enforces) — document this in the onboarding checklist for a landing zone at risk of it. |
+| 3 | A file arrives late (after the run that would ordinarily have picked it up) | No | No | The next scheduled run picks it up — `availableNow` drains whatever is present, whenever it runs. Nothing to do. |
+| 4 | Schema drift between files (a new column, a changed type) | Depends on `schema_mode` | Depends | `provided`: a genuinely new column is dropped unless `rescuedDataColumn` catches it (VB-06); a type mismatch across files becomes rescued data or a cast failure depending on format. `infer`/`hints`: the inferred schema can change between runs with no review — this is exactly why `provided` is the platform default. |
+| 5 | `cloudFiles.schemaLocation` deleted | Behaves like a genuine first run for schema purposes | No, if the stream checkpoint is intact | Auto Loader re-infers or re-applies the schema on the next microbatch; the STREAM checkpoint (a separate resource) still prevents re-reading already-processed files. If the stream checkpoint is ALSO gone, this is the ordinary checkpoint-reset scenario above. |
+
+### Deliberately not built
+
+- **File archiving, moving or deletion.** Moving or deleting source files after ingest is a
+  data-loss-shaped operation that belongs to whoever owns the landing zone, not to this
+  framework. **Open item for the incoming team:** if a landing zone accumulates files
+  without bound, that is an operational concern for its owner to solve (a lifecycle policy
+  on the storage account is the usual answer), not something this job does on their behalf.
+- **A processed-files ledger.** Auto Loader's own checkpoint already is one.
+- **A second checkpoint-reset guard.** See above.
+- **A format abstraction layer.** `file_format` is a config value passed to Auto Loader
+  directly; there is no strategy-pattern class per format.
+- **Schema inference caching, or a schema registry for files.** `cloudFiles.schemaLocation`
+  already is the former; there is no equivalent of Kafka's Schema Registry for file drops
+  in this framework's scope.
+- **SAS-token and managed-identity storage auth.** Only `account_key` and
+  `service_principal` are implemented — see `sources/file/security.py`.
