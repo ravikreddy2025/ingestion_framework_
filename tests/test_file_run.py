@@ -1,9 +1,9 @@
-"""sources/file/run.py - the checkpoint-reset guard, and the microbatch body.
+"""sources/file/run.py - the checkpoint-reset guard wiring, and the microbatch body.
 
-Mirrors tests/test_kafka_run.py by design - STAGE_5 brief: "do not write a second guard".
-Where the two differ is exactly where the code differs: no `topic`-style filter on the
-"already landed" check, because this source's landing table belongs to exactly one file
-source, unlike Kafka's shared per-cluster checkpoint namespace.
+The checkpoint-reset guard itself is a shared framework function now
+(framework/checkpoint.py, tested in tests/test_framework_checkpoint.py); what is left here
+is proof that this source wires its own fields into it correctly, mirroring
+tests/test_kafka_run.py's wiring tests of the same shape.
 """
 
 from __future__ import annotations
@@ -21,14 +21,21 @@ LANDING_TABLE = "cat_dev.files_claims.claims_inbound"
 
 
 # --------------------------------------------------------------------------------------
-# The startup guard
+# The startup guard - the full behaviour matrix lives in tests/test_framework_checkpoint.py
+# now that the guard itself is a shared framework function. What is left here is WIRING:
+# does this source's run() feed ITS OWN checkpoint path, landing table, reset id and
+# control column into that shared guard correctly.
 # --------------------------------------------------------------------------------------
 
 
 @pytest.fixture
 def checkpoint(monkeypatch):
-    """Control whether the guard believes the checkpoint exists - same technique as
-    tests/test_kafka_run.py's fixture of the same name."""
+    """Control whether the guard believes the checkpoint exists.
+
+    Patches the shared probe in framework/checkpoint.py - same technique as
+    tests/test_kafka_run.py's fixture of the same name.
+    """
+    from kafka_ingest.framework import checkpoint as checkpoint_guard
 
     def _set(exists=True, error=None):
         def probe(_path):
@@ -36,7 +43,7 @@ def checkpoint(monkeypatch):
                 raise error
             return exists
 
-        monkeypatch.setattr(file_run, "_checkpoint_offsets_exist", probe)
+        monkeypatch.setattr(checkpoint_guard, "_checkpoint_offsets_exist", probe)
 
     return _set
 
@@ -49,90 +56,16 @@ def _ctx(config_root, existing_tables=(), landing_rows=(), audit_rows=(), **kwar
     return make_file_ctx(config_root, spark=spark, existing_tables=existing_tables, **kwargs)
 
 
-def _guard(ctx):
-    from kafka_ingest.sources.file import config as file_config
-
-    cfg = file_config.build(ctx.cfg, ctx.run_type, ctx.tables)
-    file_run._guard_against_checkpoint_reset(ctx, cfg)
-
-
-def test_the_guard_allows_a_run_whose_checkpoint_is_intact(file_config_root, checkpoint):
-    checkpoint(exists=True)
-    _guard(_ctx(file_config_root, existing_tables=(LANDING_TABLE,), landing_rows=[{"claim_id": "1"}]))
-
-
-def test_the_guard_allows_a_genuine_first_run(file_config_root, checkpoint):
-    checkpoint(exists=False)
-    _guard(_ctx(file_config_root, existing_tables=(LANDING_TABLE,), landing_rows=[]))
-
-
-def test_the_guard_allows_a_run_when_the_landing_table_does_not_exist_yet(file_config_root, checkpoint):
-    checkpoint(exists=False)
-    _guard(_ctx(file_config_root))
-
-
 def test_the_guard_refuses_when_the_checkpoint_vanished_but_data_exists(file_config_root, checkpoint):
-    """The state that would report success and ingest nothing: batch ids restart at 0 and
-    Delta skips every write as a duplicate."""
+    """The refusal must name THIS source's own control column, not some other source's -
+    proof that this source's cfg.landing_table and control column reach the shared guard."""
     checkpoint(exists=False)
     ctx = _ctx(file_config_root, existing_tables=(LANDING_TABLE,), landing_rows=[{"claim_id": "1"}])
     with pytest.raises(RuntimeError) as exc:
-        _guard(ctx)
+        file_run.run(ctx, secrets=object())
     message = str(exc.value)
     assert "REFUSING TO RUN" in message
-    assert "SKIP every write" in message or "skip every write" in message.lower()
     assert "file_checkpoint_reset_id" in message
-
-
-def test_a_fresh_reset_id_lets_the_guard_through_and_says_so_loudly(file_config_root, checkpoint):
-    checkpoint(exists=False)
-    from kafka_ingest.sources.file import config as file_config_module
-
-    ctx = _ctx(
-        file_config_root,
-        existing_tables=(LANDING_TABLE,),
-        landing_rows=[{"claim_id": "1"}],
-        checkpoint_reset_id="INC-1042",
-    )
-    cfg = file_config_module.build(ctx.cfg, ctx.run_type, ctx.tables)
-    file_run._guard_against_checkpoint_reset(ctx, cfg)
-    assert "file_checkpoint_reset_engaged" in ctx.log.events("WARNING")
-    fields = ctx.log.fields("file_checkpoint_reset_engaged")
-    assert fields["checkpoint_reset_id"] == "INC-1042"
-
-
-def test_a_reused_reset_id_is_refused(file_config_root, checkpoint):
-    checkpoint(exists=False)
-    ctx = _ctx(
-        file_config_root,
-        existing_tables=(LANDING_TABLE, AUDIT_TABLE),
-        landing_rows=[{"claim_id": "1"}],
-        audit_rows=[
-            {
-                "source_key": "demo_file",
-                "run_type": "primary",
-                "rerun_id": "INC-1042",
-                "run_id": "some-other-run",
-            }
-        ],
-        checkpoint_reset_id="INC-1042",
-    )
-    with pytest.raises(RuntimeError, match="ALREADY been"):
-        _guard(ctx)
-
-
-def test_a_stale_reset_id_is_inert_once_the_checkpoint_exists_again(file_config_root, checkpoint):
-    """The checkpoint existing is checked FIRST - a spent reset id left in the control table
-    must not become a permanent alarm once the stream is healthy again."""
-    checkpoint(exists=True)
-    ctx = _ctx(
-        file_config_root,
-        existing_tables=(LANDING_TABLE, AUDIT_TABLE),
-        landing_rows=[{"claim_id": "1"}],
-        audit_rows=[{"source_key": "demo_file", "run_type": "primary", "rerun_id": "INC-1042", "run_id": "other"}],
-        checkpoint_reset_id="INC-1042",
-    )
-    _guard(ctx)  # must not raise
 
 
 def test_the_reset_id_is_recorded_on_the_audit_row(file_config_root, checkpoint, monkeypatch):
@@ -148,17 +81,6 @@ def test_the_reset_id_is_recorded_on_the_audit_row(file_config_root, checkpoint,
     monkeypatch.setattr(file_run._Session, "run_streaming", lambda self: None)
     file_run.run(ctx, secrets=object())
     assert ctx.audit.rerun_id == "INC-1042"
-
-
-def test_an_unreadable_checkpoint_volume_is_not_treated_as_a_missing_checkpoint(monkeypatch, tmp_path):
-    import os
-
-    def deny(_path):
-        raise PermissionError("no access to the Volume from this compute profile")
-
-    monkeypatch.setattr(os, "stat", deny)
-    with pytest.raises(RuntimeError, match="NOT the same as the checkpoint being missing"):
-        file_run._checkpoint_offsets_exist(str(tmp_path))
 
 
 # --------------------------------------------------------------------------------------
