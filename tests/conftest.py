@@ -135,6 +135,10 @@ class FakeRow:
     def asDict(self):  # noqa: N802 - mirrors the Spark API
         return dict(self._data)
 
+    def __getitem__(self, key):
+        """By column name, as pyspark.sql.Row does - a probe row is read that way."""
+        return self._data[key]
+
 
 class FakeDataFrame:
     """Records predicates instead of applying them.
@@ -806,3 +810,341 @@ def demo_config_root(tmp_path: Path) -> str:
         encoding="utf-8",
     )
     return str(tmp_path)
+
+
+# --------------------------------------------------------------------------------------
+# Oracle fixtures.
+#
+# The tree is synthetic EXCEPT for conf/defaults/oracle.yaml, which is copied from the
+# repository. That file carries the landing-table pattern, the fetch size and the
+# partition count - the three shipped values whose absence or mis-spelling would be a real
+# outage - so the tests resolve the same layer 1b a job resolves, not a paraphrase of it.
+# --------------------------------------------------------------------------------------
+
+REPO_CONF = Path(__file__).resolve().parent.parent / "conf"
+
+# The source file every Oracle test starts from. `write_oracle_source` replaces or extends
+# it, so a test states only the setting it is about.
+ORACLE_SOURCE_DEFAULTS = {
+    "jdbc_ref": "oracle_demo",
+    "domain": "claims",
+    "source_schema": "CLAIMS",
+    "source_table": "CLAIM_HEADER",
+}
+
+
+@pytest.fixture
+def oracle_config_root(tmp_path: Path) -> str:
+    """A minimal but valid conf/ tree for one Oracle source, with every layer represented."""
+    (tmp_path / "sources").mkdir()
+    (tmp_path / "defaults").mkdir()
+    (tmp_path / "environments").mkdir()
+
+    (tmp_path / "defaults.yaml").write_text(
+        textwrap.dedent(
+            """
+            defaults:
+              audit_table: "{ops_catalog}.audit.ingest_audit"
+              state_table: "{ops_catalog}.ingestion.ingest_state"
+              control_table: "{ops_catalog}.ingestion.ingest_control"
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    # Layer 1b, verbatim from the repository - see the note above.
+    (tmp_path / "defaults" / "oracle.yaml").write_text(
+        (REPO_CONF / "defaults" / "oracle.yaml").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+
+    for environment, catalog in (("dev", "cat_dev"), ("prod", "cat_prod")):
+        (tmp_path / "environments" / f"{environment}.yaml").write_text(
+            textwrap.dedent(
+                f"""
+                vars:
+                  catalog: {catalog}
+                  ops_catalog: ops_{environment}
+                defaults: {{}}
+                defaults_by_type: {{}}
+                jdbc:
+                  oracle_demo:
+                    host: "oracle-{environment}.corp.internal"
+                    secret_scope: kv-oracle-{environment}
+                """
+            ).strip(),
+            encoding="utf-8",
+        )
+
+    # A register of one. Its CONTENTS are not read until sub-step 4b builds a connection
+    # from them; what 4a asserts is that a jdbc_ref naming something absent from it fails.
+    (tmp_path / "jdbc.yaml").write_text(
+        textwrap.dedent(
+            """
+            jdbc:
+              oracle_demo:
+                port: 1521
+                service_name: CLAIMSPDB
+                username_key: oracle-user
+                password_key: oracle-password
+            """
+        ).strip(),
+        encoding="utf-8",
+    )
+
+    write_oracle_source(str(tmp_path))
+    return str(tmp_path)
+
+
+def write_oracle_source(config_root, source_key="demo_oracle", **settings) -> str:
+    """Write conf/sources/<source_key>.yaml with the defaults plus whatever a test states.
+
+    A setting passed as None is REMOVED rather than written as a null, so a test can say
+    "this source does not set merge_keys at all" - which is a different configuration from
+    setting it to an empty list, and the difference is load-bearing.
+    """
+    import yaml
+
+    merged = {**ORACLE_SOURCE_DEFAULTS, **settings}
+    document = {"source_type": "oracle", "source": {k: v for k, v in merged.items() if v is not None}}
+    path = Path(config_root) / "sources" / f"{source_key}.yaml"
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    return source_key
+
+
+def make_oracle_cfg(config_root, source_key="demo_oracle", environment="dev", run_type="primary", **job_parameters):
+    """The source's own frozen config, resolved through the REAL five-layer path.
+
+    Uses framework/tables.py itself rather than a stand-in: rendering the landing pattern
+    and rejecting a name Unity Catalog cannot hold is part of what is being tested.
+    """
+    from kafka_ingest.framework import tables
+    from kafka_ingest.framework.config import resolve_config
+    from kafka_ingest.sources import oracle
+    from kafka_ingest.sources.oracle import config as oracle_config
+
+    resolved = resolve_config(config_root, source_key, environment, oracle.SOURCE_SPEC, job_parameters=job_parameters)
+    return oracle_config.build(resolved, run_type, tables)
+
+
+class RecordingState:
+    """Stands in for framework/state.py's StateStore, recording every read and write.
+
+    The Oracle source's correctness is an ORDERING - read, write, commit, then advance -
+    so what a test needs is not a state table but a record of when state was written
+    relative to everything else. `writes` is that record, and it is empty for every case
+    where the watermark must NOT move.
+    """
+
+    def __init__(self, values=None, on_write=None):
+        self.values = dict(values or {})
+        self.reads = []
+        self.writes = []
+        self._on_write = on_write
+
+    def read_state(self, source_key, state_key):
+        self.reads.append((source_key, state_key))
+        return self.values.get((source_key, state_key))
+
+    def write_state(self, source_key, state_key, value, value_type, run_id):
+        if self._on_write is not None:
+            self._on_write()
+        self.writes.append(
+            {
+                "source_key": source_key,
+                "state_key": state_key,
+                "value": value,
+                "value_type": value_type,
+                "run_id": run_id,
+            }
+        )
+        self.values[(source_key, state_key)] = value
+
+    def next_run_sequence(self, source_key):
+        return 1
+
+    @property
+    def watermark(self):
+        """The value the LAST write left, or None if the watermark never moved."""
+        writes = [w for w in self.writes if w["state_key"] == "watermark"]
+        return writes[-1]["value"] if writes else None
+
+
+def make_oracle_ctx(
+    config_root,
+    source_key="demo_oracle",
+    environment="dev",
+    run_type="primary",
+    spark=None,
+    state=None,
+    existing_tables=(),
+    run_sequence=1,
+    **job_parameters,
+):
+    """A RunContext of stand-ins, built through the real config resolution path.
+
+    A source is handed a RunContext and nothing else, so this is how one is tested without
+    a database: recording writers, a recording audit writer and a FakeSpark whose reader
+    captures the options rather than connecting.
+    """
+    from kafka_ingest.framework.config import resolve_config
+    from kafka_ingest.framework.contracts import RunContext
+    from kafka_ingest.sources import oracle
+
+    cfg = resolve_config(config_root, source_key, environment, oracle.SOURCE_SPEC, job_parameters=job_parameters)
+    return RunContext(
+        cfg=cfg,
+        spark=spark if spark is not None else FakeJdbcSpark(),
+        audit=RecordingAudit(run_type=run_type),
+        state=state if state is not None else RecordingState(),
+        writers=RecordingWriters(),
+        tables=RecordingTables(existing_tables),
+        log=RecordingLog(),
+        run_id=f"{source_key}-{run_type}-test",
+        run_type=run_type,
+        run_sequence=run_sequence,
+    )
+
+
+@pytest.fixture
+def oracle_cfg(oracle_config_root):
+    """The default source: a full extract of CLAIMS.CLAIM_HEADER."""
+    return make_oracle_cfg(oracle_config_root)
+
+
+# --------------------------------------------------------------------------------------
+# A Spark schema, without Spark. sources/oracle/types.py reads `.fields`, `.name` and
+# `.dataType.simpleString()` by duck typing precisely so this is possible.
+# --------------------------------------------------------------------------------------
+
+
+class FakeType:
+    def __init__(self, name):
+        self._name = name
+
+    def simpleString(self):  # noqa: N802 - mirrors the Spark API
+        return self._name
+
+
+class FakeField:
+    def __init__(self, name, type_name):
+        self.name = name
+        self.dataType = FakeType(type_name)
+
+
+class FakeSchema:
+    def __init__(self, columns):
+        self.fields = [FakeField(name, type_name) for name, type_name in columns.items()]
+
+
+# --------------------------------------------------------------------------------------
+# Recording JDBC read path.
+#
+# A JDBC read is entirely "hand the right options to spark.read". Recording the options
+# map tests exactly the part that has to be right, and does it with no driver, no
+# database and no JVM - which is the only way it can be tested at all here.
+# --------------------------------------------------------------------------------------
+
+
+class RecordingJdbcReader:
+    """Stands in for spark.read, capturing format/options instead of connecting."""
+
+    def __init__(self, spark):
+        self._spark = spark
+        self.format_used = None
+        self.options_used = {}
+
+    def format(self, source):
+        self.format_used = source
+        return self
+
+    def options(self, **options):
+        self.options_used.update(options)
+        return self
+
+    def option(self, key, value):
+        self.options_used[key] = value
+        return self
+
+    def load(self):
+        self._spark.reads.append(self)
+        # Kept so a test can assert on the frame this read returned - specifically that it
+        # was cached and released, which is what stops a JDBC extract running twice.
+        self.load_result = self._spark.next_frame()
+        return self.load_result
+
+
+class LoadedFrame:
+    """What a recorded read returns: rows and a schema, both supplied by the test.
+
+    Records the projection and the cache lifecycle instead of performing either. Between
+    them those are what an Oracle run does to a frame, and both matter: the projection is
+    landing's provenance columns, and an extract that is not cached is read from the source
+    TWICE (once to count, once to write).
+    """
+
+    def __init__(self, rows=(), schema=None):
+        self.rows = [FakeRow(row) if isinstance(row, dict) else row for row in rows]
+        self.schema = schema if schema is not None else FakeSchema({})
+        self.projections = []
+        self.persisted = 0
+        self.unpersisted = 0
+
+    @property
+    def columns(self):
+        return [field.name for field in self.schema.fields]
+
+    def selectExpr(self, *expressions):  # noqa: N802 - mirrors the Spark API
+        self.projections.append(list(expressions))
+        return self
+
+    def persist(self, _level=None):
+        self.persisted += 1
+        return self
+
+    def unpersist(self):
+        self.unpersisted += 1
+        return self
+
+    def collect(self):
+        return list(self.rows)
+
+    def count(self):
+        return len(self.rows)
+
+
+class FakeJdbcSpark(FakeSpark):
+    """A FakeSpark whose `.read` records. `frames` are returned one per load(), in order.
+
+    A list rather than one frame because an Oracle run reads more than once: a probe for
+    the partition bounds, then the extract itself, and the interesting assertions are
+    about how the two DIFFER.
+    """
+
+    def __init__(self, frames=None, frames_by_table=None, **kwargs):
+        super().__init__(**kwargs)
+        self.reads = []
+        # `_load_frames`, not `_frames`: FakeSpark already uses that name for the frames it
+        # hands back from `table()`, and one name for two things is how a fake starts lying.
+        self._load_frames = list(frames or [])
+        # What `spark.table(name).schema` returns - i.e. what the landing table already
+        # holds, which is the other half of the schema-drift check.
+        self._frames_by_table = dict(frames_by_table or {})
+
+    @property
+    def read(self):
+        return RecordingJdbcReader(self)
+
+    def next_frame(self):
+        return self._load_frames.pop(0) if self._load_frames else LoadedFrame()
+
+    def table(self, name):
+        """An existing Delta table, for the schema-drift comparison.
+
+        A table a test did not describe gets an EMPTY schema, which reads as "nothing to
+        compare against" rather than as drift - so a test about the write path does not
+        have to restate the schema it is not testing.
+        """
+        return self._frames_by_table.setdefault(name, LoadedFrame())
+
+    def options_for(self, index):
+        return self.reads[index].options_used

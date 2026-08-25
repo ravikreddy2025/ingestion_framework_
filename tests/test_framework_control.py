@@ -227,11 +227,25 @@ def test_a_column_this_spec_also_declares_is_exempt_from_the_foreign_check(demo_
 
 
 def test_a_spec_with_no_control_columns_declared_defaults_to_empty():
-    """Oracle and file are still Stage 1 stubs (Stage 4/5 build them) - their
-    control_columns must default to empty rather than requiring every SOURCE_SPEC to set it."""
-    from kafka_ingest.sources.oracle import SOURCE_SPEC
+    """A source type with no operational levers must not have to declare an empty mapping.
 
-    assert dict(SOURCE_SPEC.control_columns) == {}
+    Asserted against a SourceSpec built here rather than against a shipped stub: the two
+    stubs this used to use are being filled in by Stages 4 and 5, and a test that fails
+    when a source type acquires its first control column is testing the wrong thing.
+    """
+    from kafka_ingest.framework.contracts import SourceSpec
+
+    spec = SourceSpec(
+        source_type="leverless",
+        required_keys=frozenset(),
+        structural_keys=frozenset(),
+        operational_keys=frozenset(),
+        mutually_exclusive=(),
+        layers=("landing",),
+    )
+    assert dict(spec.control_columns) == {}
+    rows = [{"source_key": "demo_source", "enabled": False}]
+    assert control.read_control(_spark(rows), CONTROL_TABLE, "demo_source", spec) == {"enabled": False}
 
 
 def test_the_shipped_kafka_spec_declares_its_control_columns():

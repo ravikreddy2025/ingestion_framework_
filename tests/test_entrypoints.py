@@ -84,6 +84,26 @@ def test_every_replay_control_has_a_matching_flag():
         assert getattr(args, name) == "value"
 
 
+def test_every_replay_control_any_shipped_source_declares_has_a_flag():
+    """THE CROSSING TEST. The list above is what a support engineer can actually pass; a
+    SOURCE_SPEC declaring a `replay_*` key with no flag here is a lever nobody can pull -
+    the setting exists, the code reads it, and there is no way to get a value to it.
+
+    Derived from the dispatch dict rather than hardcoded, so a source type added in a later
+    stage is covered the day it declares its first replay control.
+    """
+    from kafka_ingest.framework import runner
+
+    declared = {
+        key
+        for module in runner._SOURCES.values()
+        for key in module.SOURCE_SPEC.operational_keys
+        if key.startswith("replay_")
+    }
+    missing = sorted(declared - set(run_replay._REPLAY_PARAMETERS))
+    assert not missing, f"replay controls with no --flag in run_replay.py: {missing}"
+
+
 def test_replay_controls_reach_the_runner_as_job_parameters(monkeypatch):
     """Which means they are validated against the source type's own SOURCE_SPEC exactly like
     a YAML key: a misspelled control is an unknown-key error naming the key, not a silently

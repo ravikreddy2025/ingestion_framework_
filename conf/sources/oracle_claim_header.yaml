@@ -1,0 +1,44 @@
+# =====================================================================================
+# CLAIMS.CLAIM_HEADER  ->  {catalog}.oracle_claims.claim_header
+#
+# The worked Oracle example: a delta load with a stable key, keyed on the same column
+# Oracle stamps on update. Copy _TEMPLATE_oracle.yaml rather than this file when onboarding
+# a new table - the template carries the four questions the source team has to answer.
+#
+# PREREQUISITE, once per environment: `CREATE SCHEMA IF NOT EXISTS <catalog>.oracle_claims;`
+# The framework creates tables, never schemas (docs/build_log/DECISIONS.md D-02).
+# =====================================================================================
+
+source_type: oracle
+
+source:
+
+  source_schema: CLAIMS
+  source_table: CLAIM_HEADER
+  jdbc_ref: oracle_prod_core
+  domain: rcm
+
+  # A delta load. The cursor is the column the claims application stamps on every update;
+  # VB-25's question - whether it is stamped at statement time or at commit - is open for
+  # this table and is the first thing to settle with the source team.
+  incremental_mode: cursor
+  cursor_column: LAST_UPDATE_DT
+  cursor_type: timestamp
+
+  # The table's stable key. With it the cursor predicate is INCLUSIVE of the last
+  # watermark, so a second-granularity timestamp cannot lose the rows sharing a boundary
+  # value - the MERGE de-duplicates the re-read. The merge key is (CLAIM_ID,
+  # LAST_UPDATE_DT), so landing keeps every VERSION of a claim rather than only its
+  # current state; see sources/oracle/config.py's `merge_on`.
+  merge_keys: [CLAIM_ID]
+
+  # Read parallelism. CLAIM_ID is a monotonically increasing surrogate key, so the range
+  # splits evenly; Spark reads its MIN and MAX over this run's own query rather than taking
+  # configured bounds that would go stale as the table grows.
+  partition_column: CLAIM_ID
+  num_partitions: 8
+
+  # One hour. A delta run reads minutes of changes, so a statement still running after an
+  # hour is a stuck session rather than a large extract - which is the case a timeout
+  # should catch. A first FULL run of this table will need this raised, deliberately.
+  query_timeout: 3600

@@ -69,6 +69,28 @@ CREATE TABLE IF NOT EXISTS {ops_catalog}.{control_schema}.ingest_control (
   -- silently skip every write again.
   kafka_checkpoint_reset_id     STRING  COMMENT 'Incident use only. Never clear after use.',
 
+  -- ---- oracle-only levers -------------------------------------------------------------
+  -- See sources/oracle/spec.py SOURCE_SPEC.control_columns for which setting each maps to.
+  -- The first two change only how hard the extract leans on the source database, never
+  -- which rows it returns - that is what makes them safe to turn without a PR. The third
+  -- is the deliberate exception and carries its own note below. Everything that decides
+  -- what the increment MEANS (source_schema, source_table, filter_criteria, merge_keys,
+  -- cursor_column, cursor_type) stays structural and an override of it is ignored.
+  oracle_fetch_size             INT     COMMENT 'JDBC rows per round trip. The driver''s own default is TEN. Lower it when rows are wide.',
+  oracle_num_partitions         INT     COMMENT 'Parallel JDBC connections. Needs a partition_column in the source file; 1 means a serial read.',
+  -- THE FULL-VS-DELTA SWITCH (docs/build_log/DECISIONS.md D-09). The one lever that
+  -- changes WHICH ROWS an Oracle run extracts, and it is operational because it is a
+  -- recovery action: a delta load that has been skipping rows is repaired by one full
+  -- load, and waiting for a PR to merge is the wrong shape of answer at 3am.
+  --
+  -- SWITCHING TO 'full' DUPLICATES ROWS on any source whose merge_keys are waived
+  -- (`merge_keys: []`), because that source appends. Where merge_keys are set the MERGE
+  -- absorbs the re-read and the switch is free. Check which you have before setting this.
+  --
+  -- A full run does NOT advance or clear the watermark, so switching back to 'cursor'
+  -- resumes from the last genuine delta boundary.
+  oracle_incremental_mode       STRING  COMMENT 'full | cursor | filter. Recovery lever. Duplicates rows where merge_keys are waived.',
+
   -- ---- replay controls, framework-owned ------------------------------------------------
   -- Populated to park a replay intent durably. The replay JOB PARAMETERS win over these,
   -- so an urgent one-off needs no UPDATE first. Clear these once the replay is done.
@@ -83,6 +105,16 @@ CREATE TABLE IF NOT EXISTS {ops_catalog}.{control_schema}.ingest_control (
   CONSTRAINT source_key_present CHECK (source_key IS NOT NULL),
   CONSTRAINT kafka_failure_mode_valid CHECK (
     kafka_failure_mode IS NULL OR kafka_failure_mode IN ('FAILFAST', 'QUARANTINE')
+  ),
+  -- Zero is not "the default" for either: sources/oracle/config.py refuses both, and the
+  -- constraint refuses them here so the UPDATE fails at the keyboard rather than the run
+  -- failing at 3am.
+  CONSTRAINT oracle_tuning_positive CHECK (
+    (oracle_fetch_size     IS NULL OR oracle_fetch_size     > 0) AND
+    (oracle_num_partitions IS NULL OR oracle_num_partitions > 0)
+  ),
+  CONSTRAINT oracle_incremental_mode_valid CHECK (
+    oracle_incremental_mode IS NULL OR oracle_incremental_mode IN ('full', 'cursor', 'filter')
   )
 )
 USING DELTA

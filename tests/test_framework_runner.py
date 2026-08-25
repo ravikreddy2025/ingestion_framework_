@@ -106,10 +106,11 @@ def test_every_dispatchable_source_exposes_exactly_the_contract(source_type):
     assert not {"read", "parse", "write", "validate"} & set(dir(module))
 
 
-# Kafka is implemented (Stage 3). Oracle and file are still stubs, and the list is derived
-# rather than hardcoded so that Stage 4 and Stage 5 shrink it by implementing a source, not
-# by editing this line.
-_UNIMPLEMENTED = sorted(t for t in runner._SOURCES if t != "kafka")
+# Kafka (Stage 3) and Oracle (Stage 4) are implemented; file is still a stub. The list is
+# derived from the dispatch dict rather than hardcoded, so implementing the last source
+# empties it and the test stops running rather than starting to lie.
+_IMPLEMENTED = {"kafka", "oracle"}
+_UNIMPLEMENTED = sorted(t for t in runner._SOURCES if t not in _IMPLEMENTED)
 
 
 @pytest.mark.parametrize("source_type", _UNIMPLEMENTED)

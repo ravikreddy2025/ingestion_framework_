@@ -1,0 +1,104 @@
+# ORACLE INGESTION - one job definition, every Oracle table.
+#
+# A new table is added by appending a task below with a different source-key. No new job,
+# no code change. It is a SEPARATE job from resources/job_ingest_primary.yml even though
+# the entrypoint is identical, and that separation is operational rather than technical:
+#
+#   * the SCHEDULE is different in kind. A Kafka run drains whatever accumulated since the
+#     last one and its cadence is bounded by broker retention; an Oracle run reads a
+#     window out of a live OLTP database, and its cadence is bounded by what that database
+#     can afford. Those two are negotiated with different teams.
+#   * the BLAST RADIUS of a stuck run is different. A stuck Kafka run costs lag; a stuck
+#     Oracle run holds sessions open on somebody else's production database.
+#   * "pause all Oracle extraction" is a thing a DBA asks for during THEIR incident, and it
+#     should be one pause_status, not a per-task edit in a job that also serves Kafka.
+#
+# THE TASKS ARE DUPLICATED ON PURPOSE, for the same reason as job_ingest_primary.yml: YAML
+# anchors would remove the repetition, but bundle schema validation of anchors could not be
+# confirmed here and a bundle that fails to parse blocks every deployment.
+#
+# SERVERLESS COMPUTE DEPENDENCY
+# -----------------------------
+# The environment below targets serverless jobs compute, which needs egress to every
+# Oracle listener in conf/jdbc.yaml via Network Connectivity Configuration, and needs the
+# Oracle JDBC driver available to the task. NEITHER IS ASSUMED - VB-22 covers the driver
+# and VB-12 covers the network. If serverless cannot reach the database, swap
+# `environment_key: oracle_env` for a `job_cluster_key` and add the driver as a cluster
+# library there.
+
+resources:
+  jobs:
+
+    ingest_oracle:
+      name: "[${bundle.target}] Oracle Ingest"
+      description: >-
+        Scheduled JDBC extraction of Oracle tables into landing. Behaviour per table is
+        controlled by the control table named in conf/defaults.yaml; structure by conf/ in
+        Git. Watermarks live in ingest_state and are advanced only after a committed write.
+
+      schedule:
+        # 03:30 UTC daily, deliberately AFTER the Kafka window so the two do not compete
+        # for the same serverless capacity.
+        #
+        # THE CADENCE IS NOT A FREE CHOICE and it is not a platform decision: it is how
+        # stale the consuming teams can afford the data to be, bounded by what the source
+        # DBA will accept. Confirm it with both before changing it.
+        quartz_cron_expression: "0 30 3 * * ?"
+        timezone_id: UTC
+        pause_status: UNPAUSED
+
+      # ONE AT A TIME, ALWAYS. Two concurrent runs of the same table would read overlapping
+      # intervals and race to advance one watermark - and the loser's rows would be
+      # attributed to a window the winner has already declared complete.
+      max_concurrent_runs: 1
+
+      # A run that arrives while one is in flight is DROPPED, not queued. Queueing would
+      # start a second extract against the source database the moment the first finished,
+      # which is precisely the load pattern a DBA asks us not to produce. The next
+      # scheduled run covers the interval anyway - that is what the watermark is for.
+      queue:
+        enabled: false
+
+      parameters:
+        - name: config_root
+          default: ${workspace.file_path}/conf
+        - name: environment
+          default: ${bundle.target}
+
+      email_notifications:
+        on_failure:
+          - ${var.notification_email}
+
+      environments:
+        - environment_key: oracle_env
+          spec:
+            client: "3"
+            dependencies:
+              - ./dist/*.whl
+
+      tasks:
+
+        - task_key: oracle_claim_header
+          environment_key: oracle_env
+          # Retries are safe by construction: the watermark is advanced only AFTER a
+          # committed write, so a retry re-extracts the identical interval - which the
+          # merge key absorbs. A source that has WAIVED its merge keys duplicates those
+          # rows on a retry instead; that is the trade the waiver buys, and it is why the
+          # run WARNs about it every time.
+          max_retries: 2
+          min_retry_interval_millis: 600000
+          # Ten minutes between attempts, not five: a JDBC failure is often the source
+          # database being busy, and retrying quickly makes that worse for everyone.
+          retry_on_timeout: false
+          # Three hours. A delta run reads minutes of changes; this bound exists for the
+          # FIRST run, which reads the whole table. Raise it deliberately for a large
+          # initial load rather than discovering it at hour three.
+          timeout_seconds: 10800
+          python_wheel_task:
+            package_name: kafka_ingest
+            entry_point: run-ingest
+            named_parameters:
+              config-root: "{{job.parameters.config_root}}"
+              environment: "{{job.parameters.environment}}"
+              source-key: oracle_claim_header
+              job-run-id: "{{job.run_id}}"

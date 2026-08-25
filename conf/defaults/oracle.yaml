@@ -5,16 +5,10 @@
 # Read only when a source file declares `source_type: oracle`, so nothing here is ever
 # applied to a Kafka or file source.
 #
-# EMPTY UNTIL STAGE 4. Deliberately: a key written here before the Oracle source reads it
-# is a key that silently does nothing, which is the single worst outcome this project can
-# produce. Stage 4 fills it in alongside sources/oracle/spec.py, and the two must agree -
-# a default for a key the spec does not list is rejected as an unknown key.
-#
-# What is expected to land here (from CORE section 11 - none of it is settled, and none of
-# it is written as config until the code that reads it exists):
-#   * fetchsize          Oracle JDBC defaults to TEN ROWS. Not setting it is a catastrophe.
-#   * the target-name pattern for landing, derived from source_schema / source_table
-#   * read parallelism   partitionColumn / numPartitions shape - see VB-01
+# EVERY KEY HERE IS DECLARED IN sources/oracle/spec.py AND READ BY THIS PACKAGE. A key
+# that is not is a hard error at startup naming the key - which is the point: a setting
+# that silently does nothing is worse than a missing one. Keys the WRITE path needs arrive
+# with the code that reads them, in sub-step 4c.
 #
 # PLACEHOLDERS
 #   {catalog}      and any other key under `vars:` in the environment file
@@ -22,4 +16,89 @@
 #   {domain}       the source's `domain:` value
 # =====================================================================================
 
-defaults: {}
+defaults:
+
+  # --- TARGET -------------------------------------------------------------------------
+  # ONE TABLE PER ORACLE TABLE, in landing. Oracle has no curated layer here (CORE
+  # section 10) and no quarantine layer: a JDBC read either returns typed rows or fails.
+  #
+  # {source_schema} and {source_table} are the two placeholders the CONFIG LOADER leaves
+  # alone - only the source knows them, so sources/oracle/spec.py declares them in
+  # target_tokens and sources/oracle/config.py fills them at the top of the run, before
+  # anything connects.
+  #
+  # THE CASE RULE: Oracle folds unquoted identifiers to UPPER case, Unity Catalog folds to
+  # lower. `CLAIMS.CLAIM_HEADER` in Oracle is `oracle_claims.claim_header` here, whichever
+  # case the source file was written in. The `oracle_` schema prefix keeps one source
+  # system's tables together and stops `CLAIMS` colliding with a Kafka or file feed that
+  # happens to share the name.
+  #
+  # THE SCHEMA MUST ALREADY EXIST. The framework creates tables, never schemas
+  # (docs/build_log/DECISIONS.md D-02) - creating `{catalog}.oracle_<schema>` is a
+  # provisioning step in the Oracle onboarding checklist.
+  #
+  # To override the name for one table, set `landing_table:` in that source's file - the
+  # catalog still comes from {catalog}, so a source file never contains a catalog name.
+  landing_table: "{catalog}.oracle_{source_schema}.{source_table}"
+
+  # --- TABLE LAYOUT -------------------------------------------------------------------
+  # Delta allows PARTITIONED BY or CLUSTER BY, never both. See docs/DESIGN.md.
+  # ingest_date - the date a row was WRITTEN here, not the date it changed in Oracle -
+  # bounds partition growth over years of daily runs and makes retention a partition drop.
+  #
+  # It is deliberately NOT a date derived from the cursor: a cursor is optional, its column
+  # differs per source, and a partition column that exists for some sources and not others
+  # is a table layout nobody can reason about. The cost is that a landing MERGE cannot be
+  # bounded to a partition - see the `true` predicate in sources/oracle/run.py, which says
+  # so at the call site.
+  landing_partition_by: [ingest_date]
+
+  # --- EXTRACTION SHAPE ---------------------------------------------------------------
+  # full | cursor | filter. The platform default is `full` deliberately: a source that
+  # forgets to declare its mode re-extracts the whole table, which is visible in the row
+  # count and in the run time. The alternative default - `cursor` - would need a cursor
+  # column nobody chose, and its failure mode is missing rows rather than duplicate ones.
+  #
+  # `cursor` additionally requires cursor_column, cursor_type, and an explicit `merge_keys`
+  # decision - see the MUST-READ row in docs/CONFIGURATION.md.
+  incremental_mode: full
+
+  # --- READ PARALLELISM ---------------------------------------------------------------
+  # ORACLE JDBC's OWN fetchsize DEFAULT IS TEN ROWS per network round trip. Not setting it
+  # is not "the driver decides", it is one round trip per ten rows for the whole extract.
+  # 10000 is a common working value; raise it for narrow rows, lower it for rows carrying
+  # large columns, because this many rows are buffered in executor memory at a time.
+  # Operationally overridable: ingest_control.oracle_fetch_size.
+  fetch_size: 10000
+
+  # How many parallel JDBC connections the read opens. ONE by default, and that is a
+  # deliberate refusal to guess: splitting a read needs a partition_column whose value
+  # distribution only the source team knows, and the wrong bounds produce skewed
+  # partitions - one task reading everything - rather than an error.
+  #
+  # A serial read is the safe wrong answer; a parallel read against a table the DBA did
+  # not expect it on is not. Onboarding asks the source team for the partition column and
+  # sets BOTH keys in the source file. Setting this above 1 without a partition_column is
+  # a config error, because Spark would silently ignore it and read on one executor.
+  # Operationally overridable: ingest_control.oracle_num_partitions.
+  num_partitions: 1
+
+  # --- THE READ ITSELF ----------------------------------------------------------------
+  # Seconds a single JDBC statement may run before the driver cancels it. ZERO MEANS NO
+  # TIMEOUT, which is the JDBC option's own default and is what this ships with: a first
+  # full extract of a large table legitimately runs for a long time, and a platform-wide
+  # timeout would kill it at the same point every night with an error that looks like a
+  # network fault. Set it per source once that source's normal run time is known.
+  query_timeout: 0
+
+  # DELIBERATELY NOT SET HERE, both of them:
+  #
+  #   session_init   an ALTER SESSION run once per JDBC CONNECTION, i.e. once per
+  #                  partition. What it should say depends on the database (NLS settings,
+  #                  a parallel hint, a resource group), so it belongs in a source file
+  #                  where a DBA can review it - never platform-wide.
+  #   column_types   per-column type overrides rendered into the JDBC customSchema option.
+  #                  A platform-wide default here would apply a type to a column of the
+  #                  same name in an unrelated table. See VB-02 / VB-03 / VB-04 before
+  #                  setting one at all: the right answer is usually to let the driver's
+  #                  mapping stand.

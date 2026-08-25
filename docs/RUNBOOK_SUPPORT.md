@@ -511,3 +511,99 @@ the Q2 output for that batch, and `error_class` / `error_message`.
 
 The split is deliberate: things with production blast radius get code review, things needed
 at 3am do not.
+
+
+---
+
+## 8. Oracle incident playbooks
+
+SQL and job parameters only — nothing here needs a deploy. Every query number refers to
+`sql/03_support_queries.sql`.
+
+### 8.1 An Oracle run failed once — transient
+
+Symptom: one failed run, `error_class` is a JDBC or network error, the next run is fine.
+
+1. Q17 — confirm the watermark did **not** move. It should still hold the previous run's
+   `position_end`. That is the design: nothing advances until a write has committed.
+2. Re-run the task. It re-extracts the identical interval.
+3. Nothing else to do. With `merge_keys` set the re-read de-duplicates; without them the
+   interval appends twice, and Q19 lists the duplicates.
+
+### 8.2 Every run fails — the source database is refusing the load
+
+Symptom: repeated failures, or a DBA asking why their database is busy at 03:30.
+
+1. Reduce the load without a deploy — Q20:
+   `oracle_num_partitions` down (fewer concurrent sessions) and/or `oracle_fetch_size`
+   down (less memory per session, more round trips).
+2. If it must stop entirely: `enabled = FALSE` (Q7). The watermark stays where it is, and
+   the next enabled run covers the whole gap in one interval.
+3. Escalate if the extract needs re-shaping — a `filter_criteria`, a projection, or a
+   different cursor column is a PR, not a control-table change.
+
+### 8.3 A run reported success but the data looks short
+
+1. Q21 — what interval did that run actually cover? The audit row's `position_start` /
+   `position_end` are the bounds, and `source_detail.query` is the **exact SQL** the run
+   sent. Compare it against what you expected: a `dynamic_date_filter` or a
+   `filter_criteria` narrows the extract in a way the row count alone will not explain.
+2. Q17 — is the watermark where that run left it?
+3. If rows exist in Oracle inside the interval and not in landing, this is VB-25 (a
+   late-committing transaction with a low cursor value). It is not fixed by re-running:
+   use 8.5 to re-extract the window explicitly, and raise the cursor-stamping question
+   with the source team.
+
+### 8.4 The watermark is wrong
+
+A watermark **too far forward** silently skips rows. A watermark **too far back**
+re-extracts — safe with merge keys, duplicating without them.
+
+1. Q21 — find the last run you trust and take its `position_end`.
+2. Q18 — set the watermark to that value. The query is deliberately a single-row MERGE with
+   the source key spelled out; read the WHERE clause before running it.
+3. Re-run the task. Confirm with Q17 and Q21.
+
+**Never** set a watermark forward to "skip a problem". The rows in the gap are not
+extracted by any later run.
+
+### 8.5 Re-extract a window — the Oracle replay
+
+Use when a window landed wrong, or the source corrected its own data.
+
+```
+databricks bundle run replay --params \
+  source_key=oracle_claim_header,run_type=oracle_replay,rerun_id=INC12345,\
+  replay_cursor_start=2026-08-01 00:00:00,replay_cursor_end=2026-08-02 00:00:00
+```
+
+* `rerun_id` is required and tags every row the replay writes (`replay_run_id`).
+* The bounds replace the stored watermark **for this run only**. The scheduled delta load
+  is not disturbed, and **the replay never writes `ingest_state`** — Q17 before and after
+  should show the same value.
+* The start bound is inclusive, always.
+* Omit `replay_cursor_end` for "from there to now".
+* Q22 afterwards: rows tagged with that `rerun_id`, and whether the interval is now whole.
+
+### 8.6 Switch a table between delta and full — and back
+
+The lever for "the delta load has been missing rows and we need a clean sweep".
+
+1. **Check first** whether the source waives its merge keys — Q23. If it does, a full load
+   **duplicates every row it re-reads**, because that source appends.
+2. Q24 — set `oracle_incremental_mode = 'full'`. Takes effect on the next run.
+3. Run it. It reads the whole table; expect it to take much longer than a delta run, and
+   raise the task timeout first if the table is large.
+4. Q24 again — set the column back to NULL (inherit `cursor` from the source file). The
+   watermark was never touched by the full run, so the next delta run resumes from the last
+   genuine delta boundary.
+
+### 8.7 A source table was altered
+
+* **A new column**: nothing to do. Additive changes are allowed and land automatically.
+* **A type change, or a removed column**: the run stops **before writing**, naming the
+  column and both types. This is not a control-table fix — decide deliberately with the
+  owning team: ALTER the landing table, pin the old type with `column_types` (a PR), or
+  accept the change and recreate the table.
+* **Dropped or renamed table**: the read fails loudly. The source file is wrong, or the
+  table is gone; both are a PR.
