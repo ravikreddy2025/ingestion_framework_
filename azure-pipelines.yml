@@ -11,10 +11,20 @@
 #
 # WHY THE FAST SUITE IS THE PR GATE
 # ---------------------------------
-# `pytest -m "not spark"` needs no Spark, no JVM, no secrets and no network: config
-# resolution, auth option construction, the registry client, the writers' Delta options,
-# the run-shape dispatch, and validation of every shipped topic in EVERY environment.
-# It runs in seconds.
+# `pytest -m "not spark"` needs no live SparkSession, no JVM, no secrets and no network:
+# config resolution, auth option construction, the registry client, the writers' Delta
+# options, the run-shape dispatch, and validation of every shipped topic in EVERY
+# environment. It runs in seconds.
+#
+# IT DOES NEED THE `pyspark` PYTHON PACKAGE INSTALLED, though never a JVM or a cluster -
+# framework/audit.py imports pyspark.sql.types at module level (for its StructType/audit
+# schema), and every source's `run.py` imports pyspark.sql at module level too, so importing
+# ANY of them - which merely COLLECTING the fast suite does - fails with
+# `ModuleNotFoundError` if the package is absent, never mind actually running a test. See
+# docs/build_log/STAGE_1_REPORT.md's addendum: pyspark is dev tooling here (CLAUDE.md
+# "Development tooling may be added; runtime dependencies may not"), not a project
+# dependency, which is why it is pip-installed alongside `.[dev]` below rather than added to
+# pyproject.toml's own dependency list.
 #
 # The `spark`-marked tests are NOT run here. They need a JVM and the spark-avro connector,
 # and the point of them is to confirm `from_avro` behaviour on a real Databricks Runtime -
@@ -50,7 +60,12 @@ stages:
             inputs:
               versionSpec: $(pythonVersion)
 
-          - script: python -m pip install --upgrade pip && pip install -e ".[dev]"
+          # pyspark is pinned to match the target runtime - DBR 16.4 LTS ships Spark 3.5.2
+          # (docs/VERIFICATION_BACKLOG.md VB-14) - not left to resolve to whatever "pyspark"
+          # latest happens to be, which would silently drift from the cluster the code
+          # actually runs on. No JDK/JVM is installed or needed: the fast suite never starts
+          # a SparkSession, so the package alone (for imports and type hints) is sufficient.
+          - script: python -m pip install --upgrade pip && pip install -e ".[dev]" pyspark==3.5.2
             displayName: Install package and dev dependencies
 
           - script: ruff check src tests
