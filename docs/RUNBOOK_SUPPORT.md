@@ -347,9 +347,10 @@ SET kafka_checkpoint_reset_id = 'INC12345',
 WHERE source_key = 'rcm_claim_status';
 ```
 
-On the next scheduled trigger the job logs `kafka_checkpoint_reset_engaged` and starts a
-fresh stream: a new checkpoint, and a new Delta transaction identity with no committed
-history to collide with. That fork is what makes the restart safe, not merely permitted.
+On the next scheduled trigger the job logs `checkpoint_reset_engaged` (source_key and
+source_type on the same line identify which source) and starts a fresh stream: a new
+checkpoint, and a new Delta transaction identity with no committed history to collide with.
+That fork is what makes the restart safe, not merely permitted.
 
 **Step 4 - Backfill the gap with a bounded Kafka replay.**
 
@@ -378,7 +379,7 @@ trail of when and why, and Q6d is what stops it being reused.
 | [ ] | Recorded the last committed end offset per partition | Q13 |
 | [ ] | Confirmed the reset id has never been used for this source | Q6d |
 | [ ] | Set a fresh `kafka_checkpoint_reset_id` | Q6c |
-| [ ] | Primary ran and logged `kafka_checkpoint_reset_engaged` | driver log, or Q1 |
+| [ ] | Primary ran and logged `checkpoint_reset_engaged` | driver log, or Q1 |
 | [ ] | Backfilled the gap with a bounded replay from step 1's offsets | 5.5 |
 | [ ] | Verified the gap is closed | 5.7 |
 | [ ] | Left `kafka_checkpoint_reset_id` set | - |

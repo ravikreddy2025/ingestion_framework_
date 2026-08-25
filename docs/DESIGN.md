@@ -531,23 +531,39 @@ stream.
 ### The checkpoint-reset guard is reused, not redesigned
 
 The STAGE_5 brief is explicit: "the file source is checkpoint-based... wire that in; do not
-write a second guard." `sources/file/run.py`'s `_guard_against_checkpoint_reset` mirrors
-`sources/kafka/run.py`'s function of the same name field-for-field — same three states (checkpoint
-intact / gone-with-a-fresh-reset-id / gone-with-no-reset-id-and-data-already-landed), same
-refusal message shape, same single-use reset-id check against the audit table.
+write a second guard." Stage 5 duplicated Kafka's `_guard_against_checkpoint_reset` into
+`sources/file/run.py` field-for-field rather than promoting it, on the grounds that two
+implementations did not yet clear CORE section 2 rule 4's bar of three. A later pass
+(docs/build_log/STAGE_5b_REPORT.md) revisited that: two near-identical ~90-line functions,
+copied rather than shared, is exactly the kind of drift rule 6 (smallest correct change)
+warns about once the duplication itself has a cost — the two copies had already started
+disagreeing (see below) — so the guard now lives once, in
+`framework/checkpoint.py::guard_against_checkpoint_reset`, and both sources call it. Oracle
+still has no checkpoint at all — its correctness rests on `ingest_state`'s watermark
+instead — so this remains two callers, not three; the promotion is justified by the
+duplication cost, not by clearing rule 4's count.
 
-**It is a deliberate, small duplication, not a shared framework function.** Two sources
-(Kafka and this one) need it; CORE section 2 rule 4 sets the bar for a new abstraction at
-**three** implementations, and Oracle has no checkpoint at all — its correctness rests on
-`ingest_state`'s watermark instead. Promoting the guard to `framework/` today would be the
-premature abstraction rule 4 exists to prevent. If a third checkpoint-based source ever
-arrives, this is the first place to look.
+**The two copies had already drifted**, and Stage 5b's merge is the correction: Kafka's
+"already landed" check filtered landing by `topic`, reasoning that one Kafka cluster's
+checkpoint namespace is shared across topics. That reasoning does not hold — Kafka's
+landing table is itself one-per-topic (`{catalog}.landing.{topic_table}`, see §5
+"Partitioning, not Liquid Clustering" above), so every row in it already carries the same
+`topic` value and the filter was redundant
+defence, not real isolation. The file source's version never had it, correctly, since its
+landing table is also one-per-source. The shared implementation checks neither: "does the
+landing table hold any row at all" is the whole question for both.
 
-**What differs from Kafka's, and why:** Kafka's "already landed" check filters landing by
-`topic`, because one Kafka cluster's checkpoint namespace is shared across topics. A file
-source's landing table belongs to exactly one file source — there is no equivalent
-namespace to disambiguate — so the check here is simply "does the landing table hold any
-row at all."
+The shared function also does not repeat Kafka's `checkpoint_reset_id`-reuse refusal
+message verbatim: the Stage-5-era Kafka text pointed operators at "the kafka replay job",
+which the file source has never had (`docs/build_log/STAGE_5_REPORT.md` decision 7) — a
+generic message that claimed that mechanism unconditionally would be inventing a capability
+this source does not have, which CORE section 2 rule 2 forbids. The merged refusal message
+drops that source-specific recommendation and states only what is true for every caller:
+set this source's own control column to an unused incident id, per
+`docs/RUNBOOK_SUPPORT.md` §5.4a. The reuse-engaged log event also lost its per-source
+prefix (`kafka_checkpoint_reset_engaged` / `file_checkpoint_reset_engaged` are now both just
+`checkpoint_reset_engaged`) — every log line already carries `source_type` and `source_key`
+(`framework/logs.py`), so the prefix was redundant, not informative.
 
 ### `cloudFiles.schemaLocation` and the reset guard — the decision
 
