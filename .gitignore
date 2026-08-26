@@ -14,7 +14,10 @@ __pycache__/
 junit/
 
 # Build output (DAB builds the wheel into dist/ at deploy time)
-build/
+# Anchored to the repo root: an unanchored `build/` also matched .claude/build/ (the staged
+# rebuild briefs CLAUDE.md tells every stage session to read), silently keeping them out of
+# git entirely - found while reconciling those briefs against the repo in Stage 8.
+/build/
 dist/
 
 # Local Spark scratch
