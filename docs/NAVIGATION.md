@@ -243,7 +243,7 @@ in a notebook.
 |---|---|---|
 | `00_validate_config` | Nothing | Always — no network, no secrets, no writes |
 | `01_run_unit_tests` | Nothing | Always — the full suite, on a cluster with Spark already present |
-| `02_check_connectivity` | Secrets + registry/driver | Reads secrets, resolves connection options; still no data movement |
+| `02_check_connectivity` | Secrets + registry/driver, plus four first-connection verification probes (VB-19, VB-27, VB-29, VB-01 — see `RUNBOOK_DEVELOPER.md` §9) | Reads secrets, resolves connection options; read-only except VB-27's self-cleaning scratch table |
 | `03_run_ingestion` | The real source | Real run. Start in `dev` |
 
 ### Deployment and CI — root + `resources/` (7 files)

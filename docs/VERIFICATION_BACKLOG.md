@@ -26,11 +26,17 @@ reasoning rather than just a shuffled list:
 2. **Silent but narrower, bounded, or already partly self-correcting** (VB-24, VB-26, VB-28,
    VB-05, VB-10) -- the same "no error" shape, but a smaller blast radius, an unused code
    path today, or a runtime self-check that fails loudly before it fails silently.
-3. **Loud and infra-blocking** (VB-22, VB-01, VB-11, VB-08, VB-12, VB-16, VB-17, VB-13,
-   VB-14) -- fails at connect time, at deploy time, or as an obvious exception. Expensive to
-   be blocked by, cheap to diagnose.
+3. **Loud and infra-blocking** (VB-29, VB-22, VB-01, VB-11, VB-08, VB-12, VB-16, VB-17,
+   VB-13, VB-14) -- fails at connect time, at deploy time, or as an obvious exception.
+   Expensive to be blocked by, cheap to diagnose.
 4. **Cost or performance only, not correctness** (VB-21, VB-07) -- the wrong answer is a
    slower or pricier system, never a wrong number.
+
+**VB-29 added in Stage 8**, and placed first in tier 3: a secret scope or key missing is
+loud (a `ConfigError` naming the scope/key, exactly like VB-22's `ClassNotFoundException`),
+but unlike every other entry in this tier it blocks EVERY source type at the first step of
+every run, not one source's driver, one network route, or one grant. Nothing else in this
+backlog can be exercised on a fresh environment until this one is clear.
 
 Status key: OPEN (not yet checked) / CONFIRMED (checked, assumption held) / REFUTED (checked,
 code must change -- see "If it fails").
@@ -549,6 +555,44 @@ code must change -- see "If it fails").
 - **Expected:** No exception; log line "from_avro writer/reader schema semantics verified".
 - **If it fails:** Confirm the DBR/Spark version meets the 13.3 LTS / Spark 3.4+ floor named
   in the code's own error message before debugging further.
+- **Status:** OPEN
+
+### VB-29 -- Does every secret scope named in `conf/environments/*.yaml` resolve, and does every key name in `conf/jdbc.yaml` / `conf/storage.yaml` exist in it?
+- **Stage / file:** Added in Stage 8. `framework/security.py::SecretResolver`, every
+  register file (`conf/clusters.yaml`, `registries.yaml`, `jdbc.yaml`, `storage.yaml`), and
+  every `conf/environments/<env>.yaml`'s `secret_scope` overlay.
+- **Why it matters:** Nothing in this repository asserts that a secret scope named in an
+  environment file is actually backed by a real Key Vault-backed scope in that workspace,
+  or that the job's service principal has `READ` on it, or that the specific key names each
+  register declares (`username_key`, `password_key` in `jdbc.yaml`;
+  `account_key_secret_key`, `client_id_secret_key`, `client_secret_secret_key` in
+  `storage.yaml`; the equivalent fields in `clusters.yaml` and `registries.yaml`) were ever
+  actually populated in that scope. The failure is loud once a run reaches
+  `SecretResolver.get()` -- a `ConfigError` naming the scope and key -- but "once a run
+  reaches it" is the catch: a fresh environment's first deploy can pass every offline test
+  in `tests/test_offline_validation.py` (which only checks that a NAME is spelled
+  consistently between a source file, a register and an environment overlay) and still fail
+  on the very first real run, for every single source, because nobody populated the Key
+  Vault yet. That is a slower, noisier discovery than confirming it up front.
+- **How to check:** `notebooks/02_check_connectivity.py`'s VB-29 cell, which iterates every
+  profile in every register for the selected environment (via the already-resolved
+  `ResolvedConfig.registers` -- no register is hand-picked) and:
+  ```python
+  for scope in every distinct secret_scope named:
+      dbutils.secrets.list(scope)          # raises if the scope does not exist / no READ
+  for profile in conf/jdbc.yaml's and conf/storage.yaml's profiles:
+      for key_name in that profile's *_key fields:
+          assert key_name in {entry.key for entry in dbutils.secrets.list(profile's scope)}
+  ```
+  Deliberately uses `dbutils.secrets.list()`, never `.get()` -- this confirms a key NAME is
+  present without ever reading the secret VALUE into the notebook.
+- **Expected:** Every scope resolves, and every key name declared in `jdbc.yaml` /
+  `storage.yaml` appears in the scope it is supposed to live in, for every environment.
+- **If it fails:** A missing scope or an access-denied error is a platform/Key Vault
+  ticket, not a code change -- same as VB-16's "confirm Terraform granted what the list
+  says". A missing KEY inside an otherwise-reachable scope means populating it, or -- if the
+  key name itself was typed wrong -- fixing the field in `conf/jdbc.yaml` /
+  `conf/storage.yaml`, never inventing a fallback default for a missing secret.
 - **Status:** OPEN
 
 ### VB-22 -- Is the Oracle JDBC driver installed on the target cluster, and which version?
