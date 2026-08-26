@@ -753,7 +753,8 @@ being genuinely absent, is the lever that matters.
 3. **Run the normal file job.**
 
 **To bound the re-read to fewer files** — a targeted fix rather than the whole path —
-temporarily narrow `source_path` or `path_glob` for that one run, in a PR or a one-off job
+temporarily narrow `path_glob`, or the path itself (`source_path` for `access_mode: adls`,
+`volume_path` for `access_mode: volume`), for that one run, in a PR or a one-off job
 parameter override. **There is no offset or timestamp window for this source**, unlike
 Kafka's or Oracle's replay bounds: narrowing the path is the only bounding mechanism there
 is, and it only narrows *which files are listed*, not which rows within them.
@@ -765,6 +766,6 @@ is, and it only narrows *which files are listed*, not which rows within them.
 | [ ] | Deleted the affected landing partition(s) | `DELETE ... WHERE ingest_date = ...` |
 | [ ] | Confirmed the reset id has never been used for this source | the audit table, Q6d's shape |
 | [ ] | Set a fresh `file_checkpoint_reset_id` | the control table |
-| [ ] | Narrowed `source_path` / `path_glob` if this is a bounded re-read, not a full one | source YAML or job parameters |
+| [ ] | Narrowed `source_path` / `volume_path` / `path_glob` if this is a bounded re-read, not a full one | source YAML or job parameters |
 | [ ] | Ran the normal file job and confirmed it logged `checkpoint_reset_engaged` | driver log, or Q1 |
 | [ ] | Verified row counts against what was expected, and no duplicates | landing table |

@@ -182,7 +182,7 @@ if source_type == "file":
     print(f"source_path: {file_cfg.full_source_path}")
 
     if file_cfg.storage is None:
-        print("\nThis is a Unity Catalog Volume path (D-13) - no storage_ref, no credentials")
+        print(f"\naccess_mode: {file_cfg.access_mode} (D-15) - no storage_ref, no credentials")
         print("of this framework's own. Access is governed entirely by Unity Catalog grants")
         print("on the Volume itself.")
         restore = lambda: None  # noqa: E731 - nothing was applied, nothing to restore
