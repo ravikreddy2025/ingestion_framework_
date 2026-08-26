@@ -1,0 +1,38 @@
+# =====================================================================================
+# membership/eligibility/*.csv  ->  {catalog}.files_membership.eligibility_inbound
+#
+# The worked Unity Catalog Volume example (docs/build_log/DECISIONS.md D-15): a
+# pipe-delimited CSV drop read directly from a Volume, no storage_ref and no credentials of
+# this framework's own. Copy _TEMPLATE_file.yaml rather than this file when onboarding a new
+# drop zone - the template carries the four questions the landing-zone owner has to answer
+# first, plus which access_mode to pick.
+#
+# PREREQUISITE, once per environment:
+#   `CREATE SCHEMA IF NOT EXISTS <catalog>.files_membership;` (the framework creates
+#   tables, never schemas - docs/build_log/DECISIONS.md D-02) and the ingestion job's
+#   compute/service principal must hold READ VOLUME on the Volume named below.
+# =====================================================================================
+
+source_type: file
+
+source:
+
+  access_mode: volume
+  # UC-governed - no storage_ref, no fs.azure.* credentials of this framework's own.
+  volume_path: "/Volumes/{catalog}/landing/membership/eligibility_inbound/"
+  path_glob: "*.csv"
+  file_format: csv
+  format_options:
+    header: "true"
+    delimiter: "|"
+    encoding: "UTF-8"
+
+  domain: vector
+
+  target_schema: files_membership
+  target_table: eligibility_inbound
+
+  schema_mode: provided
+  schema: "member_id STRING, plan_code STRING, effective_date STRING, status STRING"
+
+  landing_partition_by: [ingest_date]
