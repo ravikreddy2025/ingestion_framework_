@@ -523,3 +523,85 @@ stand as written.
 e.g. a third checkpoint-based source type reopening `framework/checkpoint.py`'s module-count
 question, or evidence `hints` was meant as `schemaHints` after all. None of those triggers
 occurred in this stage.
+
+---
+
+## D-15 -- File source access is chosen explicitly via `access_mode`, not inferred from `source_path`'s shape
+
+**Decided.** D-13's mechanism -- inferring Volume-governed vs `storage_ref`-governed access
+from whether `source_path` happens to start with `/Volumes/` -- is **superseded** by an
+explicit, required `access_mode` key: `volume` | `adls`. Shape-inference makes the choice a
+side effect of a string's prefix; an explicit key makes it a reviewable line in the source
+file, the same reasoning that already makes `incremental_mode` an explicit switch on the
+Oracle source rather than something inferred from which cursor columns happen to be set
+(D-09).
+
+**Mechanism, so the two forms cannot silently combine into a wrong config:**
+
+- `access_mode` is a new **required, structural-only** key on `sources/file/spec.py`'s
+  `SOURCE_SPEC` (`volume` | `adls`, no platform default -- every file source must declare
+  it, the same as `target_schema` / `target_table`).
+- **`volume` mode** requires `volume_path` (a new structural key --
+  `/Volumes/<catalog>/<schema>/<volume>/...`) and **rejects** `storage_ref` and
+  `source_path`: either present is a config error naming the key and `access_mode: 'volume'`.
+  No storage credentials are ever applied for it -- `framework/security.py::
+  apply_session_options` is never called, exactly as D-13 already guaranteed for a
+  Volume-shaped path.
+- **`adls` mode** requires `storage_ref` and `source_path` (the path WITHIN the container,
+  unchanged from before D-13) and **rejects** `volume_path`: present is a config error naming
+  the key and `access_mode: 'adls'`.
+- All four keys -- `access_mode`, `volume_path`, `storage_ref`, `source_path` -- stay
+  structural-only (CORE section 5.2: what a source reads from is a PR, not an incident
+  lever), the same as `source_path` / `storage_ref` already were.
+- The mode-conditional required/rejected validation lives in `sources/file/config.py`,
+  checked at config load -- **not** `SourceSpec.mutually_exclusive`, because that field only
+  expresses "at most one of these two may be set" and cannot express "this key is REQUIRED in
+  mode X and FORBIDDEN in mode Y" with a message naming the mode. The shape is the same one
+  `sources/oracle/config.py::_check_mode_requirements` already uses for `incremental_mode`'s
+  cursor/filter requirements -- a source's own config module, not the framework, owns a
+  cross-field rule that depends on a VALUE rather than which keys are merely present.
+- `volume_path`'s shape (`/Volumes/<catalog>/<schema>/<volume>/...`, three non-empty segments
+  after `/Volumes/`) is validated at config load in the same function. The `{catalog}`
+  placeholder inside it resolves through the existing layer 1-3 substitution
+  (`framework/config.py::_substitute`) before `sources/file/config.py` ever sees the value --
+  an unresolved `{catalog}` was already a hard error before this decision, so nothing new was
+  built for that half; the cross-product test (`tests/test_shipped_config.py`) now exercises
+  it for a Volume-mode shipped source in every environment, the same coverage `source_path`
+  already had for `adls` mode.
+
+**Work this implies:**
+
+1. `sources/file/spec.py` -- `access_mode` into `required_keys` and `structural_keys`;
+   `volume_path` into `structural_keys`; `source_path` OUT of `required_keys` (still
+   structural, now conditionally required).
+2. `sources/file/config.py` -- `FileConfig.access_mode` / `.volume_path`; the
+   shape-inference `_storage()` replaced by a mode-driven `_access()`; `is_uc_volume_path`
+   removed in favour of comparing `access_mode` directly; `full_source_path` branches on
+   `access_mode`.
+3. `conf/sources/file_claims_inbound.yaml` -- `access_mode: adls` added (no other change --
+   its own `storage_ref` / `source_path` form is unchanged).
+4. A second shipped file source, `access_mode: volume`, so the cross-product test in
+   `tests/test_shipped_config.py` actually resolves a Volume-mode source in every
+   environment -- D-13 had no shipped Volume-mode example, only the capability.
+5. `conf/sources/_TEMPLATE_file.yaml`, `docs/CONFIGURATION.md`, `docs/DESIGN_FILES.md`,
+   `docs/NAVIGATION.md` -- the shape-inference language replaced with the explicit
+   `access_mode` switch.
+6. `docs/VERIFICATION_BACKLOG.md` -- VB-28 rewritten to "which `access_mode` does each
+   environment use" (the same underlying question, now phrased against the explicit key
+   rather than the inferred shape); a new VB entry for whether Auto Loader's stream
+   checkpoint and `cloudFiles.schemaLocation` behave identically when the source itself
+   reads from a Volume path (`access_mode: volume`) as they do reading from `abfss://`
+   (`access_mode: adls`) -- neither D-13 nor this decision tested that the two are
+   equivalent beyond both checkpoint/schema-location ROOTS already being Volume-backed
+   regardless of `access_mode`, which is a different resource from what `volume_path`
+   itself points the stream source at.
+7. `docs/DESIGN_FILES.md` -- record that if VB-28 (rewritten) comes back "Volumes
+   everywhere", `conf/storage.yaml`'s auth block, `sources/file/security.py` and
+   `framework/security.py::apply_session_options` become deletable, so nobody maintains two
+   credential paths indefinitely. This restates D-13's existing "planned simplification"
+   note against the new, explicit key rather than removing it.
+
+**What would change it:** none anticipated -- this narrows an inferred switch to an
+explicit one, which is a strictly more conservative validation than what it replaces; the
+only way back is a future need to mix the two within one source, which nothing in this
+framework's scope suggests.
