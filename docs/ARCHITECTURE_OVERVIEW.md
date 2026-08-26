@@ -4,7 +4,9 @@ For the client IT and architecture teams. Explains what this framework is, how i
 what it needs from your platform, and what it does with your data.
 
 No code reading required. Engineers wanting implementation depth should read
-[DESIGN.md](DESIGN.md); [NAVIGATION.md](NAVIGATION.md) maps every file in the package.
+[DESIGN.md](DESIGN.md) and the per-source [DESIGN_KAFKA.md](DESIGN_KAFKA.md) /
+[DESIGN_ORACLE.md](DESIGN_ORACLE.md) / [DESIGN_FILES.md](DESIGN_FILES.md);
+[NAVIGATION.md](NAVIGATION.md) maps every file in the package.
 
 ---
 
@@ -272,9 +274,9 @@ Practical consequence: if a Kafka run's landing write succeeds and its curated w
 re-running the job completes the curated write **without duplicating the landing data**. No
 manual cleanup, no reconciliation job.
 
-Recovery operations are separated by cause, and vary by source type — see
-[DESIGN.md](DESIGN.md)'s per-source failure-scenario tables for the complete list. In
-summary:
+Recovery operations are separated by cause, and vary by source type — see each source's own
+failure-scenario table for the complete list: [DESIGN_KAFKA.md](DESIGN_KAFKA.md),
+[DESIGN_ORACLE.md](DESIGN_ORACLE.md), [DESIGN_FILES.md](DESIGN_FILES.md). In summary:
 
 | Situation | Kafka | Oracle | Files |
 |---|---|---|---|

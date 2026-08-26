@@ -148,6 +148,6 @@ procedure (Files) instead; see `docs/RUNBOOK_SUPPORT.md`.
 | `SchemaResolutionError: ... no entry for /schemas/ids/N (HTTP 404)` (Kafka) | Records were produced against a **different** registry | Check `registry:` in the source YAML |
 | `ClassNotFoundException: oracle.jdbc.OracleDriver` (Oracle) | The JDBC driver is not installed on this cluster | Platform task — add it as a cluster library or init script (VB-22) |
 | `RuntimeError: from_avro reader/writer schema self-check failed` (Kafka) | A runtime whose `from_avro` maps the writer/reader arguments differently than expected | There is no config workaround — see `docs/CONFIGURATION.md` §4, "`reader_schema_mode` — pick one" |
-| `REFUSING TO RUN: checkpoint ... is missing` (Kafka, Files) | The checkpoint-reset guard — see `docs/DESIGN.md` | Do not delete landing rows. Use `docs/RUNBOOK_SUPPORT.md`'s checkpoint-reset procedure. |
+| `REFUSING TO RUN: checkpoint ... is missing` (Kafka, Files) | The checkpoint-reset guard — see `docs/DESIGN_KAFKA.md` or `docs/DESIGN_FILES.md` | Do not delete landing rows. Use `docs/RUNBOOK_SUPPORT.md`'s checkpoint-reset procedure. |
 | Job hangs then times out on connect | Broker/JDBC host wrong, or no network path | Most common onboarding error |
 | Replay ran but ingested nothing (Kafka) | Replay pointed at an existing checkpoint | Use a **new** `rerun_id` — it derives an isolated checkpoint |

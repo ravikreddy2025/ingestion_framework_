@@ -6,9 +6,11 @@ For the engineers who own, extend and deploy this codebase.
 record of each source type through every module in execution order — the fastest way to
 orient.
 
-**Prerequisite reading:** [DESIGN.md](DESIGN.md). This runbook tells you *how to do things*;
-DESIGN.md tells you *why the code is shaped the way it is*. Do not change core behaviour
-without reading its per-source failure-scenario tables.
+**Prerequisite reading:** [DESIGN.md](DESIGN.md), plus that source's own
+[DESIGN_KAFKA.md](DESIGN_KAFKA.md) / [DESIGN_ORACLE.md](DESIGN_ORACLE.md) /
+[DESIGN_FILES.md](DESIGN_FILES.md). This runbook tells you *how to do things*; the design
+docs tell you *why the code is shaped the way it is*. Do not change core behaviour without
+reading that source's failure-scenario table.
 
 **Your first hour, in order:**
 
@@ -226,12 +228,14 @@ catch this.
 
 ### Add a source type
 
-See [`DESIGN.md` §12](DESIGN.md#12-adding-a-source-type) for the full seven-item checklist
-and the grep gate that proves nothing under `framework/` changed. In short: a new
-`sources/<type>/` package with `spec.py` (`SOURCE_SPEC`, no PySpark import) and `run.py`
+See [`DESIGN.md` §8](DESIGN.md#8-adding-a-source-type) for the full checklist and the grep
+gate that proves nothing under `framework/` changed. In short: a new `sources/<type>/`
+package with `spec.py` (`SOURCE_SPEC`, no PySpark import) and `run.py`
 (`run(ctx) -> RunResult`), one dict entry in `runner.py`'s `_SOURCES`, a
-`conf/defaults/<type>.yaml`, an onboarding template, and — only if the type needs a
-connection kind none of the existing four registers cover — a new register file.
+`conf/defaults/<type>.yaml`, an onboarding template, a `docs/DESIGN_<TYPE>.md` following the
+pattern `DESIGN_KAFKA.md`/`DESIGN_ORACLE.md`/`DESIGN_FILES.md` already set, and — only if
+the type needs a connection kind none of the existing four registers cover — a new register
+file.
 
 ### Add a control-table lever for an existing source type
 

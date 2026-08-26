@@ -32,6 +32,19 @@ any implementation code.
    each. Faster proof that "onboarding is config only" is true than any prose.
 5. **The trace below**, for whichever source type you touch first.
 
+**`DESIGN.md` is now the shared model only** — architecture, contract rationale,
+configuration model, and the framework-wide lookups (common changes, testing, the
+unverified-claims list, deliberate non-abstractions, adding a source type). Each source's
+own re-run mechanics, failure-scenario table and design decisions moved to a sibling file —
+[DESIGN_KAFKA.md](DESIGN_KAFKA.md), [DESIGN_ORACLE.md](DESIGN_ORACLE.md),
+[DESIGN_FILES.md](DESIGN_FILES.md) — so a reader touching one source type is not also
+carrying the other two. Measured honestly, not rounded down: `DESIGN.md` itself is now 358
+lines (was 729 — the module `docs/build_log/STAGE_7_REPORT.md` §9 named as the thing
+pushing onboarding past two hours), and the one sibling file you actually need adds 74–198
+lines depending on source type, instead of all three. A developer touching only the file
+source, for example, now reads roughly 480 lines of design doc instead of 729 — noticeably
+shorter, and a real file boundary rather than a scroll position to find.
+
 ---
 
 ## Trace one record through every module, in execution order
@@ -85,7 +98,8 @@ connection options).
 | 13 | `framework/audit.py` | The run-level audit row, `source_detail` carrying the **exact SQL** this run sent to Oracle. |
 
 A crash anywhere before step 12 leaves the watermark exactly where it was, so the next run
-re-extracts the same interval — see [DESIGN.md §10](DESIGN.md#10-oracle----the-watermark-and-what-can-go-wrong).
+re-extracts the same interval — see
+[DESIGN_ORACLE.md](DESIGN_ORACLE.md#oracle----the-watermark-and-what-can-go-wrong).
 
 ### A file line
 
@@ -113,12 +127,15 @@ platform default) refuses the batch; `QUARANTINE` lands it and only reports the 
 
 ## Complete file map
 
-### Documentation — `docs/` (8 files)
+### Documentation — `docs/` (11 files)
 
 | File | Read it when |
 |---|---|
 | [NAVIGATION.md](NAVIGATION.md) | You are here |
-| [DESIGN.md](DESIGN.md) | **Before changing any code.** The spine, the source contract, per-source failure scenarios, design decisions, "adding a source type" |
+| [DESIGN.md](DESIGN.md) | **Before changing any code.** The spine, the source contract, the configuration model, common changes, testing, the unverified-claims list, deliberate non-abstractions, "adding a source type" |
+| [DESIGN_KAFKA.md](DESIGN_KAFKA.md) | Before touching `sources/kafka/`. Re-runs and duplicates, design decisions, what Kafka deliberately does not build |
+| [DESIGN_ORACLE.md](DESIGN_ORACLE.md) | Before touching `sources/oracle/`. The watermark lifecycle, failure-scenario table, idempotency |
+| [DESIGN_FILES.md](DESIGN_FILES.md) | Before touching `sources/file/`. Auto Loader design, the shared checkpoint-reset guard, what Files deliberately does not build |
 | [CONFIGURATION.md](CONFIGURATION.md) | Looking up a setting. Every option, tiered MUST CHANGE / NICE TO CHANGE / NO CHANGE REQUIRED |
 | [RUNBOOK_DEVELOPER.md](RUNBOOK_DEVELOPER.md) | Setting up locally, extending the code, raising a PR |
 | [RUNBOOK_SUPPORT.md](RUNBOOK_SUPPORT.md) | Production incident, onboarding, decommissioning. SQL and job parameters only |
@@ -275,10 +292,10 @@ no test in the fast suite ever builds a real `SparkSession`).
 | Re-extract an Oracle window | `oracle_replay`. RUNBOOK_SUPPORT §8.5 |
 | Switch an Oracle table between full and delta | `oracle_incremental_mode`. RUNBOOK_SUPPORT §8.6 |
 | Force a re-read for a file source | The checkpoint-reset procedure. RUNBOOK_SUPPORT §9.7 |
-| Add a source type | [DESIGN.md §12](DESIGN.md#12-adding-a-source-type) |
+| Add a source type | [DESIGN.md §8](DESIGN.md#8-adding-a-source-type) |
 | Add an audit column | `framework/audit.py` (`AUDIT_SCHEMA` + `AUDIT_DDL_COLUMNS`) + `sql/02_layer_tables.sql` |
 | Add a control-table column for a new source-type lever | That source's `SOURCE_SPEC.control_columns` + `sql/01_operational_config.sql` — see D-01 |
-| Understand duplicates on re-run | [DESIGN.md's per-source "Failure scenarios" tables](DESIGN.md) |
+| Understand duplicates on re-run | The "Failure scenarios" table in that source's own design file — [DESIGN_KAFKA.md](DESIGN_KAFKA.md), [DESIGN_ORACLE.md](DESIGN_ORACLE.md), [DESIGN_FILES.md](DESIGN_FILES.md) |
 | Debug a failing job | RUNBOOK_DEVELOPER §6, then `sql/03_support_queries.sql` Q1-Q3 |
 
 ---
@@ -300,10 +317,11 @@ no test in the fast suite ever builds a real `SparkSession`).
 
 ## Two things that will save you an hour
 
-1. **Read [DESIGN.md](DESIGN.md)'s per-source failure-scenario tables before touching
-   `run.py` in any source package.** Each documents which failures are self-healing, which
-   duplicate, which lose rows, and the no-code-change fix for each — most incidents are
-   already answered there.
+1. **Read that source's own design file's failure-scenario table before touching `run.py`
+   in any source package** — [DESIGN_KAFKA.md](DESIGN_KAFKA.md),
+   [DESIGN_ORACLE.md](DESIGN_ORACLE.md), [DESIGN_FILES.md](DESIGN_FILES.md). Each documents
+   which failures are self-healing, which duplicate, which lose rows, and the no-code-change
+   fix for each — most incidents are already answered there.
 2. **Never hardcode a catalog, schema, storage account or JDBC host in a source file.**
    It works in whichever environment you tested and silently breaks the others.
    `tests/test_shipped_config.py` resolves every source in every environment specifically

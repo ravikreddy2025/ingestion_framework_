@@ -721,7 +721,7 @@ Auto Loader's own checkpoint is untouched, so re-enabling resumes from where it 
 
 ### 9.6 A landing zone owner reports files "disappearing"
 
-This framework never moves, renames or deletes a source file (`docs/DESIGN.md` §11,
+This framework never moves, renames or deletes a source file (`docs/DESIGN_FILES.md`,
 "Deliberately not built"). If files are vanishing from the landing zone, that is happening
 outside this job — check the storage account's own lifecycle policies and any other process
 with write access to the container before assuming this job is responsible.

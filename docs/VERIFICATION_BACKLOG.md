@@ -495,7 +495,7 @@ code must change -- see "If it fails").
   the two-form support this stage added is the permanent shape, not a transitional one. If
   Volumes turn out to be available everywhere, `conf/storage.yaml`, `sources/file/security.py`
   and `framework/security.py`'s `apply_session_options` all become deletable - the planned
-  simplification recorded in `docs/DESIGN.md` section 11 - once every shipped file source has
+  simplification recorded in `docs/DESIGN_FILES.md` - once every shipped file source has
   actually moved off them.
 - **Status:** OPEN
 
