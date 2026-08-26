@@ -468,3 +468,99 @@ Having now read the whole codebase, in the order a new joiner would:
    `sources/kafka/listener.py::LAYER_STREAM` as the one source-owned layer name that is not
    also one of that source's `SOURCE_SPEC.layers`, would have saved that time and will save
    it for the next reader too.
+
+---
+
+## Addendum — the three flagged items, fixed before the PR
+
+The human read the five lists and asked for all three "not reproduced" / "decisions for the
+human" findings to be resolved rather than carried forward. All three are done on this
+branch, plus one more stale object found and fixed while doing them. The sections above are
+left as written — they are the record of what was found and why it looked like a decision
+for the human — and this addendum records what actually happened instead.
+
+### 1. `docs/RUNBOOK_CLIENT_IT.md` renamed to `docs/ARCHITECTURE_OVERVIEW.md`
+
+`git mv`, then every cross-reference updated: `README.md`, `docs/NAVIGATION.md`,
+`docs/CONFIGURATION.md`, `docs/VERIFICATION_BACKLOG.md`, `sql/01_operational_config.sql`,
+`sql/02_layer_tables.sql`, and the two docstring mentions in `tests/test_shipped_sql.py`
+(comments only — neither test asserts against the file's name, confirmed by grep before
+renaming, so no test needed changing to keep passing). The file's own content needed no
+change: its H1 was already "Architecture and Governance Overview," matching the new
+filename. `docs/build_log/*.md` (the historical stage reports) were **not** touched — they
+record what was true at the time each stage ran, and rewriting history is not what an
+addendum is for.
+
+### 2. `docs/IMPORT_TO_DATABRICKS.md` rewritten
+
+Full rewrite against the current API: `framework.config`/`framework.runner` instead of the
+retired `kafka_ingest.config`/`pipeline`; the real entry points (`ingest_primary`,
+`ingest_oracle`, `ingest_file`, `replay_kafka`, `replay_curated`, `maintenance`) instead of
+one Kafka-only job; DBR 16.4 LTS (matching `pyproject.toml`'s `requires-python` and VB-14)
+instead of the pre-refactor "13.3 LTS" floor; the real test file names; a compute-
+requirements row for the Oracle JDBC driver (VB-22); and a common-errors table covering all
+three source types. This file was never in any stage's `Files:` list, including this one's —
+Stage 0's inventory flagged it for rewrite "out of scope before Stage 7," and Stage 7's own
+brief did not name it either. Fixed anyway per the explicit instruction to fix or remove
+stale objects, rather than continuing to leave it as the one remaining document nobody's
+scope covered.
+
+### 3. Oracle's maintenance-job gap closed (`docs/build_log/DECISIONS.md` D-11)
+
+`resources/job_maintenance.yml` gained an `oracle_claim_header` task, mirroring the file
+source's task exactly: same anchor-merged retry/timeout settings, same
+`sql/04_maintenance.sql` file, `landing_table: "${var.data_catalog}.oracle_claims.
+claim_header"` — derived the same way `conf/defaults/oracle.yaml`'s pattern derives it
+(`CLAIMS.CLAIM_HEADER` -> `oracle_claims.claim_header`). No SQL change was needed:
+`sql/04_maintenance.sql`'s `OPTIMIZE`/`VACUUM` statements already take a landing table name
+generically. The header comment's "NOT covered, flagged so it is not mistaken for closed"
+note is replaced with the closure statement. `docs/build_log/DECISIONS.md` D-11 gained a
+short closing paragraph rather than being rewritten, following the same amend-in-place
+precedent Stage 2's own addendum set.
+
+**Verified, not assumed:** `tests/test_shipped_config.py`'s
+`test_every_maintenance_task_names_a_source_that_actually_exists` and
+`test_every_maintenance_task_s_landing_table_matches_what_the_source_resolves_to` are both
+parametrized directly over `resources/job_maintenance.yml`'s own task list, so the new task
+was picked up automatically with no test file edited — and both pass for it
+(`pytest tests/test_shipped_config.py tests/test_shipped_jobs.py tests/test_shipped_sql.py -q`
+→ 167 passed).
+
+### One more stale object, found while fixing the above
+
+`pyproject.toml`'s `description` field still read *"Config-driven Kafka -> Databricks
+landing/curated ingestion framework"* — a one-line, cosmetic but genuinely stale claim (this
+is a three-source framework, and Oracle/Files are landing-only, not landing/curated).
+Corrected to *"Config-driven multi-source (Kafka, Oracle, Files) -> Databricks ingestion
+framework."* No behavioural effect; found only because this addendum's grep-before-renaming
+pass over the repository surfaced it.
+
+### Gate after the addendum
+
+```
+$ python -m ruff check src tests
+All checks passed!
+
+$ python -m ruff format --check src tests
+85 files already formatted
+
+$ python -m pytest -m "not spark" -q
+949 passed, 7 skipped, 36 deselected
+
+$ grep -rInE '\b(kafka|oracle|bigquery|autoloader|cloudFiles|jdbc)\b' src/kafka_ingest/framework/ \
+    | grep -v 'runner.py:.*_SOURCES'
+$ echo $?
+1
+```
+
+Test count rose from 947 to **949** — the two new parametrized maintenance-job test cases
+for `oracle_claim_header` (`test_every_maintenance_task_names_a_source_that_actually_exists`
+and `test_every_maintenance_task_s_landing_table_matches_what_the_source_resolves_to`), both
+passing, neither test file edited to get them. No other test count changed.
+
+### What this addendum leaves standing from the original five lists
+
+The "not reproduced" and "decisions for the human" entries for these three items are now
+historical — read them for the reasoning, not as open items. Decision 4 (the `layer =
+'stream'` finding) and everything in sections 1, 2 and the "what I would change" list stand
+unchanged; none of them was asked to be fixed.
