@@ -96,7 +96,7 @@ AUDIT_DDL_COLUMNS = """
     source_key            STRING    COMMENT 'Matches conf/sources/<source_key>.yaml and ingest_control.source_key',
     source_ref            STRING    COMMENT 'Source-side identifier: topic name, SCHEMA.TABLE, or path glob',
     domain                STRING    COMMENT 'Owning team',
-    layer                 STRING    COMMENT 'run, plus whichever layers the source type has',
+    layer                 STRING    COMMENT 'run (this file), or a source''s own - e.g. Kafka''s LAYER_STREAM',
     status                STRING    COMMENT 'STARTED | COMPLETED | FAILED | SKIPPED | NO_DATA',
     record_count          BIGINT    COMMENT 'Rows PRESENTED to the write - see the caveat in framework/audit.py',
     quarantined_count     BIGINT,

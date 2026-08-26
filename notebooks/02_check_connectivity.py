@@ -12,6 +12,12 @@
 # MAGIC   call; runs no query). Files: lists the source path (a real call against the storage
 # MAGIC   account or Volume; reads no file content).
 # MAGIC * **No test writes anything, and no row of business data is read.**
+# MAGIC * Then four **first-connection verification probes**, one per open
+# MAGIC   `docs/VERIFICATION_BACKLOG.md` entry a developer must clear before any real
+# MAGIC   ingestion (VB-19, VB-27, VB-01, VB-29 - see `docs/RUNBOOK_DEVELOPER.md`'s
+# MAGIC   "First-connection verification" table). **Every probe is read-only: no write to a
+# MAGIC   landing table, no state advanced.** VB-27 is the one exception that writes
+# MAGIC   anything at all, and it writes only to a scratch table it creates and drops itself.
 # MAGIC
 # MAGIC No secret VALUE is ever printed. Run it once per environment: dev, preprod and prod
 # MAGIC use different scopes and different endpoints, so passing in one proves nothing about
@@ -28,10 +34,14 @@ sys.path.insert(0, f"{REPO_ROOT}/src")
 dbutils.widgets.text("config_root", f"{REPO_ROOT}/conf", "1. Config root")
 dbutils.widgets.text("source_key", "vector_patient_events", "2. Source key")
 dbutils.widgets.dropdown("environment", "dev", ["dev", "preprod", "prod"], "3. Environment")
+dbutils.widgets.text(
+    "vb27_scratch_table", "<CHANGE_ME_catalog>.<CHANGE_ME_schema>.vb27_column_order_probe", "4. VB-27 scratch table"
+)
 
 config_root = dbutils.widgets.get("config_root")
 source_key = dbutils.widgets.get("source_key")
 environment = dbutils.widgets.get("environment")
+vb27_scratch_table = dbutils.widgets.get("vb27_scratch_table")
 
 # COMMAND ----------
 
@@ -205,6 +215,193 @@ if source_type == "file":
         raise
     finally:
         restore()
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## First-connection verification probes
+# MAGIC
+# MAGIC Four probes from `docs/VERIFICATION_BACKLOG.md`, ordered by that file's own damage
+# MAGIC ranking. Each is safe to run before any real ingestion: **read-only, no write to a
+# MAGIC landing table, no state advanced.** VB-27 is the only one that writes anything at
+# MAGIC all, and it writes to - then drops - a scratch table of its own, never a real table.
+# MAGIC
+# MAGIC See `docs/RUNBOOK_DEVELOPER.md`'s "First-connection verification" table for what each
+# MAGIC one proves and what to change in the code if it fails.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### VB-29 - do this environment's secret scopes resolve, and do the key names
+# MAGIC ### `conf/jdbc.yaml` / `conf/storage.yaml` declare actually exist in them?
+# MAGIC
+# MAGIC Read-only: `dbutils.secrets.list()` returns key **names** only, never a value, so
+# MAGIC this never touches an actual credential. Runs regardless of which `source_key` is
+# MAGIC selected above - `cfg.registers` already carries every profile in every register for
+# MAGIC the selected environment, not just the one this source references.
+
+# COMMAND ----------
+
+print(f"\nVB-29 - secret scopes and key names for environment '{environment}':")
+
+_scopes: dict[str, list[str]] = {}
+for register_name, profiles in cfg.registers.items():
+    for profile_name, profile in profiles.items():
+        scope = profile.get("secret_scope")
+        if scope:
+            _scopes.setdefault(scope, []).append(f"{register_name}.{profile_name}")
+
+print(f"\nStep 1 - {len(_scopes)} distinct secret scope(s) named across every register:")
+_listed: dict[str, list[str]] = {}
+for scope, users in sorted(_scopes.items()):
+    try:
+        keys = [entry.key for entry in dbutils.secrets.list(scope)]
+        _listed[scope] = keys
+        print(f"  [OK]      {scope:<28} ({len(keys)} key(s))  used by {', '.join(users)}")
+    except Exception as exc:
+        print(f"  [FAILED]  {scope:<28} {type(exc).__name__}: {exc}  used by {', '.join(users)}")
+        print(f"            Check the scope exists in conf/environments/{environment}.yaml and that")
+        print("            the job's service principal has READ on it.")
+
+print("\nStep 2 - every key name conf/jdbc.yaml and conf/storage.yaml declare, checked")
+print("against the scope each profile resolves to (names only, never fetched):")
+_JDBC_KEY_FIELDS = ("username_key", "password_key")
+_STORAGE_KEY_FIELDS = ("account_key_secret_key", "client_id_secret_key", "client_secret_secret_key")
+for register_name, key_fields in (("jdbc", _JDBC_KEY_FIELDS), ("storage", _STORAGE_KEY_FIELDS)):
+    for profile_name, profile in sorted(cfg.registers.get(register_name, {}).items()):
+        scope = profile.get("secret_scope")
+        available = _listed.get(scope)
+        for field in key_fields:
+            key_name = profile.get(field)
+            if not key_name:
+                continue  # not every profile sets every field - e.g. only one storage auth_mode applies
+            if available is None:
+                print(f"  [SKIPPED] {register_name}.{profile_name}.{field}='{key_name}' - scope '{scope}' above failed")
+            elif key_name in available:
+                print(f"  [OK]      {register_name}.{profile_name}.{field}='{key_name}' found in '{scope}'")
+            else:
+                print(f"  [MISSING] {register_name}.{profile_name}.{field}='{key_name}' NOT in '{scope}'")
+                print(f"            Populate this key in the '{scope}' scope, or fix the field name in")
+                print(f"            conf/{register_name}.yaml if it was typed wrong.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### VB-01 - does a partitioned Oracle JDBC read actually produce `numPartitions` tasks?
+# MAGIC
+# MAGIC Read-only: `partition_bounds()` is one `SELECT MIN/MAX` round trip, and
+# MAGIC `.rdd.getNumPartitions()` reads Spark's own partitioning plan - it does not execute
+# MAGIC the query or fetch a single row.
+
+# COMMAND ----------
+
+if source_type == "oracle":
+    from kafka_ingest.framework import tables as framework_tables
+    from kafka_ingest.sources.oracle import config as oracle_config
+    from kafka_ingest.sources.oracle import query as oracle_query
+    from kafka_ingest.sources.oracle import reader as oracle_reader
+
+    oracle_cfg = oracle_config.build(cfg, "primary", framework_tables)
+    print(f"\nVB-01 - partitioned read for '{oracle_cfg.source_ref}':")
+    if not oracle_cfg.partition_column or oracle_cfg.num_partitions <= 1:
+        print(
+            f"  SKIPPED - partition_column={oracle_cfg.partition_column!r}, "
+            f"num_partitions={oracle_cfg.num_partitions}. This source reads serially; VB-01 only "
+            "matters once a partition_column and num_partitions > 1 are configured."
+        )
+    else:
+        if oracle_cfg.is_cursor:
+            high_water_row = oracle_reader.read_scalar_row(
+                spark, oracle_cfg, secrets, oracle_query.high_water_query(oracle_cfg)
+            )
+            base_query = oracle_query.build_query(oracle_cfg, run_high_water=str(high_water_row["high_water"]))
+        else:
+            base_query = oracle_query.build_query(oracle_cfg)
+        bounds = oracle_reader.partition_bounds(spark, oracle_cfg, secrets, base_query)
+        df = oracle_reader.read(spark, oracle_cfg, secrets, base_query, bounds)
+        actual = df.rdd.getNumPartitions()
+        expected = oracle_cfg.num_partitions
+        status = "OK" if actual == expected else "SILENT FALLBACK"
+        print(f"  bounds={bounds}  expected numPartitions={expected}  actual={actual}  [{status}]")
+        if actual != expected:
+            print("  Spark silently read this serially despite partition_column being set. Per VB-01,")
+            print("  sources/oracle/reader.py must always build a parenthesised dbtable subquery when")
+            print("  partitionColumn is set, never the bare `query` option for a partitioned read.")
+else:
+    print(f"\nVB-01 only applies to an Oracle source; source_type is '{source_type}'. Skipped.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### VB-19 - does the rendered `TO_TIMESTAMP` watermark literal compare correctly
+# MAGIC ### against a real Oracle cursor column?
+# MAGIC
+# MAGIC Read-only: both queries below are `SELECT COUNT(*)`, over a wide, fixed bound - no
+# MAGIC row content is fetched and no state is touched. Uses the framework's own
+# MAGIC `build_query()`, the exact code path a real run takes, against a `TO_DATE` control
+# MAGIC rendered the same way but naming a different Oracle function - if the two counts
+# MAGIC disagree, the comparison in `sources/oracle/query.py::_literal()` is wrong for this
+# MAGIC column's actual Oracle type (VB-03's question, arriving here as a predicate).
+
+# COMMAND ----------
+
+if source_type == "oracle" and oracle_cfg.is_cursor and oracle_cfg.cursor_type == "timestamp":
+    _wide_start, _wide_end = "1901-01-01 00:00:00", "2999-12-31 23:59:59"
+    to_timestamp_query = oracle_query.build_query(oracle_cfg, last_watermark=_wide_start, run_high_water=_wide_end)
+    to_date_query = to_timestamp_query.replace("TO_TIMESTAMP(", "TO_DATE(")
+    print(f"\nVB-19 - comparing the two literal forms over {oracle_cfg.cursor_column}:")
+    print(f"  Framework's TO_TIMESTAMP query:\n    {to_timestamp_query}")
+    print(f"\n  TO_DATE control query:\n    {to_date_query}")
+    count_sql_a = f"SELECT COUNT(*) AS c FROM ({to_timestamp_query}) q"
+    count_sql_b = f"SELECT COUNT(*) AS c FROM ({to_date_query}) q"
+    count_a = oracle_reader.read_scalar_row(spark, oracle_cfg, secrets, count_sql_a)
+    count_b = oracle_reader.read_scalar_row(spark, oracle_cfg, secrets, count_sql_b)
+    n_a = count_a["c"] if count_a else None
+    n_b = count_b["c"] if count_b else None
+    print(f"\n  TO_TIMESTAMP count={n_a}   TO_DATE count={n_b}   [{'OK' if n_a == n_b else 'MISMATCH'}]")
+    if n_a != n_b:
+        print("  The two literal forms disagree over the same bounds. Change the format model or")
+        print("  the function in sources/oracle/query.py::_literal() - it is the only place a")
+        print("  watermark becomes SQL, and every predicate goes through it.")
+elif source_type == "oracle":
+    print(
+        f"\nVB-19 - SKIPPED. cursor_type={oracle_cfg.cursor_type!r}, is_cursor={oracle_cfg.is_cursor}. "
+        "VB-19 concerns the TO_TIMESTAMP literal path, which only a timestamp cursor takes."
+    )
+else:
+    print(f"\nVB-19 only applies to an Oracle source; source_type is '{source_type}'. Skipped.")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### VB-27 - does a Delta append reconcile columns by NAME when order differs?
+# MAGIC
+# MAGIC The only probe here that writes anything - to the scratch table named by the
+# MAGIC `vb27_scratch_table` widget, which it creates and then **drops itself** at the end.
+# MAGIC Never touches a real landing table. Change the widget to a catalog.schema you can
+# MAGIC create a table in if the default does not resolve for you.
+
+# COMMAND ----------
+
+print(f"\nVB-27 - column-order-vs-name probe, using scratch table '{vb27_scratch_table}':")
+try:
+    spark.sql(f"CREATE TABLE {vb27_scratch_table} (a STRING, b STRING, c STRING) USING DELTA")
+    reordered = spark.createDataFrame([("C", "A", "B")], "c STRING, a STRING, b STRING")
+    reordered.write.format("delta").mode("append").saveAsTable(vb27_scratch_table)
+    row = spark.table(vb27_scratch_table).collect()[0]
+    landed_by_name = row["a"] == "A" and row["b"] == "B" and row["c"] == "C"
+    print(f"  wrote columns (c, a, b) = ('C', 'A', 'B'); read back a={row['a']} b={row['b']} c={row['c']}")
+    print(f"  [{'OK - reconciled by NAME' if landed_by_name else 'POSITIONAL - see VB-27'}]")
+    if not landed_by_name:
+        print("  sources/file/landing.py::project() must end with an explicit .select() naming every")
+        print("  column in the exact order tables.landing_columns() declares - the same discipline")
+        print("  Kafka's and Oracle's projections already follow.")
+except Exception as exc:
+    print(f"  FAILED: {type(exc).__name__}: {exc}")
+    print("  Change the vb27_scratch_table widget to a catalog.schema you have CREATE TABLE on.")
+    raise
+finally:
+    spark.sql(f"DROP TABLE IF EXISTS {vb27_scratch_table}")
 
 # COMMAND ----------
 

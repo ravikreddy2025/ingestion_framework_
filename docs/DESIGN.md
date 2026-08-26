@@ -3,7 +3,14 @@
 For the team taking this over. Read this before changing code.
 
 **Scope: Kafka → landing/curated. Oracle → landing. Files → landing.** Nothing downstream
-of a source's own layers is in this package.
+of a source's own layers is in this package. **Each source's own design, failure-scenario
+table and design decisions live in their own sibling file** —
+[DESIGN_KAFKA.md](DESIGN_KAFKA.md), [DESIGN_ORACLE.md](DESIGN_ORACLE.md),
+[DESIGN_FILES.md](DESIGN_FILES.md) — so a reader who only touches one source type is not
+carrying the other two while they read. This file holds what is genuinely shared: the
+architecture, why the source contract has exactly one method, the configuration model, and
+the framework-wide lookups (common changes, testing, the unverified-claims list, deliberate
+non-abstractions, adding a source type).
 
 ---
 
@@ -181,200 +188,7 @@ merges on should require a PR — every source's own test module asserts this.
 
 ---
 
-## 4. Kafka — re-runs and duplicates
-
-**The most important section for anyone changing `sources/kafka/run.py`.**
-
-### Two mechanics everything follows from
-
-1. **Checkpoint protocol.** Spark writes the batch's offset range to `<checkpoint>/offsets/N`
-   *before* running `foreachBatch`, and `<checkpoint>/commits/N` *after* it returns
-   cleanly. On restart, if `offsets/N` exists but `commits/N` does not, Spark
-   **re-executes batch N over the identical offset range**. A retry never reads a
-   different set of records.
-2. **Delta idempotent writes.** `txnAppId` + `txnVersion` (the microbatch id) are recorded
-   **per table**. A repeat write with an already-seen version is skipped. That is why one
-   shared `txn_app_id` is correct: landing skips itself while curated still proceeds.
-
-`txn_app_id` is derived from `source_key` + run type + replay lineage
-(`sources/kafka/config.py`). It **must stay stable across restarts** — never make it random
-per run.
-
-### Failure scenarios
-
-| # | Failure | Duplicates? | Fix — no code change |
-|---|---|---|---|
-| 1 | Curated fails, transient | No | Re-run |
-| 2 | Curated fails persistently (unregistered schema) | No | Register schema, **or** `kafka_failure_mode → QUARANTINE` |
-| 3 | Driver dies between landing and curated | No | Re-run |
-| 4 | Landing write itself fails | No | Fix cause, re-run |
-| 5 | Job timeout mid-run | No | Re-run; lower `max_offsets_per_trigger` |
-| 6 | **Primary checkpoint deleted** | **No — silent data loss instead** | Kafka checkpoint-reset procedure (RUNBOOK_SUPPORT §5.4a) |
-| 7 | Batch succeeded, curated data wrong | No | Curated replay job |
-| 8 | Records genuinely missed | No | Kafka replay job |
-
-#### Scenario 1-3 — self-healing
-
-```
-Batch 5, attempt 1:  landing append (X,5) → COMMITTED
-                     curated write        → FAILS
-                     no commits/5         → run fails
-Batch 5, retry:      landing append (X,5) → SKIPPED by Delta
-                     curated write        → SUCCEEDS
-                     commits/5 written    → done
-```
-
-#### Scenario 2 — poison batch, the one that actually hurts
-
-A *persistent* parse failure retries forever; the topic never advances. Not a duplicate
-problem — a stuck stream. Fixes, in order of preference:
-
-1. Register the missing schema. Next run succeeds naturally.
-2. `UPDATE ... SET kafka_failure_mode = 'QUARANTINE'` (see `sql/03_support_queries.sql` Q6).
-   Bad records go to quarantine with raw bytes, the batch completes, the stream drains.
-   Recover them later with the **curated replay** job, then set it back to `FAILFAST`.
-
-#### Scenario 6 — the only failure that looks like success
-
-Deleting the primary checkpoint restarts `batchId` at 0. Delta has already recorded high
-versions for this `txnAppId`, so appends are **skipped as duplicates**. The job reports
-success and writes nothing.
-
-`framework/checkpoint.py::guard_against_checkpoint_reset` refuses to run when the primary
-checkpoint is missing **and** the landing table already holds rows for this source. A
-genuine first run is unaffected: its own landing table has no rows yet.
-
-**Never delete a primary checkpoint. Use the Kafka replay job** to recover the missed *data*
-— it derives a different checkpoint *and* a different `txnAppId` from `rerun_id`, so neither
-collides. Replay does **not**, by itself, unblock the *primary* job: the guard keeps refusing
-every trigger until support sets `kafka_checkpoint_reset_id` in the control table, which
-forks the txnAppId lineage the same way `rerun_id` does, so the restarted primary also gets
-an identity with no committed history to collide with. See
-[`RUNBOOK_SUPPORT.md` §5.4a](RUNBOOK_SUPPORT.md#5-4a-restarting-the-primary-after-a-genuine-checkpoint-loss).
-
-### ⚠️ Verify this on your DBR before go-live
-
-`txnAppId` / `txnVersion` behaviour is taken from Delta's documented contract. In
-particular, confirm whether the skip triggers on `txnVersion ≤ last recorded` or only on
-`==`; scenario 6 depends on it. Test by killing a job deliberately between the landing and
-curated writes, then re-running and checking `sql/03_support_queries.sql` **Q11**
-(duplicate check) returns zero rows.
-
-## 5. Kafka design decisions
-
-#### Payload stays nested
-
-Curated stores the parsed record as **one `payload` STRUCT**, not flattened columns.
-
-- Every curated table has the same recognisable outer shape, so an operator moving between
-  topics does not relearn the columns.
-- No collision is possible between business fields and framework columns.
-- Nested structures survive as structs/arrays/maps: query `payload.patient.id`, read with
-  `SELECT to_json(payload)`.
-- Business fields in config are therefore written as `payload.<field>` — e.g.
-  `curated_dedup_keys: [payload.claim_id]`.
-
-**Arrays are not exploded.** Curated is 1:1 with Kafka records. Exploding would break the
-`(topic, kafka_partition, kafka_offset)` merge key that makes replay idempotent. Fan-out is
-a modelling decision that belongs downstream.
-
-#### Reader schema is mandatory; a "writer" mode does not exist
-
-`from_avro(payload, jsonFormatSchema, options)` maps onto Avro's two-schema resolution:
-positional = **writer** (how the bytes were encoded), `avroSchema` option = **reader**
-(the shape you want out). The reader schema fixes the `payload` struct's type.
-
-Because curated stores payload as one struct column, two writer versions decoded *without*
-a common reader schema would produce two incompatible struct types that cannot share a
-table. So there is no "use each writer schema as-is" mode — only `registry_latest` and
-`pinned_id`. Avro resolution fills reader-only fields from defaults and drops writer-only
-fields, so a mixed-version batch lands cleanly.
-
-That positional/option mapping is easy to get backwards and has moved between Spark
-versions, so `sources/kafka/curated.py::assert_from_avro_semantics()` **proves it at
-runtime**, once per run, with a 5-byte synthetic record. A DBR upgrade that changed the
-behaviour fails the job at startup instead of silently mis-decoding production data.
-
-#### Partitioning, not Liquid Clustering
-
-Delta allows `PARTITIONED BY` or `CLUSTER BY`, never both.
-
-- **landing** `(ingest_date)` — one table per topic, so `topic` is constant inside it and
-  gives per-topic file isolation for retention and replay. `ingest_date` stops one topic's
-  partition growing without bound.
-- **curated** `(event_date)` — already one table per topic. `event_date` = date of
-  `ce_time`, falling back to `kafka_timestamp`. Late-arriving events write into older
-  partitions; that is expected.
-
-#### MERGE vs append
-
-| | Primary | Replay |
-|---|---|---|
-| **landing** | append + `txnAppId`/`txnVersion` | MERGE on record key, **insert-if-absent only** |
-| **curated** | append + `txnAppId`/`txnVersion` | MERGE on record key, **upsert** |
-
-Append on the primary path because exactly-once is already guaranteed by checkpoint +
-idempotent markers; MERGE would scan the target every batch to discover it has nothing to do.
-
-MERGE on replays because a replay overlaps existing data *by definition*.
-
-**The asymmetry is the important part.** Landing records *what arrived* — overwriting a
-row's provenance with replay metadata would destroy the thing replays are meant to be
-distinguishable by. Curated records *what the data means* — replacing a bad parse is the
-entire point of a curated replay.
-
-`framework/writers.py::merge()` requires a partition predicate with no default. Landing's
-own replay call passes `"true"` deliberately: landing is partitioned by `ingest_date` (the
-date a row was *written*), so a replayed record's `ingest_date` never matches its original
-twin's — any derived bound would match nothing and insert duplicates. Curated's replay call
-computes a real `event_date BETWEEN` bound, because `event_date` is a property of the record
-itself and both copies share it.
-
-#### CloudEvents
-
-CloudEvents v1.0, Kafka binary content mode: context attributes arrive as `ce_*` headers
-and the event data is the Kafka value — exactly the Avro payload. Eight attributes are
-promoted to typed columns in both layers. Header matching is case-insensitive.
-
-Two judgement calls:
-
-- **`ce_time` is stored as STRING, verbatim.** RFC3339 UTC sorts correctly as a string, and
-  parsing here would either silently NULL a malformed value or throw under ANSI mode.
-  `event_date` is derived separately with a regex guard so a malformed `ce_time` can never
-  fail a batch.
-- **No `ce_extensions` MAP.** Kafka permits duplicate header keys and map construction from
-  them errors on duplicates. Non-standard attributes stay in `kafka_headers`.
-
-#### Hand-rolled `foreachBatch`, not Lakeflow Declarative Pipelines
-
-LDP is the better default for most medallion work, and is the right tool downstream of
-curated. It does not fit *this* layer, for three concrete reasons:
-
-1. **Per-record writer-schema resolution needs a driver-side registry call inside the
-   batch.** The query plan is a function of the schema ids *in that batch*, so it cannot be
-   declared up front.
-2. **Replay checkpoint isolation is not expressible.** LDP owns its checkpoints; the replay
-   pattern here depends on *choosing* the checkpoint path per run so a starting-offset
-   override is honoured at all.
-3. **Bounded replay and the asymmetric MERGE are per-run imperative decisions.**
-
-If LDP gains user-controlled per-run checkpoint/offset overrides, revisit this.
-
-### Kafka — deliberately not built
-
-- **Pluggable serialization formats.** Avro-via-Schema-Registry is the only format in
-  scope; `sources/kafka/registry.py` refuses non-`AVRO` `schemaType` with a clear error.
-- **A Kafka client factory.** There is one client.
-- **Executor-local cert staging** (`SparkContext.addFile`). Documented in
-  `sources/kafka/security.py` as the fallback if a compute profile cannot read UC Volumes
-  from executors (VB-11).
-- **Per-partition replay timestamps.** `replay_starting_timestamp` covers what support asks
-  for.
-- **`ce_extensions` map**, **payload flattening**, **array explosion** — see above.
-
----
-
-## 6. Where to make common changes
+## 4. Where to make common changes
 
 | I want to… | Edit | Deploy needed? |
 |---|---|---|
@@ -388,14 +202,14 @@ If LDP gains user-controlled per-run checkpoint/offset overrides, revisit this.
 | Switch Oracle between full and delta | `oracle_incremental_mode` in the control table | **No** |
 | Add a CloudEvent attribute (Kafka) | `CE_ATTRIBUTES` in `sources/kafka/landing.py` + the DDL blocks in `sources/kafka/tables.py` | Yes |
 | Change the audit row shape | `AUDIT_SCHEMA` in `framework/audit.py` + `AUDIT_DDL_COLUMNS` + `sql/02_layer_tables.sql` | Yes |
-| Add a source type | §12 below | Yes (PR, plus the grep gate must stay clean) |
+| Add a source type | §8 below | Yes (PR, plus the grep gate must stay clean) |
 
 The last two are the only framework-wide ones, and a test asserts the audit schema and DDL
 stay in step (`tests/test_framework_audit.py`).
 
 ---
 
-## 7. Testing
+## 5. Testing
 
 ```bash
 ruff check src tests             # lint - the azure-pipelines.yml CI gate
@@ -418,7 +232,7 @@ The tests worth knowing about:
 | `tests/test_file_run.py` | The rescued-row / `failure_mode` interaction, the shared guard's wiring |
 | `tests/test_shipped_config.py` | Every real `conf/sources/*.yaml` resolves in every environment, across all three source types — the CI gate for configuration |
 | `tests/test_shipped_jobs.py` | Every job template names a real, correctly-typed source, and the runbook's cited queries actually exist |
-| `tests/test_offline_validation.py` | YAML parses; every job entrypoint resolves; every `source_type` has a package; every register reference resolves |
+| `tests/test_offline_validation.py` | YAML parses; every job entrypoint resolves; every `source_type` has a package; every register reference resolves; every notebook's `kafka_ingest` imports resolve against the current source tree |
 
 Run the full suite on Databricks via `notebooks/01_run_unit_tests` — DBR has Spark and
 `spark-avro` built in, so it runs with no setup. No test connects to Kafka, Oracle or ADLS,
@@ -426,7 +240,7 @@ reads a secret, or writes to a table.
 
 ---
 
-## 8. The unverified-claims list
+## 6. The unverified-claims list
 
 Every assumption this codebase makes that needs real infrastructure to confirm is tracked
 in [`docs/VERIFICATION_BACKLOG.md`](VERIFICATION_BACKLOG.md), ordered by how much breaks if
@@ -449,7 +263,7 @@ examples.
 
 ---
 
-## 9. Deliberate non-abstractions
+## 7. Deliberate non-abstractions
 
 Forbidden across the whole framework, and not negotiable, because a small team has to own
 this — CORE section 7's list, restated here as what was *not* built and why:
@@ -475,6 +289,12 @@ this — CORE section 7's list, restated here as what was *not* built and why:
 - **File archiving, moving or deletion** for the file source — that belongs to whoever owns
   the landing zone.
 
+Each source's own, narrower "deliberately not built" list — the choices specific to that
+source type, like Kafka's single serialization format or Files' lack of a replay job — lives
+in that source's own design file: [DESIGN_KAFKA.md](DESIGN_KAFKA.md),
+[DESIGN_FILES.md](DESIGN_FILES.md). Oracle has none beyond what this framework-wide list
+already covers.
+
 The falsifiable gate, run in CI on every PR:
 
 ```bash
@@ -486,198 +306,7 @@ If this returns anything, the spine has leaked.
 
 ---
 
-## 10. Oracle — the watermark, and what can go wrong
-
-### The order, and why it is the whole design
-
-    capture the high water -> read the closed interval -> write landing -> THEN advance
-
-A crash anywhere before the advance leaves the stored watermark where it was, so the next
-run re-extracts the same interval — which the merge key absorbs. Advancing first would mean
-a crash silently skipped a window, and nothing downstream could detect that.
-
-`ingest_state` holds the watermark, not the audit table. Audit writes are best-effort by
-design and must never raise; extraction correctness must not depend on best-effort writes.
-
-### The closed interval
-
-`cursor > last_watermark AND cursor <= high_water`, with the upper bound captured at run
-start from `MAX(cursor)` over the rows this extract can see — never from a clock, because a
-clock reading is ahead of every committed row by definition and would move the watermark
-past rows still in flight.
-
-**The gap this does not close:** a transaction already open when the high water was
-captured, carrying a cursor value below it, that commits after the extract has read past
-that value, is never seen. That is inherent to a cursor over a wall-clock column, and how
-much it matters is a property of the SOURCE APPLICATION — whether it stamps the cursor at
-statement time or at commit. It is VB-25, it is stated at the top of `sources/oracle/run.py`,
-and it is a question for the source team at onboarding rather than something this code can
-detect.
-
-### Failure scenarios
-
-| # | Failure | Duplicates? | Rows lost? | Fix — no code change |
-|---|---|---|---|---|
-| 1 | Transient JDBC failure (network, session killed) | No | No | Re-run. The watermark never moved, so the same interval is re-read. |
-| 2 | Write fails after a successful read | No | No | Re-run. Same interval; nothing was committed and nothing advanced. |
-| 3 | Crash between the write and the watermark advance | **Only if `merge_keys` waived** | No | Re-run. With merge keys the re-read de-duplicates; a waived source appends the interval twice — Q19 finds the duplicates. |
-| 4 | Watermark manually corrupted (edited too far forward) | No | **Yes — silently** | Q18: set it back to a known-good value from the audit table's `position_end`, then re-run. A watermark set BACKWARDS is safe with merge keys and duplicates without them. |
-| 5 | Cursor values arrive out of order (late commit, low cursor) | No | **Yes — silently** | Not fixable by re-running: the interval has been read. VB-25. Remedies in order: a safety lag on the high water, `incremental_mode: full`, or a change-tracking mechanism. |
-| 6 | Source table altered — new column | No | No | Nothing. Additive changes are allowed and Delta widens the target. |
-| 6b | Source table altered — type changed, or a column removed | No | No | **The run stops before writing**, naming the column and both types. Decide deliberately: ALTER the landing table, pin the old type with `column_types`, or recreate. |
-| 7 | Source table dropped or renamed | No | No | The read fails loudly. Fix the source file (or the source), then re-run. |
-| 8 | A full load run against a `merge_keys: []` source | **Yes** | No | Expected: that source appends. Delete the duplicate `ingest_date` partition, or set merge keys. |
-
-### Idempotency
-
-`txnAppId = ingest::oracle::<source_key>`, `txnVersion = run_sequence` from `ingest_state`.
-One identity per source, with **no fork for a replay** — unlike Kafka's, which forks on the
-rerun id. The difference is what supplies the version: Kafka's is a microbatch id that
-restarts at 0 in a replay's own checkpoint, while `run_sequence` is allocated on every run
-of every type and therefore always increases.
-
-The markers apply to APPENDS only; Delta does not honour them on a MERGE, so a merging
-source's idempotency comes from its merge key instead.
-
-### Why landing keeps every version
-
-The merge key is `merge_keys + cursor_column`, so `(CLAIM_ID, LAST_UPDATE_DT)` identifies a
-version of a claim. Two consequences, both deliberate:
-
-* landing is a retained mirror — a replay or a historical reprocessing can see what the
-  source held at a point in time, which merging on the business key alone would destroy;
-* the key does not change when `oracle_incremental_mode` does. A full run keyed on the
-  business key alone would match every historical version of a claim with one source row
-  and overwrite all of them — a control-table UPDATE causing data loss.
-
-A source with **no** cursor has no version identity, so its merge updates matched rows: the
-key identifies the row, a match means it changed, and the mirror would go stale otherwise.
-
----
-
-## 11. Files — Auto Loader, the shared checkpoint-reset guard, and what is deliberately
-not built
-
-### Why Auto Loader, and why `availableNow` always
-
-CORE section 10 decided this ahead of Stage 5: Auto Loader (`cloudFiles`) over a hand-rolled
-processed-files ledger. A ledger is Auto Loader re-implemented with worse listing
-performance and a new correctness surface — tracking which files have been seen is exactly
-what `cloudFiles.schemaLocation` and the stream checkpoint already do. The consequence
-accepted knowingly: **this source is checkpoint-based**, exactly like Kafka's primary
-stream, with everything that implies about restart safety.
-
-There is no per-source `trigger:` the way Kafka has one — this source is always a bounded
-`availableNow` run, because that is the only shape a scheduled Workflows run has a natural
-end under, and there is no case in this framework's scope for a genuinely continuous file
-stream.
-
-### The checkpoint-reset guard is shared, not duplicated
-
-Kafka and Files call the same implementation, `framework/checkpoint.py::
-guard_against_checkpoint_reset`, rather than each carrying its own copy. Both sources are
-checkpoint-based; Oracle has no checkpoint at all, so its correctness rests on
-`ingest_state`'s watermark instead — this remains two callers, not three, and the promotion
-was justified by the cost of the two copies having already drifted once (see below), not
-by clearing CORE section 7 rule 4's "three implementations" bar.
-
-The shared function checks "does the landing table hold any row at all" — no `topic`-style
-filter, because every source that calls it already has one landing table per source (Kafka's
-included: `{catalog}.landing.{topic_table}` is one table per topic).
-
-The shared refusal message does not claim a replay mechanism unconditionally: the file
-source has no replay job (this section's own "deliberately not built" list, below), so the merged
-message states only what is true for every caller — set this source's own control column to
-an unused incident id. The reset-engaged log event also carries no per-source prefix; every
-log line already carries `source_type` and `source_key` (`framework/logs.py`).
-
-### `cloudFiles.schemaLocation` and the reset guard — the decision
-
-`schemaLocation` is a second checkpoint-like resource, living beside the stream checkpoint
-under the same Volume root, keyed by the same `source_key` (`sources/file/config.py`
-`checkpoint_path` / `schema_location_path` are siblings). **Decision: the reset guard covers
-the stream checkpoint directly and the schema location indirectly, through that shared
-`source_key` scoping — it is not probed or reset separately.**
-
-Reasoning: a `checkpoint_reset_id` forks the stream's Delta transaction identity so a
-restarted stream has no committed versions to collide with. It does **not** delete or move
-`schema_location_path` — nothing in this framework does, ever, matching the "do not build a
-processed-files ledger, do not build file archiving" scope boundary below. A fresh stream
-under a forked identity re-applies (`schema_mode: provided`) or re-infers
-(`hints`/`infer`) against whatever is already at that path for this `source_key`, which is
-unaffected by the reset. The failure mode this would NOT catch — a schema recorded before an
-incident no longer matching reality — is the same as an ordinary schema-mode-`infer` risk
-documented in `docs/CONFIGURATION.md`, not something specific to a reset.
-
-### Failure scenarios
-
-| # | Failure | Duplicates? | Rows lost? | Fix — no code change |
-|---|---|---|---|---|
-| 1 | A malformed file mid-batch (unparseable row) | No | No, if `failure_mode: QUARANTINE` | The batch lands with `_rescued_data` populated for that row; investigate and re-onboard the fix. Under `FAILFAST` (the default) the whole batch is refused and retries until fixed or the mode is flipped. |
-| 2 | A file rewritten in place, under the same path, after Auto Loader has already processed it | No | **Yes — silently** | Auto Loader tracks files it has SEEN, not their content hash by default; a rewrite under the same name is not re-read. Producers must write under a NEW name (a convention, not something this code enforces) — document this in the onboarding checklist for a landing zone at risk of it. |
-| 3 | A file arrives late (after the run that would ordinarily have picked it up) | No | No | The next scheduled run picks it up — `availableNow` drains whatever is present, whenever it runs. Nothing to do. |
-| 4 | Schema drift between files (a new column, a changed type) | Depends on `schema_mode` | Depends | `provided`: a genuinely new column is dropped unless `rescuedDataColumn` catches it (VB-06); a type mismatch across files becomes rescued data or a cast failure depending on format. `infer`/`hints`: the inferred schema can change between runs with no review — this is exactly why `provided` is the platform default. |
-| 5 | `cloudFiles.schemaLocation` deleted | Behaves like a genuine first run for schema purposes | No, if the stream checkpoint is intact | Auto Loader re-infers or re-applies the schema on the next microbatch; the STREAM checkpoint (a separate resource) still prevents re-reading already-processed files. If the stream checkpoint is ALSO gone, this is the ordinary checkpoint-reset scenario above. |
-
-### Deliberately not built
-
-- **File archiving, moving or deletion.** Moving or deleting source files after ingest is a
-  data-loss-shaped operation that belongs to whoever owns the landing zone, not to this
-  framework. **Open item for the incoming team:** if a landing zone accumulates files
-  without bound, that is an operational concern for its owner to solve (a lifecycle policy
-  on the storage account is the usual answer), not something this job does on their behalf.
-- **A processed-files ledger.** Auto Loader's own checkpoint already is one.
-- **A second checkpoint-reset guard.** See above.
-- **A format abstraction layer.** `file_format` is a config value passed to Auto Loader
-  directly; there is no strategy-pattern class per format.
-- **Schema inference caching, or a schema registry for files.** `cloudFiles.schemaLocation`
-  already is the former; there is no equivalent of Kafka's Schema Registry for file drops
-  in this framework's scope.
-- **SAS-token and managed-identity storage auth** (`docs/build_log/DECISIONS.md` D-12).
-  Only `account_key` and `service_principal` are implemented, stated here as a limitation,
-  not an oversight: each of the excluded modes needs either a token-provider class this
-  project cannot verify exists on the target runtime, or workspace-level Unity Catalog
-  wiring outside this repository's control, so adding one is a future code change with its
-  own verification, not a config guess — the same restraint `sources/oracle/config.py`
-  applies to JDBC auth (`auth_mode: basic` only). See `sources/file/security.py`'s module
-  docstring for the mechanism these two modes do use.
-- **A file replay job or entrypoint** (`docs/build_log/DECISIONS.md` D-10, settled). A
-  fresh, missing checkpoint already makes Auto Loader re-read the whole path on its own
-  (`cloudFiles.includeExistingFiles` defaults to `true`), files persist in ADLS so there is
-  no retention window to race the way a Kafka replay races broker retention, and this
-  source is landing-only, so there is no re-parse-from-landing shape either. Recovery
-  reuses the existing checkpoint-reset procedure deliberately — `docs/CONFIGURATION.md` §11
-  and `docs/RUNBOOK_SUPPORT.md` §9 carry the three-step version.
-
-### Unity Catalog Volume source paths, and the simplification they set up (D-13)
-
-`source_path` may name a Unity Catalog Volume directly
-(`/Volumes/<catalog>/<schema>/<volume>/...`) instead of a path within an ADLS container
-named by `storage_ref`. A Volume path is governed by Unity Catalog grants on the Volume
-itself: `sources/file/config.py` applies no `storage_ref` and builds no
-`fs.azure.*` session options for it, and `sources/file/run.py` applies no session
-configuration around the read at all in that case. The two forms are mutually exclusive —
-setting `storage_ref` alongside a Volume path is a config error naming both, because there
-is no honest answer to which one governs the read.
-
-This is **preferred**, not forced: the shipped worked example keeps its existing
-`storage_ref` form, since switching it was not asked for and doing so without confirming
-Volumes are reachable from the target compute for that workload would be exactly the kind
-of unverified assumption this project exists to keep out of shipped configuration (VB-28).
-
-**The planned simplification, if VB-28 comes back "Volumes everywhere":** `conf/storage.yaml`,
-`sources/file/security.py`, and `framework/security.py`'s `apply_session_options` (added for
-exactly this source's session-scoped credentials, VB-26) all become deletable —
-a Volume path takes no credential from this framework at all. Not attempted now: narrowing to
-one credential path is a decision for whoever answers VB-28, not something to guess at while
-both are still plausibly needed in different environments. If that day comes,
-`apply_session_options` is worth a second look before deleting it outright — nothing else in
-the framework uses it today, but a future source needing session-scoped, non-`.option()`
-credentials (the same shape ADLS Gen2 has) would want it again.
-
----
-
-## 12. Adding a source type
+## 8. Adding a source type
 
 This is the falsifiable answer to CORE section 1's goal: "adding a source
 type is a new package under `sources/` and **zero changes** under `framework/`." A new
@@ -692,12 +321,13 @@ package provides exactly these, nothing more:
 | 5 | A register file (`conf/<kind>.yaml`) — **only if** the type needs a new connection kind Kafka's/Oracle's/Files' registers do not already cover. Discovered by the framework listing `conf/*.yaml`, so adding one is a new file, not a code change. | `conf/<kind>.yaml` |
 | 6 | One job template, matching the operational shape (schedule, concurrency, retries) this source's runs actually need | `resources/job_ingest_<type>.yml` |
 | 7 | An inert onboarding template — the underscore prefix keeps it out of the deployable set | `conf/sources/_TEMPLATE_<type>.yaml` |
+| 8 | A design file for this source's own re-run mechanics, failure scenarios and decisions, following the pattern [DESIGN_KAFKA.md](DESIGN_KAFKA.md)/[DESIGN_ORACLE.md](DESIGN_ORACLE.md)/[DESIGN_FILES.md](DESIGN_FILES.md) already set | `docs/DESIGN_<TYPE>.md` |
 
-**Nothing under `framework/` changes.** Every one of the seven items above lives in the new
-package, a new conf file, or a new resource file — `framework/config.py`, `control.py`,
-`state.py`, `audit.py`, `tables.py`, `writers.py`, `runner.py` (beyond the one `_SOURCES`
-line), `security.py`, `checkpoint.py` and `logs.py` are all untouched. The CORE section 7
-grep gate is what enforces this, mechanically rather than by review (§9 above).
+**Nothing under `framework/` changes.** Every one of the items above lives in the new
+package, a new conf file, a new resource file or a new sibling doc — `framework/config.py`,
+`control.py`, `state.py`, `audit.py`, `tables.py`, `writers.py`, `runner.py` (beyond the one
+`_SOURCES` line), `security.py`, `checkpoint.py` and `logs.py` are all untouched. The CORE
+section 7 grep gate is what enforces this, mechanically rather than by review (§7 above).
 
 **What is deliberately not in this list**, because CORE section 7 forbids it even for a
 fourth source type: a base class or shared interface for sources, a plugin registry or

@@ -11,7 +11,7 @@ configuration, control, audit, state and logging spine:
 
 Adding a source of an existing type is **config only** — one YAML file and one job task,
 no code change. Adding a fourth source *type* is a new package under `sources/` and zero
-changes under `framework/` — see [docs/DESIGN.md §12](docs/DESIGN.md#12-adding-a-source-type)
+changes under `framework/` — see [docs/DESIGN.md §8](docs/DESIGN.md#8-adding-a-source-type)
 for what that actually takes, and the grep gate that proves it stays true.
 
 ---
@@ -31,7 +31,8 @@ for what that actually takes, and the grep gate that proves it stays true.
 | Document | Contents |
 |---|---|
 | [docs/NAVIGATION.md](docs/NAVIGATION.md) | Map of every file. Where to start, what to ignore, "I want to… → go to…" |
-| [docs/DESIGN.md](docs/DESIGN.md) | The spine, the source contract, per-source failure scenarios, design decisions |
+| [docs/DESIGN.md](docs/DESIGN.md) | The spine, the source contract, the configuration model, common changes, testing |
+| [docs/DESIGN_KAFKA.md](docs/DESIGN_KAFKA.md) / [DESIGN_ORACLE.md](docs/DESIGN_ORACLE.md) / [DESIGN_FILES.md](docs/DESIGN_FILES.md) | Each source's own re-run mechanics, failure-scenario table and design decisions |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting, tiered **MUST CHANGE / NICE TO CHANGE / NO CHANGE REQUIRED** |
 | [docs/VERIFICATION_BACKLOG.md](docs/VERIFICATION_BACKLOG.md) | Assumptions that need a real Kafka/Oracle/ADLS/Databricks environment to confirm |
 | [docs/IMPORT_TO_DATABRICKS.md](docs/IMPORT_TO_DATABRICKS.md) | Get it into a workspace and run the tests |

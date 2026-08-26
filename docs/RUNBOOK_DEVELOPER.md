@@ -6,9 +6,11 @@ For the engineers who own, extend and deploy this codebase.
 record of each source type through every module in execution order — the fastest way to
 orient.
 
-**Prerequisite reading:** [DESIGN.md](DESIGN.md). This runbook tells you *how to do things*;
-DESIGN.md tells you *why the code is shaped the way it is*. Do not change core behaviour
-without reading its per-source failure-scenario tables.
+**Prerequisite reading:** [DESIGN.md](DESIGN.md), plus that source's own
+[DESIGN_KAFKA.md](DESIGN_KAFKA.md) / [DESIGN_ORACLE.md](DESIGN_ORACLE.md) /
+[DESIGN_FILES.md](DESIGN_FILES.md). This runbook tells you *how to do things*; the design
+docs tell you *why the code is shaped the way it is*. Do not change core behaviour without
+reading that source's failure-scenario table.
 
 **Your first hour, in order:**
 
@@ -226,12 +228,14 @@ catch this.
 
 ### Add a source type
 
-See [`DESIGN.md` §12](DESIGN.md#12-adding-a-source-type) for the full seven-item checklist
-and the grep gate that proves nothing under `framework/` changed. In short: a new
-`sources/<type>/` package with `spec.py` (`SOURCE_SPEC`, no PySpark import) and `run.py`
+See [`DESIGN.md` §8](DESIGN.md#8-adding-a-source-type) for the full checklist and the grep
+gate that proves nothing under `framework/` changed. In short: a new `sources/<type>/`
+package with `spec.py` (`SOURCE_SPEC`, no PySpark import) and `run.py`
 (`run(ctx) -> RunResult`), one dict entry in `runner.py`'s `_SOURCES`, a
-`conf/defaults/<type>.yaml`, an onboarding template, and — only if the type needs a
-connection kind none of the existing four registers cover — a new register file.
+`conf/defaults/<type>.yaml`, an onboarding template, a `docs/DESIGN_<TYPE>.md` following the
+pattern `DESIGN_KAFKA.md`/`DESIGN_ORACLE.md`/`DESIGN_FILES.md` already set, and — only if
+the type needs a connection kind none of the existing four registers cover — a new register
+file.
 
 ### Add a control-table lever for an existing source type
 
@@ -343,3 +347,30 @@ The three most likely to bite a developer first:
    already hedges between `withSchemaEvolution()` and a session-flag fallback; confirm which
    branch your runtime takes the first time a curated replay or an Oracle landing MERGE
    needs to widen a schema.
+
+---
+
+## 9. First-connection verification
+
+**Clear these four before any real ingestion runs against a new environment.** Each has its
+own probe cell in [`notebooks/02_check_connectivity.py`](../notebooks/02_check_connectivity.py)
+— run the notebook once per environment and read its output, rather than reasoning about
+these from the code alone. Every probe is **read-only: no write to a landing table, no state
+advanced** (VB-27's probe is the one exception, and it writes only to a scratch table it
+creates and drops itself — never a real table). Ordered by damage, matching
+[`VERIFICATION_BACKLOG.md`](VERIFICATION_BACKLOG.md)'s own ranking — these four are not
+its most dangerous entries in isolation, but they are the four a developer can actually
+clear from a notebook before onboarding, rather than needing a production incident to
+surface.
+
+| VB id | What to run | Expected result | What to change in the code if it fails | Who can run it |
+|---|---|---|---|---|
+| **VB-19** | The `## VB-19` cell — builds the real extraction query with the framework's `TO_TIMESTAMP` watermark literal, and a `TO_DATE` control over the same bounds, and compares two `SELECT COUNT(*)` results | Both counts agree; no `ORA-01861` | `sources/oracle/query.py::_literal()` — the format model or the function it renders, for this column's actual Oracle type | A developer with an Oracle source configured and read access to the target schema |
+| **VB-27** | The `## VB-27` cell — appends a DataFrame whose column order differs from a scratch Delta table's, then reads it back | `A`/`B`/`C` land in columns `a`/`b`/`c` by NAME, not by position | `sources/file/landing.py::project()` — add an explicit `.select()` naming every column in `tables.landing_columns()`'s exact order | Any developer with `CREATE TABLE` on one scratch schema (set via the `vb27_scratch_table` widget) |
+| **VB-29** | The `## VB-29` cell — lists every secret scope named in the selected environment, then checks every `conf/jdbc.yaml` / `conf/storage.yaml` key name against it | Every scope resolves; every key name is present (names only — no value is ever fetched) | Not a code change unless a key NAME was typed wrong in `conf/jdbc.yaml` / `conf/storage.yaml` — otherwise a platform/Key Vault ticket to populate the scope | Any developer with the target environment's workspace access (no Oracle or Kafka reachability needed) |
+| **VB-01** | The `## VB-01` cell — runs the real partitioned JDBC read via `sources/oracle/reader.py` and checks `df.rdd.getNumPartitions()` | `numPartitions` matches the source's configured `num_partitions`, not `1` | `sources/oracle/reader.py::read_options()` — force the parenthesised `dbtable` subquery form whenever `partitionColumn` is set | A developer with an Oracle source configured with `partition_column` and `num_partitions > 1` |
+
+A source with no `partition_column` configured (the D-09 default is `num_partitions: 1`)
+has nothing for VB-01 to probe — the cell says so and skips rather than reporting a false
+pass. Likewise VB-19 only applies to a `cursor_type: timestamp` source; a `number` cursor or
+a `full`/`filter` source skips with an explanation instead of a misleading result.

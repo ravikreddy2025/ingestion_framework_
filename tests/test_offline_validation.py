@@ -7,6 +7,15 @@ is pure Python and pure YAML/AST parsing - no Spark session, no network, no CLI.
 These are deliberately GENERIC over source type: a sixth source type should make every test
 in this file pass without editing it, the same falsifiable property the CORE section 7 grep
 gate proves for framework/ itself.
+
+A SIXTH check, beyond CORE's original five, was added in Stage 8: `notebooks/*.py` cannot be
+executed here (no dbutils, no cluster), so nothing previously caught them importing a name
+that no longer exists. That is exactly what happened between Stage 3 and Stage 7 - all four
+notebooks imported the pre-refactor `kafka_ingest.config`/`kafka_ingest.pipeline` module
+names for four stages before anyone noticed (`docs/build_log/STAGE_7_REPORT.md`'s own
+research section, and its "what I would change" item 2). The check below is the cheap,
+mechanical substitute Stage 7 recommended: AST-parse every notebook's `kafka_ingest` imports
+and resolve each one against the real, current source tree.
 """
 
 from __future__ import annotations
@@ -23,6 +32,7 @@ REPO = Path(__file__).resolve().parent.parent
 CONF_ROOT = REPO / "conf"
 RESOURCES_ROOT = REPO / "resources"
 SOURCES_PKG_ROOT = REPO / "src" / "kafka_ingest" / "sources"
+NOTEBOOKS_ROOT = REPO / "notebooks"
 DATABRICKS_YML = REPO / "databricks.yml"
 PYPROJECT = REPO / "pyproject.toml"
 
@@ -272,3 +282,76 @@ def test_every_required_key_is_settable_in_yaml(source_type, spec):
         "nothing could ever set them from Git - only an operational override could, and a "
         "missing control-table row is not an error (D-01), so a fresh source would never resolve"
     )
+
+
+# ========================================================================================
+# 6. Every notebook's `kafka_ingest` import resolves against the current source tree
+#
+# A notebook cannot be executed here - no dbutils, no cluster - so nothing else in this
+# suite would catch an import left behind by a rename or a retired module. AST-parsing
+# avoids the problem that made this hard to check before: the file is valid Python (the
+# `# MAGIC` / `# COMMAND` markers are comments), but RUNNING it fails immediately on the
+# first `dbutils` reference, long before a stale import would even be reached.
+# ========================================================================================
+
+
+def _notebook_files() -> list[Path]:
+    return sorted(NOTEBOOKS_ROOT.glob("*.py"))
+
+
+def _kafka_ingest_imports(path: Path) -> list[tuple[str, list[str]]]:
+    """[(module, [name, ...]), ...] for every `kafka_ingest` import in one notebook.
+
+    A plain `import kafka_ingest.x.y` carries an empty name list - the module itself is the
+    only thing to resolve. A `from kafka_ingest.x import a, b as c` carries the names as
+    written (aliases are irrelevant here; it is the SOURCE name being imported that must
+    exist, not whatever the notebook calls it afterwards).
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    imports: list[tuple[str, list[str]]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("kafka_ingest"):
+            imports.append((node.module, [alias.name for alias in node.names]))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name.startswith("kafka_ingest"):
+                    imports.append((alias.name, []))
+    return imports
+
+
+def _notebook_import_cases() -> list[tuple[Path, str, tuple[str, ...]]]:
+    return [(path, module, tuple(names)) for path in _notebook_files() for module, names in _kafka_ingest_imports(path)]
+
+
+_NOTEBOOK_IMPORT_CASES = _notebook_import_cases()
+
+
+@pytest.mark.parametrize(
+    "path, module, names",
+    _NOTEBOOK_IMPORT_CASES,
+    ids=[f"{path.name}::{module}" for path, module, _names in _NOTEBOOK_IMPORT_CASES],
+)
+def test_every_notebook_kafka_ingest_import_resolves(path, module, names):
+    """The mechanical substitute `docs/build_log/STAGE_7_REPORT.md` recommended (its own
+    "what I would change" item 2): every `kafka_ingest` name a notebook imports must exist
+    in the real source tree - not the copy in someone's memory of what Stage 3 looked like.
+
+    A real import, not a name-string comparison: `from kafka_ingest.sources import kafka`
+    names a SUBMODULE, which is only importable, never a plain attribute, until something
+    has imported it - so the submodule import is attempted as a fallback, exactly the
+    resolution order Python itself uses for `from package import name`.
+    """
+    try:
+        imported = importlib.import_module(module)
+    except ImportError as exc:
+        pytest.fail(f"{path.name}: 'import {module}' does not resolve: {exc}")
+    for name in names:
+        if hasattr(imported, name):
+            continue
+        try:
+            importlib.import_module(f"{module}.{name}")
+        except ImportError:
+            pytest.fail(
+                f"{path.name}: 'from {module} import {name}' - '{name}' is neither an "
+                f"attribute of {module} nor a submodule of it. This import is stale."
+            )

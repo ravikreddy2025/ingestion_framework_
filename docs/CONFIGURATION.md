@@ -773,7 +773,7 @@ procedure — it is the same five-step procedure as Kafka's §5.4a, with
 `file_checkpoint_reset_id` in place of `kafka_checkpoint_reset_id`.
 
 `cloudFiles.schemaLocation` is a **separate** checkpoint-like resource, covered by the same
-guard indirectly rather than directly — see `docs/DESIGN.md` §11 for the reasoning.
+guard indirectly rather than directly — see `docs/DESIGN_FILES.md` for the reasoning.
 
 ### 🔴 MUST-READ — there is no replay job for this source, and none is planned
 
@@ -868,7 +868,7 @@ unverified about that mechanism on the target compute.
 
 **If VB-28 comes back "Volumes everywhere":** this whole register, `sources/file/security.py`,
 and `framework/security.py`'s `apply_session_options` become deletable — see
-`docs/DESIGN.md` §11's note on the planned simplification. Not attempted now.
+`docs/DESIGN_FILES.md`'s note on the planned simplification. Not attempted now.
 
 ### Operational overrides — `ingest_control`
 
