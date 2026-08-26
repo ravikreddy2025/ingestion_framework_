@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "kafka-ingest"
 version = "0.2.0"
-description = "Config-driven Kafka -> Databricks landing/curated ingestion framework"
+description = "Config-driven multi-source (Kafka, Oracle, Files) -> Databricks ingestion framework"
 
 # Floor, not a pin, and set by the runtime rather than by whatever is installed locally.
 # The target is DBR 16.4 LTS or later; 16.4 LTS ships Python 3.12 and Spark 3.5.2, so 3.12

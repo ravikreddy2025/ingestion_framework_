@@ -1,266 +1,175 @@
-# Kafka → Databricks Landing/Curated Ingestion Framework
+# Multi-Source Ingestion Framework
 
-Config-driven, multi-topic, multi-cluster ingestion from Confluent Kafka into Unity Catalog
-Delta tables. One job definition serves every topic across Vector, RCM, GMA, Anti-Fraud and
-DWH-PES.
+A config-driven ingestion framework on Databricks. Three source types share one
+configuration, control, audit, state and logging spine:
 
-**Scope: Kafka → landing → curated.** Nothing downstream of curated is in this package.
+| Source | Execution model | Layers |
+|---|---|---|
+| **Kafka** | Structured Streaming, `availableNow`, `foreachBatch` | landing, curated, quarantine |
+| **Oracle** | JDBC batch, incremental by cursor or filter | landing only |
+| **Files (ADLS / UC Volumes)** | Auto Loader, `availableNow` | landing only |
+
+Adding a source of an existing type is **config only** — one YAML file and one job task,
+no code change. Adding a fourth source *type* is a new package under `sources/` and zero
+changes under `framework/` — see [docs/DESIGN.md §12](docs/DESIGN.md#12-adding-a-source-type)
+for what that actually takes, and the grep gate that proves it stays true.
 
 ---
 
 ## Read in this order
 
-> ### 🧭 New to this codebase? Start with [docs/NAVIGATION.md](docs/NAVIGATION.md)
-> Every file mapped: what each one is for, a 10-minute path to understanding the
-> architecture, and a trace of one Kafka record through all 10 modules in execution order.
-
-### Start with the runbook for your role
+> ### New to this codebase? Start with [docs/NAVIGATION.md](docs/NAVIGATION.md)
+> Every file mapped: a role-based start-here table, a ten-minute path to the architecture,
+> and a trace of one record through every module — once per source type.
 
 | You are | Read |
 |---|---|
 | **A developer** maintaining or extending this | [docs/RUNBOOK_DEVELOPER.md](docs/RUNBOOK_DEVELOPER.md) → then [docs/DESIGN.md](docs/DESIGN.md) |
 | **Production support** | [docs/RUNBOOK_SUPPORT.md](docs/RUNBOOK_SUPPORT.md) — SQL and job parameters only, no code reading |
-| **Client IT / architecture** | [docs/RUNBOOK_CLIENT_IT.md](docs/RUNBOOK_CLIENT_IT.md) — design, security, prerequisites, data protection |
-
-### Reference documents
+| **Client IT / architecture** | [docs/ARCHITECTURE_OVERVIEW.md](docs/ARCHITECTURE_OVERVIEW.md) — design, security, prerequisites, data protection |
 
 | Document | Contents |
 |---|---|
-| [docs/NAVIGATION.md](docs/NAVIGATION.md) | **Map of every file.** Where to start, what to ignore, "I want to… → go to…" |
-| **[docs/DESIGN.md](docs/DESIGN.md)** | **File lineage, dependency graph, failure scenarios, design decisions.** Read before changing code. |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting, tiered **must / nice / no change** |
+| [docs/NAVIGATION.md](docs/NAVIGATION.md) | Map of every file. Where to start, what to ignore, "I want to… → go to…" |
+| [docs/DESIGN.md](docs/DESIGN.md) | The spine, the source contract, per-source failure scenarios, design decisions |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Every setting, tiered **MUST CHANGE / NICE TO CHANGE / NO CHANGE REQUIRED** |
+| [docs/VERIFICATION_BACKLOG.md](docs/VERIFICATION_BACKLOG.md) | Assumptions that need a real Kafka/Oracle/ADLS/Databricks environment to confirm |
 | [docs/IMPORT_TO_DATABRICKS.md](docs/IMPORT_TO_DATABRICKS.md) | Get it into a workspace and run the tests |
 
-Then run `notebooks/00_validate_config` — it resolves config and prints it, touching nothing.
+---
+
+## Environment: local development only
+
+There is **no** Kafka, Oracle, ADLS, Databricks workspace, cluster or JVM in this
+repository's own environment. The only gate that can be run here is:
+
+```bash
+ruff check src tests
+ruff format --check src tests
+pytest -m "not spark" -q
+```
+
+Everything that needs real infrastructure is written defensively and recorded in
+[docs/VERIFICATION_BACKLOG.md](docs/VERIFICATION_BACKLOG.md) instead of asserted as working.
 
 ---
 
 ## What it does
 
 ```
-Kafka ──readStream──▶ foreachBatch(batch_df, batch_id)
-                          ├─ audit  landing STARTED
-                          ├─ LANDING    raw bytes verbatim + Kafka + CloudEvent columns
-                          ├─ audit  landing COMPLETED
-                          ├─ audit  curated STARTED
-                          ├─ parse the SAME cached batch
-                          ├─ CURATED    payload as one NESTED struct
-                          └─ audit  curated COMPLETED
+framework/          config, control, security, state, audit, tables, writers, runner, logs,
+                     checkpoint  -- the spine every source shares. Never names a source type.
+sources/kafka/       spec.py + run(ctx)  -- readStream, foreachBatch, landing+curated+quarantine
+sources/oracle/      spec.py + run(ctx)  -- JDBC batch read, cursor/filter incremental, landing only
+sources/file/        spec.py + run(ctx)  -- Auto Loader, availableNow, landing only
+entrypoints/         run_ingest.py, run_replay.py -- thin argparse wrappers, one per shape
 ```
 
-One read from Kafka. Both layers written from the **same in-memory microbatch**, in one
-Structured Streaming query, on `Trigger.AvailableNow`, scheduled once daily.
-
-| Layer | Tables | Partitioned by |
-|---|---|---|
-| **landing** | **ONE per topic** | `(ingest_date)` |
-| **curated** | **ONE per topic** | `(event_date)` |
-| **audit** | ONE shared table | `(audit_date)` |
+A source's entire public surface is `SOURCE_SPEC` (data: which keys it accepts, where) and
+`run(ctx) -> RunResult` (one function). There is no `read()` / `parse()` / `write()` /
+`validate()` on that contract — a Kafka `foreachBatch` body and a bounded JDBC read share
+governance, not steps. See [docs/DESIGN.md §1-2](docs/DESIGN.md) for the full argument.
 
 | Property | How |
 |---|---|
-| No duplicates on re-run | Delta idempotent writes (`txnAppId`/`txnVersion`); a retry replays the **same** batch id over the **same** offsets — [DESIGN §4](docs/DESIGN.md) |
-| Schema-drift safe | Each record decoded with **its own** writer schema from the wire header — not one "latest" schema pinned at query start |
-| Replayable past Kafka retention | Landing holds the original bytes; a curated replay never touches the broker |
-| Heterogeneous sources | Cluster and registry chosen **per topic**; SASL/PLAIN, SCRAM-256/512 and mTLS side by side |
-| No plaintext secrets | Every credential via `dbutils.secrets.get()`; scope/key **names** come from config |
-| UC-first | Certs and checkpoints on UC Volumes; DBFS paths **rejected** by validation |
+| No duplicates on re-run | Delta idempotent writes (`txnAppId`/`txnVersion`) on appends; a MERGE's idempotency comes from its key instead |
+| One shared audit table | `{ops_catalog}.{audit_schema}.ingest_audit` — one row per (run, layer, status), every source type |
+| One shared control table | `{ops_catalog}.{control_schema}.ingest_control` — support edits it, no deploy; a column specific to one source type is named `<source_type>_<setting>` |
+| Durable state, not derived from audit | `{ops_catalog}.{control_schema}.ingest_state` — watermarks and run sequences. State writes **raise** on failure; audit writes never do |
+| Structural fields are never operationally overridable | Partitioning, merge/dedup keys, target names, Oracle's `source_schema`/`source_table`/`filter_criteria`, a file's target path — all PR-only |
+| No plaintext secrets | Every credential via `dbutils.secrets.get()`; scope/key **names** come from config, values never appear in this repository |
 
 ---
 
-## Layout
+## Onboarding a source
 
-```
-conf/                        STRUCTURAL config — Git, PR-driven, tier-marked
-  clusters.yaml              Kafka cluster profiles
-  registries.yaml            Schema Registry profiles
-  topics/_TEMPLATE.yaml      Copy this to onboard a topic
-  topics/<topic_key>.yaml    One per topic — the FILENAME is the topic_key
+Every source type follows the same shape: copy a template, answer the questions it asks,
+add one job task, run the config test, open a PR. No Python changes, ever.
 
-sql/                         TEMPLATES — {catalog} placeholders, rendered per environment
-  01_operational_config.sql  Control table + grants (support-editable tier)
-  02_layer_tables.sql        Landing / audit / quarantine DDL + grants
-  03_support_queries.sql     Triage queries and the no-deploy fixes
-  04_maintenance.sql         OPTIMIZE / VACUUM, and the retention policy
+### Kafka
 
-azure-pipelines.yml          CI (lint + fast suite) and the bundle deploy stage
+1. Copy [`conf/sources/_TEMPLATE.yaml`](conf/sources/_TEMPLATE.yaml) to
+   `conf/sources/<source_key>.yaml`. Fill in `topic`, `domain`, `cluster`, `registry`,
+   `subject`. Confirm the topic's partition count and retention with the producing team —
+   `min_partitions` and the job schedule both depend on them.
+2. Add a task to `resources/job_ingest_primary.yml` with the new `source-key`.
+3. `pytest tests/test_shipped_config.py -q`, then open a PR.
 
-src/kafka_ingest/            (dependency order — see DESIGN.md §2)
-  config.py                  Two-tier config -> TopicConfig. No PySpark import.
-  security.py                Key Vault secrets + Volume certs -> connection options
-  kafka_source.py            readStream / batch read, primary vs replay positioning
-  schema_resolver.py         Wire-format parsing + Schema Registry client
-  landing_writer.py          Raw bytes + CloudEvent columns -> landing
-  curated_writer.py          Per-writer-schema decode -> curated (+ quarantine)
-  audit.py                   Per-batch, per-layer status rows
-  tables.py                  DDL + partitioning
-  pipeline.py                Chained foreachBatch body, run shapes, startup guard
-  entrypoints/               ingest_primary, replay_kafka, replay_curated
+### Oracle
 
-notebooks/                   Run in order on a cluster
-  00_validate_config.py      Resolve config. No Kafka, no secrets, no writes.
-  01_run_unit_tests.py       Full pytest suite on the cluster
-  02_check_connectivity.py   Secrets, certs, Schema Registry. Still no Kafka.
-  03_run_ingestion.py        The real thing, interactively
+1. Copy [`conf/sources/_TEMPLATE_oracle.yaml`](conf/sources/_TEMPLATE_oracle.yaml). Ask the
+   source team the four questions at the top of the template — the cursor column and when
+   it is stamped, the stable key (`merge_keys`), the partition column, and any LOB/RAW/
+   INTERVAL/TZ columns — before filling in anything else.
+2. `CREATE SCHEMA IF NOT EXISTS <catalog>.oracle_<schema>;` in every environment — the
+   framework creates tables, never schemas.
+3. Add a task to `resources/job_ingest_oracle.yml`.
+4. `pytest tests/test_shipped_config.py -q`, then open a PR.
 
-resources/                   Databricks Workflows definitions (DAB)
-  job_ingest_primary.yml     Daily ingestion, one task per topic
-  job_replay.yml             The two replay jobs
-  job_maintenance.yml        Weekly OPTIMIZE / VACUUM. Does not delete data.
-tests/                       unit tests (fast suite + Spark-backed suite)
-```
+### Files (ADLS / UC Volumes)
 
----
+1. Copy [`conf/sources/_TEMPLATE_file.yaml`](conf/sources/_TEMPLATE_file.yaml). Ask whoever
+   owns the landing zone the four questions at the top — the full schema and whether it
+   drifts, whether files are ever rewritten in place, whether the filename carries data,
+   and roughly how many files land per day.
+2. Prefer a Unity Catalog Volume `source_path` when one is available (no credentials, no
+   `storage_ref`); otherwise reference a profile in `conf/storage.yaml`.
+   `CREATE SCHEMA IF NOT EXISTS <catalog>.<target_schema>;` in every environment first.
+3. Add a task to `resources/job_ingest_file.yml`.
+4. `pytest tests/test_shipped_config.py -q`, then open a PR.
 
-## Onboarding a topic
-
-**Structural change = PR. Operational change = SQL `UPDATE`. Code change = neither.**
-
-1. **PR:** copy [`conf/topics/_TEMPLATE.yaml`](conf/topics/_TEMPLATE.yaml) to
-   `conf/topics/<topic_key>.yaml`, fill in the 🔴 fields. Do not name any table: landing,
-   curated and quarantine are all derived from the Kafka topic name. Only `audit_table` is
-   shared, and it comes from `conf/defaults.yaml` too.
-2. **PR:** add a task to `resources/job_ingest_primary.yml` with the new `topic-key` —
-   five copy-paste lines.
-3. **Optional SQL:** insert a control row. The topic runs on YAML defaults without one.
-4. **Tables:** none. Landing, curated, quarantine and audit are all created by the first
-   run — curated included, from a schema derived off the Avro reader schema before any row
-   is read. No manual DDL, and no table whose shape Spark guessed.
-5. **Code:** none. Confirm by reading
-   [`entrypoints/ingest_primary.py`](src/kafka_ingest/entrypoints/ingest_primary.py) — it
-   parses three parameters and calls `pipeline.run()`.
-
-Validate before deploying:
-
-```bash
-pytest tests/test_shipped_config.py -q
-databricks bundle validate -t dev
-```
+**There is no replay job for the file source, and none is planned** — a missing checkpoint
+already makes Auto Loader re-read everything on its own. See
+[docs/RUNBOOK_SUPPORT.md §9](docs/RUNBOOK_SUPPORT.md) for the recovery procedure instead.
 
 ---
 
-## Support runbook
+## Replay, in one paragraph per source
 
-**Read the audit table first.** Q1–Q3 in
-[`sql/03_support_queries.sql`](sql/03_support_queries.sql) answer most tickets without
-changing anything. The per-layer rows make "which layer did it die on?" a lookup:
+- **Kafka** — `kafka_replay` re-pulls from the broker from an offset or timestamp into an
+  isolated checkpoint and Delta transaction identity; `curated_replay` re-parses landing
+  with no broker contact, so it works past Kafka retention. Both need a `rerun_id`.
+- **Oracle** — `oracle_replay` re-extracts a cursor interval you bound explicitly
+  (`replay_cursor_start`/`replay_cursor_end`). It never writes `ingest_state`, so the
+  scheduled delta load is undisturbed.
+- **Files** — no replay job. Recovery is the checkpoint-reset procedure: delete the
+  affected landing partition(s) first, set a fresh `file_checkpoint_reset_id`, run the
+  normal job. A bounded re-read narrows `source_path`/`path_glob` for that one run.
 
-```sql
-SELECT batch_id,
-       max(CASE WHEN layer='landing' THEN status END) AS landing_status,
-       max(CASE WHEN layer='curated' THEN status END) AS curated_status
-FROM <audit_table> WHERE topic_key = '<topic>' GROUP BY batch_id ORDER BY batch_id DESC;
-```
-
-### A batch failed — do I need to do anything?
-
-Usually **no**. A retry replays the *same* batch over the *same* offsets, Delta skips the
-already-committed landing write, and curated is written. Just re-run (Workflows *Repair
-run*, or the next schedule).
-
-### The same batch_id keeps failing (poison batch)
-
-The stream is stuck and will not advance on its own. Either register the missing schema, or
-unblock it with no deploy:
-
-```sql
-UPDATE ops_prod.ingestion.ingestion_topic_control
-SET on_deser_error = 'quarantine',
-    change_reason = 'INC12345 - unblock stuck stream',
-    updated_by = current_user(), updated_at = current_timestamp()
-WHERE topic_key = 'rcm_claim_status';
-```
-
-Bad records go to quarantine with raw bytes retained; the stream drains. Recover them later
-with the curated replay job, then set it back to `fail`.
-
-### Choose the right replay
-
-| Symptom | Job | Touches Kafka? | Works past retention? |
-|---|---|---|---|
-| Data missing at source; consumer gap; **checkpoint was deleted** | **replay_kafka** | Yes | No |
-| Bytes fine but parsed wrong; schema registered late; records quarantined | **replay_curated** | No | Yes |
-
-If unsure, it is almost always `replay_curated` — landing already has the bytes.
-
-**Kafka replay:** Workflows → *REPLAY from Kafka* → set `topic_key`, `rerun_id` (e.g. your
-incident number), and **one** of `starting_offsets` / `starting_timestamp`. It runs against
-its own checkpoint *and* its own Delta `txnAppId`, so it cannot collide with the primary
-stream. Optionally set an ending offset/timestamp to cap it.
-
-**Curated replay:** Workflows → *REPLAY Curated from Landing* → set `topic_key`,
-`rerun_id`, and `landing_filter` (e.g. `writer_schema_id = 5513`). The topic predicate is
-added automatically.
-
-Every replayed row is tagged `ingested_via` and `replay_run_id`. Landing inserts-if-absent;
-curated upserts. Re-running the same `rerun_id` is safe.
-
-### ⚠️ Never delete a primary checkpoint
-
-Batch ids restart at 0 and Delta then skips every write as a duplicate — **the job reports
-success and ingests nothing**. The framework refuses to start in that state, but the fix is
-always the kafka replay job. [DESIGN §4, scenario 6](docs/DESIGN.md).
-
----
-
-## Failure handling
-
-Default is **FAILFAST**: a record that cannot be parsed fails the batch, the run fails, the
-job alerts, and a `FAILED` audit row names the layer, batch id and error.
-
-`on_deser_error: quarantine` routes bad records aside instead:
-
-| `quarantine_reason` | Meaning | Recovery |
-|---|---|---|
-| `malformed_wire_format` | No `0x00` magic byte, or under 5 bytes | Producer is not using the Confluent serializer. Fix upstream. |
-| `schema_resolution_failed` | Registry has no such schema id | Register it, then **replay_curated** filtered on that `writer_schema_id` |
-| `avro_decode_failed` | Bytes did not parse against the writer schema | Inspect the raw bytes; the record is retained in full |
+Full playbooks, SQL and job parameters only: [docs/RUNBOOK_SUPPORT.md](docs/RUNBOOK_SUPPORT.md).
 
 ---
 
 ## Testing
 
 ```bash
-ruff check src tests notebooks   # lint. CI runs exactly this.
-pytest -m "not spark"            # config, security, registry, writers, dispatch. No JVM. CI gate.
-pytest                           # everything, including the Spark-backed tests
+ruff check src tests            # lint. CI runs exactly this.
+pytest -m "not spark" -q        # config, control, state, audit, writers, every source's
+                                 # spec/config/run against stand-ins. No JVM. This is the CI gate.
+pytest -q                       # everything, including the few Spark-marked tests
 ```
 
-CI is `azure-pipelines.yml`: lint plus the fast suite on every pull request, then
-`databricks bundle deploy`. The deploy stage still needs its service connection and approval
-gates wired up — see the comments in that file.
+`azure-pipelines.yml` runs lint plus the fast suite on every pull request, plus the CORE
+section 7 grep gate (`framework/` must never name a source type outside `runner.py`'s
+`_SOURCES` dict), plus `databricks bundle deploy`.
 
-Run on Databricks via `notebooks/01_run_unit_tests` — DBR has Spark and `spark-avro` built
-in, so the whole suite runs with no setup. **No test connects to Kafka, reads a secret, or
-writes to a table.**
+Run the full suite (including the Spark-marked tests) on Databricks via
+`notebooks/01_run_unit_tests` — DBR ships Spark, so nothing extra is needed there. See
+[docs/RUNBOOK_DEVELOPER.md §1](docs/RUNBOOK_DEVELOPER.md) for local setup on a laptop,
+including the two non-obvious prerequisites for the Spark-marked tests.
 
-<details>
-<summary>Running the JVM-backed tests on a laptop (three non-obvious prerequisites)</summary>
-
-Verified on Windows with Python 3.14.7, PySpark 4.2.0 and Microsoft OpenJDK 21.
-
-1. **A JDK, with `JAVA_HOME` set.** `winget install Microsoft.OpenJDK.21`
-2. **`spark-avro` is not in the PySpark pip package.** It ships the Avro *Java library* but
-   not the Spark connector providing `from_avro`. Drop the jar into
-   `<venv>/Lib/site-packages/pyspark/jars/`:
-   `https://repo1.maven.org/maven2/org/apache/spark/spark-avro_2.13/4.2.0/spark-avro_2.13-4.2.0.jar`
-3. **Do NOT set `spark.jars.packages` on Windows.** Ivy resolution shells through Hadoop's
-   `Shell` class, needs `winutils.exe`, and kills the `SparkContext` with a misleading
-   `HADOOP_HOME is unset` error. Without it, the missing `winutils.exe` is a harmless warning.
-
-Local Spark is 4.2.0, **not your DBR version** — a local pass is evidence, not proof. That
-is why `assert_from_avro_semantics()` re-checks the writer/reader mapping at job startup on
-the real cluster.
-</details>
+**No test connects to Kafka, Oracle, ADLS, reads a secret, or writes to a real table.**
 
 ---
 
 ## Before go-live
 
-The open items are listed in [DESIGN §9](docs/DESIGN.md). The one that matters most:
+The full list, ordered by how much breaks if the assumption is wrong, is
+[docs/VERIFICATION_BACKLOG.md](docs/VERIFICATION_BACKLOG.md). The three most dangerous:
 
-**Verify Delta's `txnAppId`/`txnVersion` behaviour on your DBR.** It is the mechanism the
-whole no-duplicates story rests on, and it was reasoned from the documented contract rather
-than measured — no Delta was available in the environment this was written in. Test it by
-killing a job deliberately between the landing and curated writes, re-running, and checking
-that Q9 in `sql/03_support_queries.sql` returns zero rows.
+1. **Oracle JDBC driver version** (VB-22) — nothing here installs it, and its version
+   decides whether `NUMBER`/`DATE` type mappings (VB-02, VB-03) are even askable questions.
+2. **`customSchema` semantics** (VB-23) — if it is read as the complete schema rather than
+   a per-column override, every unnamed column silently drops.
+3. **`ingest_state`'s MERGE actually upserting** (VB-15) — every source type's idempotency
+   depends on it; a silent no-op here looks exactly like a healthy job doing nothing.

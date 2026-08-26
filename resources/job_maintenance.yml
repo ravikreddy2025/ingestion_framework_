@@ -9,11 +9,9 @@
 # / job_ingest_oracle.yml / job_ingest_file.yml. The shared settings live in the anchor so
 # they cannot drift between tasks.
 #
-# COVERAGE (docs/build_log/DECISIONS.md D-11): the three Kafka topics and the file source
-# below are covered. The Oracle source (oracle_claim_header) is NOT - that gap was flagged
-# in docs/build_log/STAGE_5_REPORT.md decision 8 as shared with the file source, and this
-# pass closes only the file half, per the instruction that produced D-11. Flagged again here
-# so it is not mistaken for closed.
+# COVERAGE (docs/build_log/DECISIONS.md D-11): the three Kafka topics, the file source and
+# the Oracle source are all covered - the gap docs/build_log/STAGE_5_REPORT.md decision 8
+# flagged (D-11 originally closed only the file half) is now closed for both.
 #
 # BEFORE THIS DEPLOYS, set `sql_warehouse_id` in databricks.yml. The default is a placeholder.
 #
@@ -142,3 +140,24 @@ resources:
               # Derived from target_schema/target_table in conf/sources/file_claims_inbound.yaml
               # - see sources/file/config.py FileConfig.landing_table.
               landing_table: "${var.data_catalog}.files_claims.claims_inbound"
+
+        # Oracle source (Stage 4 / D-11, closed in full here). Same OPTIMIZE/VACUUM shape -
+        # this source's landing table is written in append/MERGE batches rather than a
+        # continuous stream, but it accumulates small files the same way and benefits from
+        # the same weekly compaction. No SQL change needed, only this task.
+        - <<: *maintenance_task
+          task_key: oracle_claim_header
+          retry_on_timeout: false
+          sql_task:
+            warehouse_id: ${var.sql_warehouse_id}
+            file:
+              path: ../sql/04_maintenance.sql
+            parameters:
+              catalog: "{{job.parameters.catalog}}"
+              ops_catalog: "{{job.parameters.ops_catalog}}"
+              landing_retention_days: "{{job.parameters.landing_retention_days}}"
+              vacuum_retention_hours: "{{job.parameters.vacuum_retention_hours}}"
+              # Derived from source_schema/source_table in conf/sources/oracle_claim_header.yaml
+              # - see sources/oracle/config.py target_tokens() and conf/defaults/oracle.yaml's
+              # landing_table pattern (CLAIMS.CLAIM_HEADER -> oracle_claims.claim_header).
+              landing_table: "${var.data_catalog}.oracle_claims.claim_header"

@@ -570,7 +570,7 @@ code must change -- see "If it fails").
   and check how it is installed: cluster library, init script, or Unity Catalog volume JAR.
 - **Expected:** The class loads, and the driver version is recorded somewhere a human can find
   it -- ideally pinned as a cluster library in the bundle rather than installed by hand.
-- **If it fails:** Installing the driver is a platform task (`docs/RUNBOOK_CLIENT_IT.md`), not
+- **If it fails:** Installing the driver is a platform task (`docs/ARCHITECTURE_OVERVIEW.md`), not
   a code change. Record the version there, because VB-02/VB-03 are answered PER VERSION and an
   upgrade re-opens them.
 - **Status:** OPEN
@@ -667,7 +667,7 @@ code must change -- see "If it fails").
 - **Stage / file:** Stage 2, `framework/runner.py` (`_ensure_framework_tables`),
   `framework/tables.py`. Grants themselves moved out of `sql/` in the
   decisions-and-stage2-followup pass (docs/build_log/DECISIONS.md D-02) -- see
-  `docs/RUNBOOK_CLIENT_IT.md`'s "Unity Catalog privileges" table.
+  `docs/ARCHITECTURE_OVERVIEW.md`'s "Unity Catalog privileges" table.
 - **Why it matters:** every run issues `CREATE TABLE IF NOT EXISTS` for the audit table and
   the state table before it dispatches, so a fresh environment works without anyone running
   the provisioning SQL first. That needs `CREATE TABLE` on `{ops_catalog}.{audit_schema}`
@@ -688,7 +688,7 @@ code must change -- see "If it fails").
   Then run one source end to end in a freshly provisioned environment.
 - **Expected:** `USE SCHEMA` and `CREATE TABLE` on both schemas, and `SELECT`/`MODIFY` on
   `ingest_state` and the audit table but `SELECT` only on `ingest_control` -- matching
-  `docs/RUNBOOK_CLIENT_IT.md`'s privilege table exactly.
+  `docs/ARCHITECTURE_OVERVIEW.md`'s privilege table exactly.
 - **If it fails:** Either the Terraform did not grant what the privilege list says (fix the
   Terraform, not the code), or a decision is needed that the job should NOT create its own
   tables -- in which case drop the `_ensure_framework_tables` call from `framework/runner.py`

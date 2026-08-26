@@ -14,28 +14,35 @@
 #
 # The environment is chosen by the --environment job parameter, which the DAB job
 # definitions default to ${bundle.target}. You never type it twice.
+#
+# TIER MARKERS
+#   [MUST CHANGE]         Placeholder or environment-specific. Will not work as shipped.
+#   [NICE TO CHANGE]      Sensible default. Tune with a reason.
+#   [NO CHANGE REQUIRED]  Framework contract or platform standard.
+# Full reference: docs/CONFIGURATION.md section 1
 # =====================================================================================
 
 # Substituted into any {placeholder} in defaults / sources / cluster / registry values.
 vars:
-  catalog: platform_dev
+  catalog: platform_dev                                                     # [MUST CHANGE]
   # Operational catalog: the control and state tables. MUST match `ops_catalog`
-  # for this target in databricks.yml - a test asserts they agree.
+  # for this target in databricks.yml - a test asserts they agree.           # [MUST CHANGE]
   ops_catalog: ops_dev
   # The three ops-catalog schemas (docs/build_log/DECISIONS.md D-06). There is no reason
   # for these to differ by environment - only catalog/ops_catalog do - so every environment
-  # file carries the same three values.
+  # file carries the same three values.                                [NO CHANGE REQUIRED]
   audit_schema: audit
   control_schema: ingestion
   logs_schema: logs
 
 # Overrides conf/defaults.yaml, for every source of EVERY TYPE in this environment.
 # Only put a setting here if every source type understands it - a Kafka-only key here is
-# an unknown key for every Oracle and file source in dev.
+# an unknown key for every Oracle and file source in dev.                    [NICE TO CHANGE]
 defaults: {}
 
 # Overrides conf/defaults/<source_type>.yaml, for every source of ONE type in this
 # environment. This is where per-environment tuning of a type-specific setting belongs.
+#                                                                             [NICE TO CHANGE]
 defaults_by_type:
   kafka:
     # Small batches in dev: faster feedback, and a failure costs seconds not minutes.
@@ -46,7 +53,7 @@ defaults_by_type:
     starting_offsets: latest
 
 # Overrides named profiles in conf/clusters.yaml. The profile must already exist there -
-# conf/clusters.yaml stays the single register of which clusters exist.
+# conf/clusters.yaml stays the single register of which clusters exist.       [MUST CHANGE]
 clusters:
   confluent_cloud_shared:
     bootstrap_servers: "pkc-dev01.westeurope.azure.confluent.cloud:9092"
@@ -60,7 +67,7 @@ clusters:
     bootstrap_servers: "kafka-af-dev01.fraud.internal:9094"
     secret_scope: kv-kafka-antifraud-dev
 
-# Overrides named profiles in conf/registries.yaml.
+# Overrides named profiles in conf/registries.yaml.                          [MUST CHANGE]
 registries:
   confluent_cloud_shared:
     url: "https://psrc-dev01.westeurope.azure.confluent.cloud"
@@ -76,7 +83,7 @@ registries:
 # Overrides named profiles in conf/jdbc.yaml. The profile must already exist there -
 # conf/jdbc.yaml stays the single register of which databases we extract from. Host,
 # service name and secret scope are what differ per environment; the auth mode and the
-# secret KEY NAMES do not, so they stay in the register.
+# secret KEY NAMES do not, so they stay in the register.                     [MUST CHANGE]
 jdbc:
   oracle_prod_core:
     host: "oracle-core-dev01.corp.internal"
@@ -91,7 +98,7 @@ jdbc:
 # Overrides named profiles in conf/storage.yaml. The profile must already exist there -
 # conf/storage.yaml stays the single register of which storage accounts we read from.
 # Account, container and secret scope differ per environment; the auth mode and the secret
-# KEY NAMES do not, so they stay in the register.
+# KEY NAMES do not, so they stay in the register.                            [MUST CHANGE]
 storage:
   adls_landing_prod:
     account: "adlsclaimsdev01"

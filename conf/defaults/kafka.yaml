@@ -17,11 +17,18 @@
 #   {catalog}      and any other key under `vars:` in the environment file
 #   {source_key}   the source's config filename without .yaml
 #   {domain}       the source's `domain:` value
+#
+# TIER MARKERS
+#   [MUST CHANGE]         Placeholder. Will not work as shipped.
+#   [NICE TO CHANGE]      Sensible default. Tune with a reason - most are also
+#                         operationally overridable per source, noted where they are.
+#   [NO CHANGE REQUIRED]  Framework contract or platform standard.
+# Full reference: docs/CONFIGURATION.md section 4
 # =====================================================================================
 
 defaults:
 
-  # --- TARGETS ------------------------------------------------------------------------
+  # --- TARGETS ------------------------------------------------------ [NO CHANGE REQUIRED]
   # ONE TABLE PER TOPIC in landing, curated and quarantine. Only audit is shared, and it
   # lives in conf/defaults.yaml because every source type writes to it.
   #
@@ -45,7 +52,7 @@ defaults:
   # /<source_key>/replay/<rerun_id> itself - never add the topic name here.
   checkpoint_root: "/Volumes/{catalog}/ingestion/checkpoints"
 
-  # --- STREAMING ----------------------------------------------------------------------
+  # --- STREAMING ------------------------------------------------------------- [NICE TO CHANGE]
   # Prefix for the Spark-managed consumer group, so this consumer is identifiable in
   # broker-side monitoring. Spark OVERRIDES kafka.group.id, so this prefix is the only
   # supported knob. Replays automatically get a distinct suffix.
@@ -55,7 +62,7 @@ defaults:
   starting_offsets: earliest
 
   # Drain everything available, then stop - the right shape for a scheduled job and the
-  # only trigger under which a Workflows run has a natural end.
+  # only trigger under which a Workflows run has a natural end.                [NO CHANGE REQUIRED]
   #
   # CADENCE IS NOT SET HERE - it is in the job definition, and it is not a free choice:
   # the schedule must be at most ONE THIRD of this topic's Kafka retention. See the
@@ -63,19 +70,19 @@ defaults:
   trigger: availableNow
 
   # Fail loudly when Kafka has aged out records we never consumed. Overriding this to
-  # false means silently accepting gaps and needs explicit domain sign-off. Q13 in
+  # false means silently accepting gaps and needs explicit domain sign-off. Q13 in    [NO CHANGE REQUIRED]
   # sql/03_support_queries.sql lists every source currently running with it disabled.
   fail_on_data_loss: true
 
   # MUST HAVE A VALUE. Unset is not "no limit" in any useful sense - it means the entire
   # backlog arrives as ONE microbatch, so a first run on a retained topic becomes a single
   # enormous batch whose failure costs the whole run. Under availableNow this does NOT cap
-  # what the run consumes; it splits the backlog into several bounded batches.
+  # what the run consumes; it splits the backlog into several bounded batches.  [NICE TO CHANGE]
   # Operationally overridable: ingest_control.kafka_max_offsets_per_trigger.
   max_offsets_per_trigger: 1000000
 
   # Read parallelism. Without it, parallelism is capped at the topic's partition count no
-  # matter how large the cluster is.
+  # matter how large the cluster is.                                           [NICE TO CHANGE]
   #
   # A PLAIN INTEGER, deliberately not a computed multiple of the partition count: deriving
   # that needs a Kafka admin client, and the runtime dependencies are PyYAML and requests.
@@ -84,7 +91,7 @@ defaults:
   # the producing team at onboarding and set it once.
   min_partitions: 32
 
-  # --- TABLE LAYOUT -------------------------------------------------------------------
+  # --- TABLE LAYOUT ----------------------------------------------------- [NO CHANGE REQUIRED]
   # Delta allows PARTITIONED BY or CLUSTER BY, never both. See docs/DESIGN.md.
   # Both layers are one table per topic, so `topic` is constant inside each and worthless
   # as a partition key.
@@ -98,7 +105,7 @@ defaults:
   # curated_dedup_keys.
   curated_dedup_order_by: kafka_timestamp
 
-  # --- DESERIALIZATION ----------------------------------------------------------------
+  # --- DESERIALIZATION --------------------------------------------------- [NO CHANGE REQUIRED]
   # The curated payload struct's SHAPE follows the subject's latest registered version.
   # Each record is still DECODED with its own writer schema from the wire header - that is
   # what makes a mixed-version microbatch work. There are exactly two modes and there is

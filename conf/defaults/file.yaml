@@ -12,24 +12,30 @@
 #   {target_schema} / {target_table}   deferred - only sources/file/config.py fills these,
 #                   from the source's own `target_schema:` / `target_table:` settings. See
 #                   SOURCE_SPEC.target_tokens in sources/file/spec.py.
+#
+# TIER MARKERS
+#   [MUST CHANGE]         Placeholder. Will not work as shipped.
+#   [NICE TO CHANGE]      Sensible default. Tune with a reason.
+#   [NO CHANGE REQUIRED]  Framework contract or platform standard.
+# Full reference: docs/CONFIGURATION.md section 11
 # =====================================================================================
 
 defaults:
 
-  # --- WHERE THIS LANDS -----------------------------------------------------------------
+  # --- WHERE THIS LANDS --------------------------------------------------- [NO CHANGE REQUIRED]
   # {catalog} never appears in a source file (CORE section 6) - only this pattern does, and
   # only sources/file/config.py fills {target_schema} / {target_table}, exactly as
   # conf/defaults/oracle.yaml fills {source_schema} / {source_table}.
   landing_table: "{catalog}.{target_schema}.{target_table}"
   landing_partition_by: [ingest_date]
 
-  # --- HOW MUCH TO EXTRACT PER MICROBATCH ------------------------------------------------
+  # --- HOW MUCH TO EXTRACT PER MICROBATCH ------------------------------------ [NICE TO CHANGE]
   # Unset would mean one unbounded microbatch on the FIRST run over a landing zone with
   # years of files - a first run's failure would then cost the whole run, the exact hazard
   # Kafka's max_offsets_per_trigger guards against.
   max_files_per_trigger: 1000
 
-  # --- SCHEMA -----------------------------------------------------------------------------
+  # --- SCHEMA ------------------------------------------------------------------ [MUST-READ]
   # provided | hints | infer. PROVIDED IS THE DEFAULT DELIBERATELY: `infer` is convenient
   # in dev and a source of SILENT TYPE DRIFT in prod - a producer adding a column, or a
   # numeric column that happens to look like a date in one file's sample, changes the
@@ -38,7 +44,7 @@ defaults:
   # explanation, not only this comment.
   schema_mode: provided
 
-  # --- READING THE FILES ------------------------------------------------------------------
+  # --- READING THE FILES -------------------------------------------------------- [NICE TO CHANGE]
   path_glob: "*"
 
   # Auto Loader directory-listing vs file-notification mode (VB-07). LISTING IS THE
@@ -54,7 +60,7 @@ defaults:
   # rows, not have them land silently by default.
   failure_mode: FAILFAST
 
-  # --- CHECKPOINT AND SCHEMA-LOCATION ROOTS -----------------------------------------------
+  # --- CHECKPOINT AND SCHEMA-LOCATION ROOTS --------------------------------- [NO CHANGE REQUIRED]
   # Same pattern as Kafka's checkpoint_root (conf/defaults/kafka.yaml): a Volume path, one
   # subdirectory per source_key, enforced Volume-backed in sources/file/config.py.
   #

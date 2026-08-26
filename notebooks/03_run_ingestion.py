@@ -2,21 +2,27 @@
 # MAGIC %md
 # MAGIC # 03 - Run ingestion interactively
 # MAGIC
-# MAGIC The first notebook that actually connects to Kafka and writes data.
+# MAGIC The first notebook that actually connects to Kafka, Oracle or ADLS and writes data.
+# MAGIC Works for any source type - the entrypoint is the same one the scheduled job calls.
 # MAGIC
 # MAGIC ## Start in dev
 # MAGIC The Environment widget selects `conf/environments/<env>.yaml`, which decides the
-# MAGIC catalog, the broker and the secret scope. In `dev` every table and checkpoint lives
-# MAGIC under the dev catalog, so you can delete the checkpoint and rerun freely.
+# MAGIC catalog, the connection endpoints and the secret scopes. In `dev` every table and
+# MAGIC checkpoint/state key lives under the dev catalog, so you can reset freely.
 # MAGIC
-# MAGIC ## WARNING - never delete a PRODUCTION checkpoint
+# MAGIC ## WARNING - never delete a PRODUCTION checkpoint (Kafka, Files)
 # MAGIC Batch ids restart at 0 and Delta then skips every write as a duplicate: the job
-# MAGIC reports success and ingests nothing. The framework refuses to start in that state,
-# MAGIC but the guard only fires once landing holds rows for the topic. To reprocess prod
-# MAGIC data, use the kafka replay job. See docs/DESIGN.md section 4, scenario 6.
+# MAGIC reports success and ingests nothing. The framework refuses to start in that state, but
+# MAGIC the guard only fires once landing holds rows for the source. To reprocess prod data,
+# MAGIC use a replay job (Kafka) or the checkpoint-reset procedure (Files) - see
+# MAGIC `docs/RUNBOOK_SUPPORT.md`.
 # MAGIC
-# MAGIC This notebook calls the **same `pipeline.run()`** the scheduled job calls. It is a
-# MAGIC thin driver, not a parallel implementation - there is no notebook-only code path.
+# MAGIC ## WARNING - never hand-edit an Oracle watermark outside the one sanctioned procedure
+# MAGIC `docs/RUNBOOK_SUPPORT.md` §8.4 (Q18) is the only supported way, and only after
+# MAGIC confirming the value from the audit table.
+# MAGIC
+# MAGIC This notebook calls the **same `framework.runner.run()`** the scheduled job calls. It
+# MAGIC is a thin driver, not a parallel implementation - there is no notebook-only code path.
 
 # COMMAND ----------
 
@@ -33,199 +39,206 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-7s %(na
 # COMMAND ----------
 
 dbutils.widgets.text("config_root", f"{REPO_ROOT}/conf", "1. Config root")
-dbutils.widgets.text("topic_key", "vector_patient_events", "2. Topic key")
+dbutils.widgets.text("source_key", "vector_patient_events", "2. Source key")
 dbutils.widgets.dropdown("environment", "dev", ["dev", "preprod", "prod"], "3. Environment")
-dbutils.widgets.text("control_table", "ops_dev.ingestion.ingestion_topic_control", "4. Control table")
-dbutils.widgets.dropdown("run_type", "primary",
-                         ["primary", "kafka_replay", "curated_replay"], "5. Run type")
-dbutils.widgets.text("rerun_id", "", "6. Rerun id (replays only)")
-dbutils.widgets.text("starting_offsets", "", "7. Starting offsets JSON (kafka_replay)")
-dbutils.widgets.text("starting_timestamp", "", "8. Starting timestamp (kafka_replay)")
-dbutils.widgets.text("landing_filter", "", "9. Landing filter (curated_replay)")
+dbutils.widgets.dropdown(
+    "run_type", "primary",
+    ["primary", "kafka_replay", "curated_replay", "oracle_replay"], "4. Run type"
+)
+dbutils.widgets.text("rerun_id", "", "5. Rerun id (replays only)")
+dbutils.widgets.text("replay_starting_offsets", "", "6. Kafka: starting offsets JSON")
+dbutils.widgets.text("replay_starting_timestamp", "", "7. Kafka: starting timestamp")
+dbutils.widgets.text("replay_ending_offsets", "", "8. Kafka: ending offsets JSON (optional)")
+dbutils.widgets.text("replay_ending_timestamp", "", "9. Kafka: ending timestamp (optional)")
+dbutils.widgets.text("replay_landing_filter", "", "10. Kafka: landing filter (curated_replay)")
+dbutils.widgets.text("replay_cursor_start", "", "11. Oracle: replay cursor start")
+dbutils.widgets.text("replay_cursor_end", "", "12. Oracle: replay cursor end (optional)")
+
+config_root = dbutils.widgets.get("config_root")
+source_key = dbutils.widgets.get("source_key")
+environment = dbutils.widgets.get("environment")
+run_type = dbutils.widgets.get("run_type")
+
+_REPLAY_PARAMETERS = (
+    "replay_starting_offsets", "replay_starting_timestamp",
+    "replay_ending_offsets", "replay_ending_timestamp",
+    "replay_landing_filter", "replay_cursor_start", "replay_cursor_end",
+)
+job_parameters = {}
+if run_type != "primary":
+    rerun_id = dbutils.widgets.get("rerun_id")
+    if not rerun_id:
+        raise ValueError("A replay needs a rerun_id - it isolates the checkpoint/state and tags every row written.")
+    job_parameters["rerun_id"] = rerun_id
+    for name in _REPLAY_PARAMETERS:
+        value = dbutils.widgets.get(name)
+        if value:
+            job_parameters[name] = value
 
 # COMMAND ----------
 
-from kafka_ingest import pipeline
-from kafka_ingest.config import resolve_topic_config
-from kafka_ingest.security import SecretResolver
+# MAGIC %md
+# MAGIC ## Resolve and preview - the same read `00_validate_config` does, before anything runs
 
-overrides = {
-    "rerun_id": dbutils.widgets.get("rerun_id"),
-    "starting_offsets": dbutils.widgets.get("starting_offsets"),
-    "starting_timestamp": dbutils.widgets.get("starting_timestamp"),
-    "landing_filter": dbutils.widgets.get("landing_filter"),
-}
+# COMMAND ----------
 
-cfg = resolve_topic_config(
-    spark=spark,
-    config_root=dbutils.widgets.get("config_root"),
-    topic_key=dbutils.widgets.get("topic_key"),
-    control_table=dbutils.widgets.get("control_table"),
-    environment=dbutils.widgets.get("environment"),
-    run_type=dbutils.widgets.get("run_type"),
-    overrides=overrides,   # empty strings are filtered out by the resolver
-)
+from kafka_ingest.framework.config import read_source_type, resolve_config
+from kafka_ingest.sources import file as file_source
+from kafka_ingest.sources import kafka, oracle
+
+_SOURCES = {"kafka": kafka, "oracle": oracle, "file": file_source}
+
+source_type = read_source_type(config_root, source_key)
+spec = _SOURCES[source_type].SOURCE_SPEC
+preview = resolve_config(config_root, source_key, environment, spec, control={}, job_parameters=job_parameters)
 
 print(f"""
 ABOUT TO RUN
-  environment  {cfg.environment}
-  run type     {cfg.run.run_type}
-  topic        {cfg.topic}
-  enabled      {cfg.enabled}
-  broker       {cfg.cluster.bootstrap_servers}
-  checkpoint   {cfg.checkpoint_path}
-  landing      {cfg.landing_table}   PARTITIONED BY {cfg.landing_partition_by}
-  curated      {cfg.curated_table}   PARTITIONED BY {cfg.curated_partition_by}
-  audit        {cfg.audit_table}
+  source_key   {source_key}   (type: {source_type})
+  environment  {environment}
+  run_type     {run_type}
+  enabled      {preview.enabled}
+  layers       {preview.layers}
+  audit_table  {preview.get('audit_table')}
+  state_table  {preview.get('state_table')}
 """)
 
-# Guardrails against the two mistakes that are expensive rather than merely annoying.
-if cfg.run.run_type == "primary" and cfg.environment == "prod":
-    print("WARNING: PRIMARY run against PROD. This shares offset state with the scheduled")
-    print("         job - an interactive run here advances the production checkpoint.")
-if cfg.run.is_replay and not cfg.run.rerun_id:
-    raise ValueError("A replay needs a rerun_id - it isolates both the checkpoint and the txnAppId.")
+if run_type == "primary" and environment == "prod":
+    print("WARNING: PRIMARY run against PROD. For Kafka/Files this shares checkpoint state with")
+    print("         the scheduled job; for Oracle it advances the shared watermark. An")
+    print("         interactive run here has the same effect as a scheduled one.")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Run
-# MAGIC Under `trigger: availableNow` this drains whatever is currently on the topic and stops.
-# MAGIC Landing and curated are written from the same microbatch, in one query, with audit
-# MAGIC rows emitted between the two layers.
+# MAGIC For Kafka/Files this drains whatever is currently available under `availableNow` and
+# MAGIC stops. For Oracle this reads one bounded interval. `framework.runner.run()` reads the
+# MAGIC control table itself (no `control=` override here), exactly as the scheduled job does.
 
 # COMMAND ----------
 
-pipeline.run(spark, cfg, SecretResolver())
-print("Run complete.")
+from kafka_ingest.framework import runner
+
+result = runner.run(
+    source_key=source_key,
+    environment=environment,
+    config_root=config_root,
+    run_type=run_type,
+    job_parameters=job_parameters,
+    spark=spark,
+)
+print(f"""
+RUN COMPLETE
+  rows_read         {result.rows_read}
+  rows_written      {result.rows_written}
+  rows_quarantined  {result.rows_quarantined}
+  position_start    {result.position_start}
+  position_end      {result.position_end}
+  pending_work      {result.pending_work}
+""")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## What happened - read the audit table first, always
-# MAGIC One row per (batch, layer, status). A batch with a landing COMPLETED but no curated
-# MAGIC COMPLETED died between the two writes.
+# MAGIC One row per (run, layer, status). For Kafka, a run with `landing COMPLETED` but no
+# MAGIC `curated COMPLETED` died between the two writes - see `docs/DESIGN.md`'s failure tables.
 
 # COMMAND ----------
 
 display(
-    spark.table(cfg.audit_table)
-    .where(f"topic_key = '{cfg.topic_key}'")
+    spark.table(preview.get("audit_table"))
+    .where(f"source_key = '{source_key}'")
     .orderBy("event_ts", ascending=False)
-    .select("batch_id", "layer", "status", "record_count", "quarantined_count",
-            "writer_schema_ids", "reader_schema_id", "duration_ms",
-            "starting_offsets", "ending_offsets", "error_class", "error_message")
+    .select("run_id", "layer", "status", "record_count", "quarantined_count", "duration_ms",
+            "position_start", "position_end", "pending_work", "error_class", "error_message")
     .limit(40)
 )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ### Which layer did each batch reach?
-# MAGIC The pivot the per-layer rows exist for - same shape as Q2 in
+# MAGIC ### Which layer did this run reach?
+# MAGIC The pivot the per-layer rows exist for - the same shape as Q2 in
 # MAGIC `sql/03_support_queries.sql`.
 
 # COMMAND ----------
 
 display(
     spark.sql(f"""
-        SELECT batch_id,
+        SELECT run_id,
+               max(CASE WHEN layer='run'     THEN status END) AS run_status,
                max(CASE WHEN layer='landing' THEN status END) AS landing_status,
                max(CASE WHEN layer='landing' THEN record_count END) AS landing_rows,
                max(CASE WHEN layer='curated' THEN status END) AS curated_status,
                max(CASE WHEN layer='curated' THEN record_count END) AS curated_rows,
-               max(CASE WHEN layer='curated' THEN quarantined_count END) AS quarantined
-        FROM {cfg.audit_table}
-        WHERE topic_key = '{cfg.topic_key}'
-        GROUP BY batch_id ORDER BY batch_id DESC LIMIT 25
+               max(quarantined_count) AS quarantined
+        FROM {preview.get("audit_table")}
+        WHERE source_key = '{source_key}'
+        GROUP BY run_id ORDER BY run_id DESC LIMIT 25
     """)
 )
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Spot-check the data
+# MAGIC ## Spot-check the landed data
+# MAGIC The target table name is whatever this source resolved to - read it back from the
+# MAGIC audit row rather than guessing, since Kafka derives it from the topic and Oracle/Files
+# MAGIC derive it from their own settings.
 
 # COMMAND ----------
 
-print("LANDING - raw bytes verbatim, schema id from the wire header, CloudEvent columns")
-display(
-    spark.table(cfg.landing_table)
-    .where(f"topic = '{cfg.topic}'")
-    .select("topic", "kafka_partition", "kafka_offset", "kafka_timestamp", "writer_schema_id",
-            "wire_format_valid", "payload_bytes", "ce_id", "ce_type", "ce_time",
-            "ingested_via", "replay_run_id")
-    .orderBy("kafka_offset", ascending=False)
-    .limit(20)
+_last_landing = (
+    spark.table(preview.get("audit_table"))
+    .where(f"source_key = '{source_key}' AND layer = 'landing' AND status = 'COMPLETED'")
+    .orderBy("event_ts", ascending=False)
+    .select("source_ref")
+    .limit(1)
+    .collect()
 )
-
-# COMMAND ----------
-
-print("CURATED - payload kept NESTED. Query it with payload.<field>, read it with to_json().")
-display(spark.table(cfg.curated_table).orderBy("kafka_offset", ascending=False).limit(20))
-
-# COMMAND ----------
-
-# The payload struct rendered as readable JSON - useful when eyeballing a nested record.
-display(
-    spark.table(cfg.curated_table)
-    .selectExpr("kafka_offset", "event_date", "ce_id", "to_json(payload) AS payload_json")
-    .orderBy("kafka_offset", ascending=False)
-    .limit(10)
-)
+print("Last landing source_ref:", _last_landing[0]["source_ref"] if _last_landing else "(none yet)")
+print("\nFind the exact landing/curated table name from 00_validate_config's SETTINGS output")
+print("(landing_table / curated_table), then, e.g.:")
+print("  display(spark.table('<landing_table>').orderBy('ingest_ts', ascending=False).limit(20))")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Duplicate check - should always return zero rows
-# MAGIC If this returns anything, Delta's idempotent-write markers are not behaving as
-# MAGIC documented. Stop and read docs/DESIGN.md section 4 before running anything else.
+# MAGIC If this returns anything, the idempotent-write mechanism is not behaving as
+# MAGIC documented. Stop and read `docs/DESIGN.md`'s "re-runs and duplicates" section (Kafka)
+# MAGIC or its Oracle failure-scenario table before running anything else. Substitute the
+# MAGIC landing table name and this source's own key columns
+# MAGIC (`topic, kafka_partition, kafka_offset` for Kafka; the Oracle merge key for Oracle).
 
 # COMMAND ----------
 
-display(
-    spark.sql(f"""
-        SELECT topic, kafka_partition, kafka_offset, count(*) AS copies
-        FROM {cfg.landing_table}
-        WHERE topic = '{cfg.topic}'
-        GROUP BY topic, kafka_partition, kafka_offset
-        HAVING count(*) > 1
-        LIMIT 50
-    """)
-)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Quarantine (only if `on_deser_error: quarantine`)
-
-# COMMAND ----------
-
-if cfg.on_deser_error == "quarantine" and spark.catalog.tableExists(cfg.quarantine_table):
-    display(
-        spark.table(cfg.quarantine_table)
-        .groupBy("quarantine_reason", "writer_schema_id").count()
-        .orderBy("count", ascending=False)
-    )
-else:
-    print(f"Topic is on_deser_error='{cfg.on_deser_error}' - no quarantine table in play.")
+# display(
+#     spark.sql("""
+#         SELECT <key columns>, count(*) AS copies
+#         FROM <landing_table>
+#         GROUP BY <key columns>
+#         HAVING count(*) > 1
+#         LIMIT 50
+#     """)
+# )
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Resetting a DEV run
-# MAGIC Only ever in dev. In preprod/prod use the **kafka replay job** instead - it gets its
-# MAGIC own checkpoint AND its own txnAppId, so it cannot collide with the primary stream.
+# MAGIC Only ever in dev. In preprod/prod, Kafka uses a **replay job**, Oracle corrects its
+# MAGIC watermark via the one sanctioned Q18 procedure, and Files uses the checkpoint-reset
+# MAGIC procedure - never a manual reset. See `docs/RUNBOOK_SUPPORT.md`.
 # MAGIC
 # MAGIC ```python
-# MAGIC assert cfg.environment == "dev", "refusing to reset a non-dev environment"
-# MAGIC dbutils.fs.rm(cfg.checkpoint_path, recurse=True)
-# MAGIC spark.sql(f"DROP TABLE IF EXISTS {cfg.landing_table}")
-# MAGIC spark.sql(f"DROP TABLE IF EXISTS {cfg.curated_table}")
+# MAGIC assert environment == "dev", "refusing to reset a non-dev environment"
+# MAGIC # Kafka / Files: dbutils.fs.rm(<checkpoint_path from the SETTINGS output>, recurse=True)
+# MAGIC # Then, for any source type:
+# MAGIC # spark.sql(f"DROP TABLE IF EXISTS {preview.get('...table setting...')}")
 # MAGIC ```
 # MAGIC
-# MAGIC Landing is one table per topic, so `DROP TABLE` is safe here and preferable to a
-# MAGIC filtered `DELETE`: it also clears the table's Delta transaction log, so the next dev
-# MAGIC run starts under a clean `txnAppId` history instead of one still carrying old batch
-# MAGIC ids. In preprod/prod, never do this - use `checkpoint_reset_id` (RUNBOOK_SUPPORT §5.4a)
-# MAGIC if a primary checkpoint is genuinely lost there.
+# MAGIC `DROP TABLE` also clears the table's Delta transaction log, so the next dev run starts
+# MAGIC under a clean idempotency history instead of one still carrying old versions.

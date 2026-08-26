@@ -14,11 +14,17 @@
 #   {catalog}      and any other key under `vars:` in the environment file
 #   {source_key}   the source's config filename without .yaml
 #   {domain}       the source's `domain:` value
+#
+# TIER MARKERS
+#   [MUST CHANGE]         Placeholder. Will not work as shipped.
+#   [NICE TO CHANGE]      Sensible default. Tune with a reason.
+#   [NO CHANGE REQUIRED]  Framework contract or platform standard.
+# Full reference: docs/CONFIGURATION.md section 10
 # =====================================================================================
 
 defaults:
 
-  # --- TARGET -------------------------------------------------------------------------
+  # --- TARGET --------------------------------------------------------- [NO CHANGE REQUIRED]
   # ONE TABLE PER ORACLE TABLE, in landing. Oracle has no curated layer here (CORE
   # section 10) and no quarantine layer: a JDBC read either returns typed rows or fails.
   #
@@ -41,7 +47,7 @@ defaults:
   # catalog still comes from {catalog}, so a source file never contains a catalog name.
   landing_table: "{catalog}.oracle_{source_schema}.{source_table}"
 
-  # --- TABLE LAYOUT -------------------------------------------------------------------
+  # --- TABLE LAYOUT ----------------------------------------------------- [NO CHANGE REQUIRED]
   # Delta allows PARTITIONED BY or CLUSTER BY, never both. See docs/DESIGN.md.
   # ingest_date - the date a row was WRITTEN here, not the date it changed in Oracle -
   # bounds partition growth over years of daily runs and makes retention a partition drop.
@@ -53,7 +59,7 @@ defaults:
   # so at the call site.
   landing_partition_by: [ingest_date]
 
-  # --- EXTRACTION SHAPE ---------------------------------------------------------------
+  # --- EXTRACTION SHAPE ------------------------------------------------------ [NICE TO CHANGE]
   # full | cursor | filter. The platform default is `full` deliberately: a source that
   # forgets to declare its mode re-extracts the whole table, which is visible in the row
   # count and in the run time. The alternative default - `cursor` - would need a cursor
@@ -63,7 +69,7 @@ defaults:
   # decision - see the MUST-READ row in docs/CONFIGURATION.md.
   incremental_mode: full
 
-  # --- READ PARALLELISM ---------------------------------------------------------------
+  # --- READ PARALLELISM -------------------------------------------------------- [NICE TO CHANGE]
   # ORACLE JDBC's OWN fetchsize DEFAULT IS TEN ROWS per network round trip. Not setting it
   # is not "the driver decides", it is one round trip per ten rows for the whole extract.
   # 10000 is a common working value; raise it for narrow rows, lower it for rows carrying
@@ -83,7 +89,7 @@ defaults:
   # Operationally overridable: ingest_control.oracle_num_partitions.
   num_partitions: 1
 
-  # --- THE READ ITSELF ----------------------------------------------------------------
+  # --- THE READ ITSELF ---------------------------------------------------------- [NICE TO CHANGE]
   # Seconds a single JDBC statement may run before the driver cancels it. ZERO MEANS NO
   # TIMEOUT, which is the JDBC option's own default and is what this ships with: a first
   # full extract of a large table legitimately runs for a long time, and a platform-wide

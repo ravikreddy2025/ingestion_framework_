@@ -167,7 +167,7 @@ def test_the_support_updates_only_set_columns_the_control_table_has(support_sql,
 
 
 def test_support_never_updates_the_state_table(support_sql):
-    """Support has SELECT on ingest_state and nothing more (docs/RUNBOOK_CLIENT_IT.md's
+    """Support has SELECT on ingest_state and nothing more (docs/ARCHITECTURE_OVERVIEW.md's
     Unity Catalog privileges table). A hand-moved watermark is a silent data-loss incident,
     so the runbook must not even show how."""
     assert not _update_targets(support_sql, STATE_TABLE)
@@ -178,7 +178,7 @@ def test_support_never_updates_the_state_table(support_sql):
 def test_no_sql_file_grants_anything(provisioning_sql):
     """docs/build_log/DECISIONS.md D-02: grants are Terraform-owned, outside this
     repository - a job that can grant privileges is a job that can grant itself more. See
-    the "Unity Catalog privileges" table in docs/RUNBOOK_CLIENT_IT.md for the specification
+    the "Unity Catalog privileges" table in docs/ARCHITECTURE_OVERVIEW.md for the specification
     this replaced the GRANT statements with."""
     assert "GRANT " not in provisioning_sql
     assert "GRANT " not in _read(SUPPORT_SQL)

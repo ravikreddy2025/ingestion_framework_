@@ -5,9 +5,10 @@
 # MAGIC Every test runs here - including the Spark-backed ones that need a JDK and the
 # MAGIC `spark-avro` jar to run on a laptop. DBR ships both.
 # MAGIC
-# MAGIC **No test connects to Kafka, reads a secret, or writes to a table.** Safe on any cluster.
+# MAGIC **No test connects to Kafka, Oracle or ADLS, reads a secret, or writes to a table.**
+# MAGIC Safe on any cluster.
 # MAGIC
-# MAGIC Running these on your target DBR is the only way to confirm the `from_avro`
+# MAGIC Running these on your target DBR is the only way to confirm Kafka's `from_avro`
 # MAGIC reader/writer schema behaviour on **your** runtime rather than on a local Spark build.
 
 # COMMAND ----------
@@ -32,9 +33,11 @@ print("REPO_ROOT:", REPO_ROOT)
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Fast gate - no Spark needed
-# MAGIC Config resolution, auth option construction, registry client, shipped YAML validation.
-# MAGIC This is the suite to wire into CI.
+# MAGIC ## Fast gate - no Spark session needed
+# MAGIC Config resolution, control-table rules, state/audit write behaviour, table naming,
+# MAGIC writer idempotency mechanics, every source's own spec/config/run logic against
+# MAGIC recording stand-ins, and the shipped `conf/`/`resources/` cross-product validation.
+# MAGIC This is the suite wired into `azure-pipelines.yml`.
 
 # COMMAND ----------
 
@@ -49,7 +52,7 @@ assert exit_code == 0, f"pytest failed with exit code {exit_code}"
 # MAGIC ## Full suite - includes the Spark-backed tests
 # MAGIC Confluent wire-format byte parsing, the mixed-writer-schema microbatch decode,
 # MAGIC quarantine splitting, landing projection vs DDL, CloudEvent header extraction,
-# MAGIC event_date derivation, and the `from_avro` self-check.
+# MAGIC `event_date` derivation, and the `from_avro` self-check.
 
 # COMMAND ----------
 
@@ -61,13 +64,13 @@ assert exit_code == 0, f"pytest failed with exit code {exit_code}"
 # MAGIC %md
 # MAGIC ## The single most important check on a new runtime
 # MAGIC Proves that `from_avro`'s positional argument is the **writer** schema and the
-# MAGIC `avroSchema` option is the **reader** schema. The curated `payload` struct's shape
+# MAGIC `avroSchema` option is the **reader** schema. Kafka's curated `payload` struct's shape
 # MAGIC depends on this. The ingestion job runs the same check at startup and refuses to
 # MAGIC proceed if it fails - running it here tells you *before* you schedule anything.
 
 # COMMAND ----------
 
-from kafka_ingest.curated_writer import assert_from_avro_semantics
+from kafka_ingest.sources.kafka.curated import assert_from_avro_semantics
 
 assert_from_avro_semantics(spark)
 print("from_avro writer/reader schema semantics verified on DBR:",
