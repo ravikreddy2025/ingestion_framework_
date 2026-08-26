@@ -94,12 +94,19 @@ _KNOWN_FORMAT_OPTIONS = {
 # than the framework's generic one.
 _UC_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-# docs/build_log/DECISIONS.md D-13: a source_path under this prefix is a Unity Catalog
-# Volume path. It is UC-governed - no fs.azure.* credential this framework could apply
-# would mean anything to it - so a Volume-shaped source_path takes no storage_ref and no
-# session options at all. Everything else (a path within a container named by storage_ref)
-# is unaffected.
-_UC_VOLUME_PREFIX = "/Volumes/"
+# docs/build_log/DECISIONS.md D-15: access_mode is an EXPLICIT choice between the two ways
+# this source can read, not inferred from source_path's shape (D-13, superseded). "volume"
+# takes volume_path and no storage credentials at all - UC governs it directly. "adls"
+# takes storage_ref + source_path, exactly as this source worked before D-13 existed.
+ACCESS_MODE_VOLUME = "volume"
+ACCESS_MODE_ADLS = "adls"
+VALID_ACCESS_MODES = (ACCESS_MODE_VOLUME, ACCESS_MODE_ADLS)
+
+# /Volumes/<catalog>/<schema>/<volume>/... - three non-empty segments after /Volumes/, then
+# whatever path is left. {catalog} is already substituted by framework/config.py by the
+# time this module sees the value (it is an ordinary `vars:` placeholder, not a deferred
+# target_token), so this checks only the SHAPE of the resolved string.
+_VOLUME_PATH_SHAPE = re.compile(r"^/Volumes/[^/]+/[^/]+/[^/]+/.+$")
 
 # A rerun/reset id becomes part of a Delta app id and a path segment.
 _SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
@@ -163,9 +170,11 @@ class FileConfig:
     run_type: str
     domain: str
 
-    storage_ref: str | None  # None for a Unity Catalog Volume source_path (D-13)
-    storage: StorageProfile | None  # None for a Unity Catalog Volume source_path (D-13)
-    source_path: str  # path WITHIN the container, or a full /Volumes/... path - see below
+    access_mode: str  # "volume" | "adls" (docs/build_log/DECISIONS.md D-15)
+    volume_path: str | None  # set only for access_mode "volume"
+    storage_ref: str | None  # set only for access_mode "adls"
+    storage: StorageProfile | None  # set only for access_mode "adls"
+    source_path: str | None  # path WITHIN the container - set only for access_mode "adls"
     path_glob: str
 
     file_format: str
@@ -208,25 +217,19 @@ class FileConfig:
         return f"{self.schema_location_root.rstrip('/')}/{self.source_key}"
 
     @property
-    def is_uc_volume_path(self) -> bool:
-        """docs/build_log/DECISIONS.md D-13: a /Volumes/... source_path is UC-governed -
-        no storage_ref, no session credentials, read directly as Auto Loader's own path."""
-        return self.source_path.startswith(_UC_VOLUME_PREFIX)
-
-    @property
     def full_source_path(self) -> str:
         """The path Auto Loader actually reads.
 
-        A Unity Catalog Volume path (D-13) is already the full path this source reads - it
-        takes no account or container, because Unity Catalog governs it directly. Every
-        other `source_path` never carries the account or container (CORE section 6, extended
-        to storage the way it already applies to a catalog name): both come from
-        `storage_ref`, which is the one thing that differs per environment - so the same
-        source file resolves to a different account in dev and prod, exactly as an Oracle
-        source's `jdbc_ref` does.
+        `access_mode: volume` (docs/build_log/DECISIONS.md D-15) reads `volume_path`
+        directly - it takes no account or container, because Unity Catalog governs it
+        directly. `access_mode: adls` never carries the account or container in
+        `source_path` itself (CORE section 6, extended to storage the way it already
+        applies to a catalog name): both come from `storage_ref`, which is the one thing
+        that differs per environment - so the same source file resolves to a different
+        account in dev and prod, exactly as an Oracle source's `jdbc_ref` does.
         """
-        if self.storage is None:
-            return self.source_path
+        if self.access_mode == ACCESS_MODE_VOLUME:
+            return self.volume_path
         return f"abfss://{self.storage.container}@{self.storage.endpoint}/{self.source_path.lstrip('/')}"
 
     @property
@@ -245,6 +248,7 @@ class FileConfig:
 
         return json.dumps(
             {
+                "access_mode": self.access_mode,
                 "source_path": self.full_source_path,
                 "path_glob": self.path_glob,
                 "file_format": self.file_format,
@@ -278,8 +282,7 @@ def build(cfg: Any, run_type: str, tables: Any) -> FileConfig:
 
     target_schema = _uc_identifier(_required_text(cfg, "target_schema"), "target_schema", cfg.source_key)
     target_table = _uc_identifier(_required_text(cfg, "target_table"), "target_table", cfg.source_key)
-    source_path = _required_text(cfg, "source_path")
-    storage_ref, storage = _storage(cfg, source_path)
+    access_mode, volume_path, storage_ref, storage, source_path = _access(cfg)
 
     reset_id = cfg.get(CHECKPOINT_RESET_ID)
     if reset_id and not _SAFE_ID.match(str(reset_id)):
@@ -293,6 +296,8 @@ def build(cfg: Any, run_type: str, tables: Any) -> FileConfig:
         environment=cfg.environment,
         run_type=run_type,
         domain=str(cfg.get("domain") or ""),
+        access_mode=access_mode,
+        volume_path=volume_path,
         storage_ref=storage_ref,
         storage=storage,
         source_path=source_path,
@@ -345,7 +350,7 @@ def _validate(cfg: FileConfig) -> None:
         raise ConfigError(f"{where}: schema_location_root must be Volume-backed, got '{cfg.schema_location_root}'")
     if not cfg.landing_partition_by:
         raise ConfigError(f"{where}: landing_partition_by must name at least one column (normally ['ingest_date'])")
-    if "://" in cfg.source_path:
+    if cfg.source_path is not None and "://" in cfg.source_path:
         raise ConfigError(
             f"{where}: source_path '{cfg.source_path}' looks like a full URL. It must be the path "
             "WITHIN the container only (e.g. 'claims/inbound/') - the account and container come "
@@ -354,34 +359,63 @@ def _validate(cfg: FileConfig) -> None:
         )
 
 
-def _storage(cfg: Any, source_path: str) -> tuple[str | None, StorageProfile | None]:
-    """`(storage_ref, storage)` for this source, decided by `source_path`'s own shape.
+def _access(cfg: Any) -> tuple[str, str | None, str | None, StorageProfile | None, str | None]:
+    """`(access_mode, volume_path, storage_ref, storage, source_path)` for this source.
 
-    docs/build_log/DECISIONS.md D-13: a Volume-shaped source_path is Unity-Catalog-governed
-    and takes no storage_ref and no credentials of this framework's own; anything else is a
-    path within a container named by storage_ref, exactly as before D-13. The two forms are
-    mutually exclusive by construction here, not by SourceSpec.mutually_exclusive - that
-    field pairs two KEY NAMES that must not both be set, but this rule depends on the VALUE
-    of source_path, which SourceSpec has no way to express (the same reason schema_mode /
-    schema is checked in this module rather than there).
+    docs/build_log/DECISIONS.md D-15: access_mode is an EXPLICIT choice, not inferred from
+    source_path's shape (D-13's mechanism, now superseded). "volume" takes volume_path and
+    REJECTS storage_ref/source_path; "adls" takes storage_ref + source_path and REJECTS
+    volume_path. Checked here, not via SourceSpec.mutually_exclusive: that field only
+    expresses "at most one of these two keys may be set," and cannot express "this key is
+    required in mode X and forbidden in mode Y" with a message naming the mode - the same
+    reason sources/oracle/config.py checks incremental_mode's cursor/filter requirements in
+    its own module rather than in SourceSpec.
     """
+    where = f"source '{cfg.source_key}'"
+    access_mode = str(cfg.get("access_mode") or "").strip().lower()
+    if access_mode not in VALID_ACCESS_MODES:
+        raise ConfigError(f"{where}: access_mode '{access_mode}' not in {sorted(VALID_ACCESS_MODES)}")
+
+    volume_path = _text(cfg.get("volume_path"))
     storage_ref = _text(cfg.get("storage_ref"))
-    if source_path.startswith(_UC_VOLUME_PREFIX):
-        if storage_ref:
+    source_path = _text(cfg.get("source_path"))
+
+    if access_mode == ACCESS_MODE_VOLUME:
+        for key, value in (("storage_ref", storage_ref), ("source_path", source_path)):
+            if value is not None:
+                raise ConfigError(
+                    f"{where}: '{key}' is set, but access_mode is 'volume'. '{key}' is REJECTED in "
+                    "volume mode - a Unity Catalog Volume path is governed by Unity Catalog grants "
+                    "directly and takes no storage credentials of this framework's own. Remove it, "
+                    "or set access_mode to 'adls'."
+                )
+        if volume_path is None:
             raise ConfigError(
-                f"source '{cfg.source_key}': storage_ref '{storage_ref}' is set, but source_path "
-                f"'{source_path}' is a Unity Catalog Volume path. A Volume path is governed by Unity "
-                "Catalog directly - it takes no storage credentials and no storage_ref. Set one or "
-                "the other, not both."
+                f"{where}: access_mode is 'volume', which requires `volume_path:` - the "
+                "/Volumes/<catalog>/<schema>/<volume>/... path this source reads."
             )
-        return None, None
-    if not storage_ref:
+        if not _VOLUME_PATH_SHAPE.match(volume_path):
+            raise ConfigError(
+                f"{where}: volume_path '{volume_path}' does not match "
+                "/Volumes/<catalog>/<schema>/<volume>/... - a Unity Catalog Volume path needs all "
+                "three segments plus a trailing path."
+            )
+        return access_mode, volume_path, None, None, None
+
+    # access_mode == ACCESS_MODE_ADLS
+    if volume_path is not None:
         raise ConfigError(
-            f"source '{cfg.source_key}': storage_ref is required when source_path is not a Unity "
-            f"Catalog Volume path (i.e. does not start with '{_UC_VOLUME_PREFIX}'). Set storage_ref to "
-            "a profile in conf/storage.yaml, or change source_path to a Volume path."
+            f"{where}: 'volume_path' is set, but access_mode is 'adls'. 'volume_path' is REJECTED "
+            "in adls mode - set storage_ref and source_path instead, or set access_mode to 'volume'."
         )
-    return storage_ref, StorageProfile(name=storage_ref, **dict(cfg.profile("storage", storage_ref)))
+    missing = [key for key, value in (("storage_ref", storage_ref), ("source_path", source_path)) if value is None]
+    if missing:
+        raise ConfigError(
+            f"{where}: access_mode is 'adls', which requires {missing} - together they name where "
+            "an ADLS-governed read comes from."
+        )
+    storage = StorageProfile(name=storage_ref, **dict(cfg.profile("storage", storage_ref)))
+    return access_mode, None, storage_ref, storage, source_path
 
 
 def _format_options(cfg: Any) -> dict[str, str]:
