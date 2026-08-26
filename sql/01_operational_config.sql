@@ -202,7 +202,7 @@ TBLPROPERTIES (
 -- the reverse, the job writes and support gets SELECT only, because a hand-edited
 -- watermark is a silent data-loss incident - are recorded as a specification for whoever
 -- writes the Terraform in the "Unity Catalog privileges" table of
--- docs/RUNBOOK_CLIENT_IT.md. See VB-16.
+-- docs/ARCHITECTURE_OVERVIEW.md. See VB-16.
 -- =====================================================================================
 
 -- =====================================================================================

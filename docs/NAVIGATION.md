@@ -10,7 +10,7 @@ This page tells you which files matter to *you*, and in what order.
 |---|---|---|
 | **A developer** | [RUNBOOK_DEVELOPER.md](RUNBOOK_DEVELOPER.md), then this page's "10-minute path" and "trace" sections | 45 min |
 | **A support engineer** | [RUNBOOK_SUPPORT.md](RUNBOOK_SUPPORT.md) — SQL and job parameters only, no code | 30 min |
-| **An architect / client IT reviewer** | [RUNBOOK_CLIENT_IT.md](RUNBOOK_CLIENT_IT.md), then [DESIGN.md](DESIGN.md) | 30 min |
+| **An architect / client IT reviewer** | [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md), then [DESIGN.md](DESIGN.md) | 30 min |
 | **Onboarding a source** | The README's "Onboarding a source" section, then the relevant `conf/sources/_TEMPLATE*.yaml` | 15 min |
 | **Looking up one setting** | [CONFIGURATION.md](CONFIGURATION.md) | 2 min |
 
@@ -122,7 +122,7 @@ platform default) refuses the batch; `QUARANTINE` lands it and only reports the 
 | [CONFIGURATION.md](CONFIGURATION.md) | Looking up a setting. Every option, tiered MUST CHANGE / NICE TO CHANGE / NO CHANGE REQUIRED |
 | [RUNBOOK_DEVELOPER.md](RUNBOOK_DEVELOPER.md) | Setting up locally, extending the code, raising a PR |
 | [RUNBOOK_SUPPORT.md](RUNBOOK_SUPPORT.md) | Production incident, onboarding, decommissioning. SQL and job parameters only |
-| [RUNBOOK_CLIENT_IT.md](RUNBOOK_CLIENT_IT.md) | Reviewing architecture, security, prerequisites, data protection |
+| [ARCHITECTURE_OVERVIEW.md](ARCHITECTURE_OVERVIEW.md) | Reviewing architecture, security, prerequisites, data protection |
 | [VERIFICATION_BACKLOG.md](VERIFICATION_BACKLOG.md) | What is unverified without real infrastructure, ordered by damage |
 | [IMPORT_TO_DATABRICKS.md](IMPORT_TO_DATABRICKS.md) | First time getting this into a workspace |
 

@@ -26,7 +26,7 @@ for what that actually takes, and the grep gate that proves it stays true.
 |---|---|
 | **A developer** maintaining or extending this | [docs/RUNBOOK_DEVELOPER.md](docs/RUNBOOK_DEVELOPER.md) → then [docs/DESIGN.md](docs/DESIGN.md) |
 | **Production support** | [docs/RUNBOOK_SUPPORT.md](docs/RUNBOOK_SUPPORT.md) — SQL and job parameters only, no code reading |
-| **Client IT / architecture** | [docs/RUNBOOK_CLIENT_IT.md](docs/RUNBOOK_CLIENT_IT.md) — design, security, prerequisites, data protection |
+| **Client IT / architecture** | [docs/ARCHITECTURE_OVERVIEW.md](docs/ARCHITECTURE_OVERVIEW.md) — design, security, prerequisites, data protection |
 
 | Document | Contents |
 |---|---|

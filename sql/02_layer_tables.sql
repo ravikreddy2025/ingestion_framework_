@@ -186,7 +186,7 @@ TBLPROPERTIES (
 
 -- =====================================================================================
 -- GRANTS ARE TERRAFORM-OWNED, NOT ISSUED HERE (docs/build_log/DECISIONS.md D-02).
--- See the "Unity Catalog privileges" table in docs/RUNBOOK_CLIENT_IT.md for the exact
+-- See the "Unity Catalog privileges" table in docs/ARCHITECTURE_OVERVIEW.md for the exact
 -- privilege list a platform admin provisions for the ingestion service principal and the
 -- support group, on both the data catalog (landing/curated, below) and the ops catalog
 -- (audit, above).

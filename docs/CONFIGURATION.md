@@ -515,7 +515,7 @@ two decades. It is not the retention policy — `landing_retention_days` is.
 
 Note that the retention `DELETE` in `sql/04_maintenance.sql` is **commented out**. The policy
 is expressed and parameterised; enabling automatic deletion of raw payloads is the data
-owner's decision. See [`docs/RUNBOOK_CLIENT_IT.md`](RUNBOOK_CLIENT_IT.md) §"Data protection".
+owner's decision. See [`docs/ARCHITECTURE_OVERVIEW.md`](ARCHITECTURE_OVERVIEW.md) §"Data protection considerations".
 
 ### 🟢 NO CHANGE REQUIRED
 
