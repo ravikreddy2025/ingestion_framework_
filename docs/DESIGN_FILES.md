@@ -100,28 +100,33 @@ documented in `docs/CONFIGURATION.md`, not something specific to a reset.
   reuses the existing checkpoint-reset procedure deliberately — `docs/CONFIGURATION.md` §11
   and `docs/RUNBOOK_SUPPORT.md` §9 carry the three-step version.
 
-### Unity Catalog Volume source paths, and the simplification they set up (D-13)
+### `access_mode`, and the simplification it sets up (D-15, supersedes D-13's shape-inference)
 
-`source_path` may name a Unity Catalog Volume directly
-(`/Volumes/<catalog>/<schema>/<volume>/...`) instead of a path within an ADLS container
-named by `storage_ref`. A Volume path is governed by Unity Catalog grants on the Volume
-itself: `sources/file/config.py` applies no `storage_ref` and builds no
-`fs.azure.*` session options for it, and `sources/file/run.py` applies no session
-configuration around the read at all in that case. The two forms are mutually exclusive —
-setting `storage_ref` alongside a Volume path is a config error naming both, because there
-is no honest answer to which one governs the read.
+`access_mode` is an **explicit**, required choice — `volume` or `adls` — not inferred from
+`source_path`'s shape the way D-13 originally built it. `volume` mode names a Unity Catalog
+Volume directly via `volume_path` (`/Volumes/<catalog>/<schema>/<volume>/...`) instead of a
+path within an ADLS container named by `storage_ref`. A Volume path is governed by Unity
+Catalog grants on the Volume itself: `sources/file/config.py` applies no `storage_ref` and
+builds no `fs.azure.*` session options for it, and `sources/file/run.py` applies no session
+configuration around the read at all in that case. The two modes are mutually exclusive by
+construction — setting `storage_ref`/`source_path` under `access_mode: volume`, or
+`volume_path` under `access_mode: adls`, is a config error naming the offending key and the
+mode, checked in `sources/file/config.py::_access` at config load.
 
-This is **preferred**, not forced: the shipped worked example keeps its existing
-`storage_ref` form, since switching it was not asked for and doing so without confirming
-Volumes are reachable from the target compute for that workload would be exactly the kind
-of unverified assumption this project exists to keep out of shipped configuration (VB-28).
+`volume` is **preferred**, not forced: the shipped `abfss://`-form worked example
+(`file_claims_inbound.yaml`) keeps its existing `access_mode: adls`, since switching it was
+not asked for and doing so without confirming Volumes are reachable from the target compute
+for that workload would be exactly the kind of unverified assumption this project exists to
+keep out of shipped configuration (VB-28). A second worked example,
+`file_membership_eligibility.yaml`, ships with `access_mode: volume` so the cross-product
+config test actually resolves a Volume-mode source in every environment.
 
 **The planned simplification, if VB-28 comes back "Volumes everywhere":** `conf/storage.yaml`,
 `sources/file/security.py`, and `framework/security.py`'s `apply_session_options` (added for
 exactly this source's session-scoped credentials, VB-26) all become deletable —
 a Volume path takes no credential from this framework at all. Not attempted now: narrowing to
-one credential path is a decision for whoever answers VB-28, not something to guess at while
-both are still plausibly needed in different environments. If that day comes,
-`apply_session_options` is worth a second look before deleting it outright — nothing else in
-the framework uses it today, but a future source needing session-scoped, non-`.option()`
-credentials (the same shape ADLS Gen2 has) would want it again.
+one mode is a decision for whoever answers VB-28, not something to guess at while both are
+still plausibly needed in different environments. If that day comes, `apply_session_options`
+is worth a second look before deleting it outright — nothing else in the framework uses it
+today, but a future source needing session-scoped, non-`.option()` credentials (the same
+shape ADLS Gen2 has) would want it again.

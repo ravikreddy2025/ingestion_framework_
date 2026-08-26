@@ -806,8 +806,9 @@ offset or timestamp window for this source, unlike Kafka's or Oracle's replay bo
 
 | Key | What it is |
 |---|---|
-| `storage_ref` | A profile name from `conf/storage.yaml`. Never an account URL. **Omit entirely** when `source_path` is a Unity Catalog Volume path — see the next row and `docs/build_log/DECISIONS.md` D-13. Required for every other `source_path`. |
-| `source_path` | **Two forms, prefer the first when available (D-13):** (a) a Unity Catalog Volume path, `/Volumes/<catalog>/<schema>/<volume>/...` — UC-governed, no `storage_ref`, no credentials this framework applies at all; or (b) the path **within** the container only — never a full `abfss://` URL — resolved against `storage_ref`, which is what lets the same source file resolve to a different account per environment. Setting `storage_ref` alongside form (a) is a config error naming both — there is no honest answer to which one governs the read. |
+| `access_mode` | `volume` \| `adls` (`docs/build_log/DECISIONS.md` D-15) — an **explicit** choice, not inferred from `source_path`'s shape. Decides which of the two rows below apply; setting a key that belongs to the other mode is a config error naming the key and the mode. **Prefer `volume` when a Volume is available** — see the onboarding template. |
+| `volume_path` | **`access_mode: volume` only.** A Unity Catalog Volume path, `/Volumes/<catalog>/<schema>/<volume>/...` — UC-governed, no `storage_ref`, no credentials this framework applies at all. `storage_ref` and `source_path` are **rejected** in this mode. |
+| `storage_ref` / `source_path` | **`access_mode: adls` only.** `storage_ref` is a profile name from `conf/storage.yaml`, never an account URL. `source_path` is the path **within** the container only — never a full `abfss://` URL — resolved against `storage_ref`, which is what lets the same source file resolve to a different account per environment. `volume_path` is **rejected** in this mode. |
 | `file_format` | `csv` \| `json` \| `parquet` \| `avro`. |
 | `target_schema` / `target_table` | Where this lands. A file feed has no source-side schema/table the way Oracle's does, so these are your own choice, not a derivation — `{catalog}.<target_schema>.<target_table>`. The target schema must already exist: `CREATE SCHEMA IF NOT EXISTS <catalog>.<target_schema>;` in every environment, before the first run. |
 | `domain` | Owning team. Appears in every audit row. |
@@ -833,20 +834,20 @@ offset or timestamp window for this source, unlike Kafka's or Oracle's replay bo
 | `landing_table` | Derived from `target_schema` / `target_table`. |
 | `table_properties` | Platform-wide, from `conf/defaults.yaml`. |
 
-### Unity Catalog Volume source paths — no register, no credentials (D-13)
+### Unity Catalog Volume source paths — no register, no credentials (D-15)
 
-When `source_path` is a Volume path, none of the rest of this subsection applies: the
-register below is not consulted, `sources/file/security.py` builds no options, and
+When `access_mode` is `volume`, none of the rest of this subsection applies: the register
+below is not consulted, `sources/file/security.py` builds no options, and
 `sources/file/run.py` applies no session configuration around the read at all. Access is
 governed entirely by Unity Catalog grants on the Volume itself, verified with whoever owns
 it, not with anything in this repository. **Preferred over the register below when a Volume
-path is available** — see the onboarding template. VB-28 tracks whether Volumes are actually
-reachable in every environment this framework targets; until it is answered, both forms are
-supported and neither is assumed universal.
+path is available** — see the onboarding template. VB-28 tracks which `access_mode` each
+environment actually uses and whether Volumes are reachable everywhere this framework
+targets; until it is answered, both modes are supported and neither is assumed universal.
 
 ### Storage register — `conf/storage.yaml`
 
-For every `source_path` that is **not** a Volume path. Same register pattern as
+For every source with `access_mode: adls`. Same register pattern as
 `conf/clusters.yaml` / `conf/registries.yaml` / `conf/jdbc.yaml`: the register records the
 auth mode and the secret **key names**; `conf/environments/<env>.yaml` overrides the account,
 container and secret **scope** per environment. Two auth modes:
@@ -881,5 +882,5 @@ Three columns, mirroring Kafka's three exactly (`docs/build_log/DECISIONS.md` D-
 | `file_checkpoint_reset_id` | — | Bypasses the checkpoint-reset guard **and** forks the Delta transaction identity — see the MUST-READ block above and `docs/RUNBOOK_SUPPORT.md` §9. Single-use. Never blank it back out once set. |
 
 Everything that decides where this source reads from and where it lands —
-`storage_ref`, `source_path`, `target_schema`, `target_table`, `landing_partition_by` — is
-structural, and an override of one is ignored and logged.
+`access_mode`, `volume_path`, `storage_ref`, `source_path`, `target_schema`, `target_table`,
+`landing_partition_by` — is structural, and an override of one is ignored and logged.

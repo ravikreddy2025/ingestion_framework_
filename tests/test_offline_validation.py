@@ -199,7 +199,7 @@ def _register_names(setting: str) -> set[str]:
 
 def _source_file_references(setting: str) -> list[tuple[str, str]]:
     """[(source_key, referenced_name), ...] - skips a source file that does not set this
-    setting at all, which is legal (e.g. a Unity Catalog Volume file source, D-13, sets no
+    setting at all, which is legal (e.g. an access_mode: volume file source, D-15, sets no
     storage_ref by construction)."""
     references = []
     for path in sorted((CONF_ROOT / "sources").glob("*.yaml")):

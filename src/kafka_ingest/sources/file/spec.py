@@ -23,16 +23,15 @@ THE FILE SOURCE IS CHECKPOINT-BASED (STAGE_5 brief, "Decision, already made"). I
 the SAME checkpoint-reset-id mechanism Kafka uses, not a second design - see the guard in
 run.py. `checkpoint_root` is therefore required with no safe fallback, exactly like Kafka's.
 
-`storage_ref` IS NOT IN `required_keys` (docs/build_log/DECISIONS.md D-13), even though it
-IS in `structural_keys` and every shipped source today sets it. A `source_path` under
-`/Volumes/<catalog>/<schema>/<volume>/...` is Unity-Catalog-governed and takes no storage
-credentials at all, so it has nothing for `storage_ref` to name - a blanket `required_keys`
-entry would make that legal, credential-free form fail with a missing-key error for the
-wrong reason. `sources/file/config.py`'s `build()` enforces the real rule instead: exactly
-one of `storage_ref` or a Volume-shaped `source_path`, depending on `source_path`'s own
-shape - the same kind of cross-field rule that already lives there for `schema_mode` /
-`schema`, because SourceSpec has no way to express "required only when a sibling key looks
-like X."
+`access_mode` (docs/build_log/DECISIONS.md D-15) is an EXPLICIT choice - `volume` or `adls`
+- not inferred from a sibling key's shape. Neither `volume_path` nor `storage_ref` /
+`source_path` is in `required_keys`: which of them is actually required depends on
+`access_mode`'s VALUE, which SourceSpec has no way to express (the same reason `schema_mode`
+/ `schema` is checked in sources/file/config.py rather than here). `sources/file/config.py`'s
+`build()` enforces the real rule: `volume` mode requires `volume_path` and rejects
+`storage_ref` / `source_path`; `adls` mode requires `storage_ref` and `source_path` and
+rejects `volume_path`. All four keys stay structural - what a source reads from is a PR, not
+an incident lever (CORE section 5.2).
 """
 
 from __future__ import annotations
@@ -47,6 +46,8 @@ CHECKPOINT_RESET_ID = "checkpoint_reset_id"
 # resolves, validates and creates it.
 _STRUCTURAL = frozenset(
     {
+        "access_mode",
+        "volume_path",
         "storage_ref",
         "source_path",
         "path_glob",
@@ -75,7 +76,7 @@ SOURCE_SPEC = SourceSpec(
     # to decide between inference and a provided schema with no explicit instruction at all.
     required_keys=frozenset(
         {
-            "source_path",
+            "access_mode",
             "path_glob",
             "file_format",
             "schema_mode",

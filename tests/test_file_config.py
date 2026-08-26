@@ -123,38 +123,80 @@ def test_the_account_key_auth_mode_requires_its_secret_key_names(file_config_roo
 
 
 # --------------------------------------------------------------------------------------
-# Unity Catalog Volume source paths (docs/build_log/DECISIONS.md D-13) - no storage_ref,
-# no credentials, preferred when the compute can reach the Volume directly.
+# access_mode: volume | adls (docs/build_log/DECISIONS.md D-15, supersedes D-13's
+# shape-inference) - an explicit, mode-conditional choice: "volume" takes volume_path and
+# no storage_ref/source_path; "adls" takes storage_ref + source_path and no volume_path.
 # --------------------------------------------------------------------------------------
 
 VOLUME_PATH = "/Volumes/cat_dev/files_claims/landing/claims/inbound/"
 
 
-def test_a_volume_source_path_needs_no_storage_ref(file_config_root):
-    cfg = _cfg(file_config_root, storage_ref=None, source_path=VOLUME_PATH)
+def _volume_cfg(file_config_root, **overrides):
+    settings = {"access_mode": "volume", "volume_path": VOLUME_PATH, "storage_ref": None, "source_path": None}
+    settings.update(overrides)
+    return _cfg(file_config_root, **settings)
+
+
+def test_a_volume_source_needs_no_storage_ref(file_config_root):
+    cfg = _volume_cfg(file_config_root)
+    assert cfg.access_mode == "volume"
     assert cfg.storage_ref is None
     assert cfg.storage is None
-    assert cfg.is_uc_volume_path is True
 
 
-def test_a_volume_source_path_is_read_as_is_with_no_abfss_wrapping(file_config_root):
-    cfg = _cfg(file_config_root, storage_ref=None, source_path=VOLUME_PATH)
+def test_a_volume_source_is_read_as_is_with_no_abfss_wrapping(file_config_root):
+    cfg = _volume_cfg(file_config_root)
     assert cfg.full_source_path == VOLUME_PATH
 
 
-def test_a_volume_source_path_with_storage_ref_set_is_rejected(file_config_root):
+def test_a_volume_source_with_storage_ref_set_is_rejected(file_config_root):
     """A source declaring both leaves no honest answer to which one governs the read."""
-    with pytest.raises(ConfigError, match="Set one or the other, not both"):
-        _cfg(file_config_root, source_path=VOLUME_PATH)  # storage_ref stays "adls_demo"
+    with pytest.raises(ConfigError, match="'storage_ref' is set, but access_mode is 'volume'"):
+        _volume_cfg(file_config_root, storage_ref="adls_demo")
 
 
-def test_a_non_volume_source_path_still_requires_storage_ref(file_config_root):
-    with pytest.raises(ConfigError, match="storage_ref is required"):
+def test_a_volume_source_with_source_path_set_is_rejected(file_config_root):
+    with pytest.raises(ConfigError, match="'source_path' is set, but access_mode is 'volume'"):
+        _volume_cfg(file_config_root, source_path="claims/inbound/")
+
+
+def test_a_volume_source_requires_volume_path(file_config_root):
+    with pytest.raises(ConfigError, match="requires `volume_path:`"):
+        _volume_cfg(file_config_root, volume_path=None)
+
+
+@pytest.mark.parametrize(
+    "bad_path",
+    [
+        "/Volumes/cat_dev",
+        "/Volumes/cat_dev/",
+        "/Volumes/cat_dev/files_claims",
+        "not/even/a/volumes/path",
+    ],
+)
+def test_a_malformed_volume_path_is_rejected(file_config_root, bad_path):
+    with pytest.raises(ConfigError, match="does not match"):
+        _volume_cfg(file_config_root, volume_path=bad_path)
+
+
+def test_an_adls_source_still_requires_storage_ref(file_config_root):
+    with pytest.raises(ConfigError, match=r"requires \['storage_ref'\]"):
         _cfg(file_config_root, storage_ref=None)  # source_path stays the default container path
 
 
-def test_a_non_volume_source_path_is_not_mistaken_for_a_volume_path(file_cfg):
-    assert file_cfg.is_uc_volume_path is False
+def test_an_adls_source_with_volume_path_set_is_rejected(file_config_root):
+    with pytest.raises(ConfigError, match="'volume_path' is set, but access_mode is 'adls'"):
+        _cfg(file_config_root, volume_path=VOLUME_PATH)
+
+
+def test_an_unknown_access_mode_is_rejected(file_config_root):
+    with pytest.raises(ConfigError, match="access_mode"):
+        _cfg(file_config_root, access_mode="dbfs")
+
+
+def test_the_default_source_is_adls_mode(file_cfg):
+    assert file_cfg.access_mode == "adls"
+    assert file_cfg.volume_path is None
 
 
 # --------------------------------------------------------------------------------------

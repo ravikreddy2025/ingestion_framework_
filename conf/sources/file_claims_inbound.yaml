@@ -14,6 +14,7 @@ source_type: file
 
 source:
 
+  access_mode: adls
   storage_ref: adls_landing_prod
   # The account and container come from storage_ref, which differs per environment - this
   # source file only ever names the path WITHIN it.

@@ -21,8 +21,8 @@ below are a judgement call, not an algorithm -- restated here so a later stage c
 reasoning rather than just a shuffled list:
 
 1. **Silent, per-row data corruption with no self-correcting check** (VB-02, VB-03, VB-19,
-   VB-04, VB-27, VB-23, VB-15, VB-25, VB-20, VB-18, VB-06, VB-09) -- a wrong guess ships
-   wrong data, or drops it, with nothing in a row count or a green job to show it.
+   VB-04, VB-27, VB-23, VB-15, VB-25, VB-20, VB-18, VB-06, VB-09, VB-30) -- a wrong guess
+   ships wrong data, or drops it, with nothing in a row count or a green job to show it.
 2. **Silent but narrower, bounded, or already partly self-correcting** (VB-24, VB-26, VB-28,
    VB-05, VB-10) -- the same "no error" shape, but a smaller blast radius, an unused code
    path today, or a runtime self-check that fails loudly before it fails silently.
@@ -37,6 +37,12 @@ loud (a `ConfigError` naming the scope/key, exactly like VB-22's `ClassNotFoundE
 but unlike every other entry in this tier it blocks EVERY source type at the first step of
 every run, not one source's driver, one network route, or one grant. Nothing else in this
 backlog can be exercised on a fresh environment until this one is clear.
+
+**VB-30 added in Stage 9** (`docs/build_log/DECISIONS.md` D-15), placed in tier 1: unlike
+VB-08 (whether a UC Volume works as a checkpoint location at all -- a loud, tier-3 failure to
+start), VB-30 asks whether Auto Loader's listing/checkpoint bookkeeping is *equivalent*
+between the two `access_mode` values once both do start -- a wrong answer there is a silent
+re-read or a silent skip, not an exception.
 
 Status key: OPEN (not yet checked) / CONFIRMED (checked, assumption held) / REFUTED (checked,
 code must change -- see "If it fails").
@@ -473,36 +479,37 @@ code must change -- see "If it fails").
   with one job per storage account, not a code change here.
 - **Status:** OPEN
 
-### VB-28 -- Will file sources use Unity Catalog Volumes or `abfss://` in each environment, and are Volumes actually reachable from the target compute?
-- **Stage / file:** Stage 6 (`docs/build_log/DECISIONS.md` D-13). `sources/file/config.py`
-  (`FileConfig.is_uc_volume_path`, `_storage()`), `sources/file/run.py` (applies no storage
-  credentials at all for a Volume-shaped `source_path`).
-- **Why it matters:** The file source now supports two forms for `source_path`: a Unity
-  Catalog Volume path (no credentials, no `storage_ref` at all) and an ADLS container path
-  via `storage_ref` (session-scoped credentials, VB-26). Which one a given environment
-  should actually use is not yet decided, and the two have different prerequisites: a Volume
-  path needs the landing zone to actually be (or become) a Volume, and needs the job's
-  compute/service-principal to hold Unity Catalog read access to it; the `storage_ref` path
-  needs everything VB-26 already asks. Picking wrong is not silent - the read simply fails to
-  find the path or a grant is missing - but not knowing the answer means every onboarding
-  re-asks the question, and the framework carries two credential mechanisms indefinitely
-  rather than the one it could if this were settled.
+### VB-28 -- Which `access_mode` does each environment use, and are Unity Catalog Volumes actually reachable from the target compute?
+- **Stage / file:** Stage 6 (`docs/build_log/DECISIONS.md` D-13); rephrased against the
+  explicit key in Stage 9 (D-15). `sources/file/spec.py` (`access_mode`, `volume_path`),
+  `sources/file/config.py` (`_access()`), `sources/file/run.py` (applies no storage
+  credentials at all for `access_mode: volume`).
+- **Why it matters:** The file source now supports two `access_mode` values: `volume` (no
+  credentials, no `storage_ref` at all) and `adls` (`storage_ref`-governed, session-scoped
+  credentials, VB-26). Which one a given environment should actually use is not yet decided,
+  and the two have different prerequisites: `volume` needs the landing zone to actually be
+  (or become) a Unity Catalog Volume, and needs the job's compute/service-principal to hold
+  Unity Catalog read access to it; `adls` needs everything VB-26 already asks. Picking wrong
+  is not silent - the read simply fails to find the path or a grant is missing - but not
+  knowing the answer means every onboarding re-asks the question, and the framework carries
+  two credential mechanisms indefinitely rather than the one it could if this were settled.
 - **How to check:** For each environment, with the platform/storage team:
   1. Confirm whether the landing zone in question is, or can be, exposed as a Unity Catalog
-     Volume, and if so get its full `/Volumes/<catalog>/<schema>/<volume>/` path.
+     Volume, and if so get its full `/Volumes/<catalog>/<schema>/<volume>/` path for
+     `volume_path`.
   2. Confirm the ingestion job's compute / service principal has been granted read access to
      that Volume.
-  3. If no Volume exists or is planned for that landing zone, use the `storage_ref` form
-     instead and confirm VB-26.
-- **Expected:** A clear, environment-by-environment answer - "Volumes everywhere",
-  "`abfss://` everywhere", or a documented per-source decision - not a guess repeated at
-  every onboarding.
+  3. If no Volume exists or is planned for that landing zone, set `access_mode: adls` instead
+     and confirm VB-26.
+- **Expected:** A clear, environment-by-environment answer - "`access_mode: volume`
+  everywhere", "`access_mode: adls` everywhere", or a documented per-source decision - not a
+  guess repeated at every onboarding.
 - **If it fails / once answered:** If Volumes are unavailable in at least one environment,
-  the two-form support this stage added is the permanent shape, not a transitional one. If
+  the two-mode support this framework has is the permanent shape, not a transitional one. If
   Volumes turn out to be available everywhere, `conf/storage.yaml`, `sources/file/security.py`
   and `framework/security.py`'s `apply_session_options` all become deletable - the planned
   simplification recorded in `docs/DESIGN_FILES.md` - once every shipped file source has
-  actually moved off them.
+  actually moved to `access_mode: volume`.
 - **Status:** OPEN
 
 ### VB-05 -- Is `sources[0].latestOffset` populated in `StreamingQueryProgress` under `availableNow`?
@@ -872,4 +879,40 @@ code must change -- see "If it fails").
   prototype if notification mode is chosen.
 - **If it fails:** Fall back to directory-listing mode and document the expected listing
   cost/latency in `docs/CONFIGURATION.md` for the Files source once it exists.
+
+### VB-30 -- Do Auto Loader's stream checkpoint and `cloudFiles.schemaLocation` behave identically when the source itself reads from a Unity Catalog Volume path as they do reading `abfss://`?
+- **Stage / file:** Stage 9 (`docs/build_log/DECISIONS.md` D-15). `sources/file/reader.py`
+  (`build_stream_reader`, `cloudFiles.schemaLocation`), `sources/file/run.py` (the
+  checkpoint-reset guard, shared with Kafka via `framework/checkpoint.py`).
+- **Why it matters:** `checkpoint_root` and `schema_location_root` are ALREADY Volume-backed
+  for both `access_mode` values (`conf/defaults/file.yaml`) - that half is unaffected by
+  `access_mode`. What is untested is whether Auto Loader's OWN internal bookkeeping (file
+  listing state, dedup against already-seen files, how it names/versions entries under
+  `schemaLocation`) behaves the same when the thing it is LISTING is a Volume path
+  (`cloudFiles` reading `/Volumes/...` directly) as when it is listing an `abfss://`
+  container. Databricks documents both as supported `cloudFiles` source paths, but this
+  project has not run either against a real workspace (VB-06 already covers `_metadata` /
+  `rescuedDataColumn` behavior per format; this is the listing/checkpoint layer underneath
+  that, and specifically the delta between the two `access_mode` values rather than either
+  in isolation). A silent difference here would show up as either mode re-reading files the
+  other mode would have skipped, or vice versa - which duplicates or drops rows depending on
+  direction, and neither shows up in a green job.
+- **How to check:** Once a Volume-backed landing zone is available (VB-28), run
+  `file_membership_eligibility` (the `access_mode: volume` shipped example) through several
+  cycles - initial load, a checkpoint-intact incremental run, and a
+  `file_checkpoint_reset_id` reset - and confirm: (1) files are not re-read on an
+  incremental run with the checkpoint intact; (2) `cloudFiles.schemaLocation` correctly
+  carries the inferred/provided schema across restarts; (3) a checkpoint reset behaves the
+  same way `docs/DESIGN_FILES.md`'s failure-scenario table already documents for the
+  `abfss://` case. Compare directly against the same sequence run against
+  `file_claims_inbound` (`access_mode: adls`).
+- **Expected:** No behavioral difference between the two `access_mode` values at the
+  checkpoint/schemaLocation layer - both are just `cloudFiles` source paths as far as Auto
+  Loader's own bookkeeping is concerned.
+- **If it fails:** Document the actual difference in `docs/DESIGN_FILES.md`'s failure-scenario
+  table, scoped explicitly to `access_mode: volume`, and reconsider whether the checkpoint-
+  reset guard (`framework/checkpoint.py`) needs a mode-aware branch - which would be a real
+  design change, not a documentation fix, since CORE section 4.2 forbids branching on
+  source-internal shape in `framework/` today.
+- **Status:** OPEN
 - **Status:** OPEN

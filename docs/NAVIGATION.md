@@ -108,9 +108,9 @@ re-extracts the same interval — see
 | 1 | `entrypoints/run_ingest.py` | Same entrypoint again. |
 | 2 | `framework/runner.py` | Picks the `file` module, resolves config, allocates `run_sequence`, dispatches. |
 | 3 | `framework/config.py` | Merges `defaults.yaml` → `defaults/file.yaml` → environment → source file → control table (`file_failure_mode`, `file_max_files_per_trigger`, `file_checkpoint_reset_id`) → job parameters. |
-| 4 | `sources/file/config.py` | Builds `FileConfig`. Decides Volume-governed vs `storage_ref`-governed from `source_path`'s own shape; derives `checkpoint_path` / `schema_location_path` from `{source_key}`. |
+| 4 | `sources/file/config.py` | Builds `FileConfig`. `access_mode` (`volume` \| `adls`, an explicit key — D-15) decides Volume-governed vs `storage_ref`-governed; derives `checkpoint_path` / `schema_location_path` from `{source_key}`. |
 | 5 | `sources/file/run.py` → `run(ctx)` | The **same shared guard** Kafka uses: `framework/checkpoint.py::guard_against_checkpoint_reset`, called with this source's own checkpoint path, landing table and control column. |
-| 6 | `framework/security.py` → `apply_session_options()` | For a `storage_ref`-governed source only: sets ADLS Gen2 session/Hadoop configuration for the duration of the read, then restores whatever was there before. A Volume-governed source applies none of this. |
+| 6 | `framework/security.py` → `apply_session_options()` | For `access_mode: adls` only: sets ADLS Gen2 session/Hadoop configuration for the duration of the read, then restores whatever was there before. `access_mode: volume` applies none of this. |
 | 7 | `sources/file/reader.py` | Builds the Auto Loader `readStream` — `cloudFiles.schemaLocation` always set, `rescuedDataColumn` hardcoded to `_rescued_data`, `schema_mode: provided` calls `.schema(ddl_string)`. |
 | 8 | `sources/file/run.py` → `process_microbatch` | Once per microbatch. |
 | 9 | `sources/file/landing.py` | Projects source columns verbatim + `_metadata`-derived columns + `filename_columns` (via `regexp_extract`) + provenance columns. |
@@ -196,7 +196,7 @@ gate, enforced in CI, is what makes that a fact rather than a convention.
 | File | Job |
 |---|---|
 | `spec.py` | `SOURCE_SPEC` — `layers=("landing",)`, `target_tokens=("target_schema", "target_table")` |
-| `config.py` | `FileConfig` — decides Volume-governed vs `storage_ref`-governed from `source_path`'s shape |
+| `config.py` | `FileConfig` — `access_mode` decides Volume-governed vs `storage_ref`-governed (D-15) |
 | `security.py` | `StorageProfile` + resolved secrets → ADLS Gen2 session options (`account_key` / `service_principal`) |
 | `reader.py` | `cloudFiles.*` Auto Loader options |
 | `landing.py` | Source columns + `_metadata` + `filename_columns` + provenance projection |
