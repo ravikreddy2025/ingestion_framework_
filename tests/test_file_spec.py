@@ -65,7 +65,18 @@ def test_the_shipped_source_exposes_exactly_the_contract():
 # --------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("key", ["storage_ref", "source_path", "target_schema", "target_table", "landing_partition_by"])
+@pytest.mark.parametrize(
+    "key",
+    [
+        "access_mode",
+        "volume_path",
+        "storage_ref",
+        "source_path",
+        "target_schema",
+        "target_table",
+        "landing_partition_by",
+    ],
+)
 def test_what_is_read_and_where_it_lands_is_never_operationally_overridable(key):
     """CORE section 5.2: where this source reads from and where it writes describe what is
     already on disk or which feed this is, and changing either needs a PR."""

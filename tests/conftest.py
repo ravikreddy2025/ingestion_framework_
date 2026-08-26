@@ -1160,6 +1160,7 @@ class FakeJdbcSpark(FakeSpark):
 # --------------------------------------------------------------------------------------
 
 FILE_SOURCE_DEFAULTS = {
+    "access_mode": "adls",
     "storage_ref": "adls_demo",
     "domain": "claims",
     "source_path": "claims/inbound/",

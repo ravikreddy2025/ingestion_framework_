@@ -553,13 +553,13 @@ def test_every_file_source_reaches_a_real_storage_account_in_every_environment(s
     """A storage profile with no account or no secret scope in ONE environment would only
     fail when that environment was deployed.
 
-    A Unity Catalog Volume source (docs/build_log/DECISIONS.md D-13) has no storage profile
-    at all - it is governed by Unity Catalog grants, not by anything this framework
+    An `access_mode: volume` source (docs/build_log/DECISIONS.md D-15) has no storage
+    profile at all - it is governed by Unity Catalog grants, not by anything this framework
     resolves - so this test has nothing to check for one beyond "no placeholder survived".
     """
     cfg = _resolve_file(source_key, environment)
     assert "{" not in cfg.full_source_path
-    if cfg.is_uc_volume_path:
+    if cfg.access_mode == file_config.ACCESS_MODE_VOLUME:
         assert cfg.storage is None
         assert cfg.storage_ref is None
     else:
@@ -592,12 +592,12 @@ def test_no_shipped_file_source_checks_an_incident_lever_into_git(source_key):
 
 
 def test_every_storage_profile_the_sources_use_exists_in_the_register():
-    """A Unity Catalog Volume source (D-13) has no storage_ref to check - it names no
+    """An `access_mode: volume` source (D-15) has no storage_ref to check - it names no
     profile in this register at all, by construction."""
     register = yaml.safe_load((CONF_ROOT / "storage.yaml").read_text(encoding="utf-8"))["storage"]
     for source_key in FILE_KEYS:
         cfg = _resolve_file(source_key)
-        if cfg.is_uc_volume_path:
+        if cfg.access_mode == file_config.ACCESS_MODE_VOLUME:
             assert cfg.storage_ref is None
         else:
             assert cfg.storage_ref in register
@@ -691,8 +691,8 @@ def test_no_placeholder_survives_anywhere_in_a_resolved_oracle_config(source_key
 
 @pytest.mark.parametrize("source_key, environment", FILE_ENVS)
 def test_no_placeholder_survives_anywhere_in_a_resolved_file_config(source_key, environment):
-    """A Unity Catalog Volume source (D-13) has no `storage` profile to sweep - `cfg.storage
-    is None` is itself the point, not a gap in this test."""
+    """An `access_mode: volume` source (D-15) has no `storage` profile to sweep -
+    `cfg.storage is None` is itself the point, not a gap in this test."""
     cfg = _resolve_file(source_key, environment)
     fields = [("", cfg)] if cfg.storage is None else [("", cfg), ("storage.", cfg.storage)]
     for owner, obj in fields:
@@ -731,5 +731,13 @@ def test_the_source_side_identity_never_varies_by_environment():
         identities = {(cfg.source_schema, cfg.source_table) for cfg in resolved}
         assert len(identities) == 1, f"{source_key}: source_schema/source_table varies by environment: {identities}"
     for source_key in FILE_KEYS:
-        paths = {_resolve_file(source_key, e).source_path for e in ENVIRONMENTS}
-        assert len(paths) == 1, f"{source_key}: source_path varies by environment: {paths}"
+        resolved = [_resolve_file(source_key, e) for e in ENVIRONMENTS]
+        if resolved[0].access_mode == file_config.ACCESS_MODE_VOLUME:
+            # volume_path legitimately embeds {catalog}, which DOES vary by environment
+            # (a Volume is catalog-scoped) - strip it before comparing the schema/volume/
+            # path portion, which is the part that must not vary.
+            suffixes = {re.sub(r"^/Volumes/[^/]+/", "", cfg.volume_path) for cfg in resolved}
+            assert len(suffixes) == 1, f"{source_key}: volume_path (past the catalog) varies by environment: {suffixes}"
+        else:
+            paths = {cfg.source_path for cfg in resolved}
+            assert len(paths) == 1, f"{source_key}: source_path varies by environment: {paths}"

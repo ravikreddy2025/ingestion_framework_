@@ -84,8 +84,8 @@ def test_the_reset_id_is_recorded_on_the_audit_row(file_config_root, checkpoint,
 
 
 # --------------------------------------------------------------------------------------
-# Unity Catalog Volume source paths apply no storage credentials (docs/build_log/
-# DECISIONS.md D-13). `build_stream_reader` is stopped with a sentinel right after the
+# access_mode: volume applies no storage credentials (docs/build_log/DECISIONS.md D-15,
+# supersedes D-13). `build_stream_reader` is stopped with a sentinel right after the
 # storage-option branch, the same distance a real streaming query is out of reach of these
 # stand-ins - see the module docstring for why `run_streaming` itself is monkeypatched away
 # everywhere else in this file.
@@ -98,7 +98,13 @@ class _StreamingStoppedError(Exception):
 
 
 def test_a_volume_source_applies_no_storage_options(file_config_root, monkeypatch):
-    write_file_source(file_config_root, storage_ref=None, source_path="/Volumes/cat_dev/files_claims/landing/")
+    write_file_source(
+        file_config_root,
+        access_mode="volume",
+        volume_path="/Volumes/cat_dev/files_claims/landing/inbound/",
+        storage_ref=None,
+        source_path=None,
+    )
     calls = []
     monkeypatch.setattr(file_run.security, "build_storage_options", lambda *a, **k: calls.append("storage_options"))
     monkeypatch.setattr(file_run, "apply_session_options", lambda *a, **k: calls.append("apply_session_options"))
