@@ -19,9 +19,14 @@
 # SERVERLESS COMPUTE DEPENDENCY
 # -----------------------------
 # The environment below targets serverless jobs compute, which needs egress to every ADLS
-# account in conf/storage.yaml via Network Connectivity Configuration (VB-12). If
-# serverless cannot reach the account, swap `environment_key: file_env` for a
-# `job_cluster_key` and configure it there.
+# account in conf/storage.yaml via Network Connectivity Configuration (VB-12) - but ONLY for
+# a source whose source_path names a container via storage_ref. A source whose source_path
+# is a Unity Catalog Volume (docs/build_log/DECISIONS.md D-13, preferred when available)
+# needs no ADLS network egress at all - access is governed by Unity Catalog grants on the
+# Volume, which this compute already needs for the checkpoint/schema-location Volumes
+# regardless. See VB-28 for which form each environment actually uses. If serverless cannot
+# reach an ADLS account a storage_ref-governed source needs, swap
+# `environment_key: file_env` for a `job_cluster_key` and configure it there.
 
 resources:
   jobs:

@@ -123,6 +123,41 @@ def test_the_account_key_auth_mode_requires_its_secret_key_names(file_config_roo
 
 
 # --------------------------------------------------------------------------------------
+# Unity Catalog Volume source paths (docs/build_log/DECISIONS.md D-13) - no storage_ref,
+# no credentials, preferred when the compute can reach the Volume directly.
+# --------------------------------------------------------------------------------------
+
+VOLUME_PATH = "/Volumes/cat_dev/files_claims/landing/claims/inbound/"
+
+
+def test_a_volume_source_path_needs_no_storage_ref(file_config_root):
+    cfg = _cfg(file_config_root, storage_ref=None, source_path=VOLUME_PATH)
+    assert cfg.storage_ref is None
+    assert cfg.storage is None
+    assert cfg.is_uc_volume_path is True
+
+
+def test_a_volume_source_path_is_read_as_is_with_no_abfss_wrapping(file_config_root):
+    cfg = _cfg(file_config_root, storage_ref=None, source_path=VOLUME_PATH)
+    assert cfg.full_source_path == VOLUME_PATH
+
+
+def test_a_volume_source_path_with_storage_ref_set_is_rejected(file_config_root):
+    """A source declaring both leaves no honest answer to which one governs the read."""
+    with pytest.raises(ConfigError, match="Set one or the other, not both"):
+        _cfg(file_config_root, source_path=VOLUME_PATH)  # storage_ref stays "adls_demo"
+
+
+def test_a_non_volume_source_path_still_requires_storage_ref(file_config_root):
+    with pytest.raises(ConfigError, match="storage_ref is required"):
+        _cfg(file_config_root, storage_ref=None)  # source_path stays the default container path
+
+
+def test_a_non_volume_source_path_is_not_mistaken_for_a_volume_path(file_cfg):
+    assert file_cfg.is_uc_volume_path is False
+
+
+# --------------------------------------------------------------------------------------
 # source_path - never a full URL
 # --------------------------------------------------------------------------------------
 

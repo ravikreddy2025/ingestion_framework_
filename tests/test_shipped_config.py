@@ -19,6 +19,7 @@ prove the shortcut works.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from pathlib import Path
 
@@ -550,11 +551,20 @@ def test_every_shipped_file_source_resolves(source_key, environment):
 @pytest.mark.parametrize("source_key, environment", FILE_ENVS)
 def test_every_file_source_reaches_a_real_storage_account_in_every_environment(source_key, environment):
     """A storage profile with no account or no secret scope in ONE environment would only
-    fail when that environment was deployed."""
+    fail when that environment was deployed.
+
+    A Unity Catalog Volume source (docs/build_log/DECISIONS.md D-13) has no storage profile
+    at all - it is governed by Unity Catalog grants, not by anything this framework
+    resolves - so this test has nothing to check for one beyond "no placeholder survived".
+    """
     cfg = _resolve_file(source_key, environment)
-    assert cfg.full_source_path.startswith("abfss://")
     assert "{" not in cfg.full_source_path
-    assert cfg.storage.secret_scope, f"{source_key}/{environment}: no secret scope"
+    if cfg.is_uc_volume_path:
+        assert cfg.storage is None
+        assert cfg.storage_ref is None
+    else:
+        assert cfg.full_source_path.startswith("abfss://")
+        assert cfg.storage.secret_scope, f"{source_key}/{environment}: no secret scope"
 
 
 @pytest.mark.parametrize("source_key, environment", FILE_ENVS)
@@ -582,6 +592,144 @@ def test_no_shipped_file_source_checks_an_incident_lever_into_git(source_key):
 
 
 def test_every_storage_profile_the_sources_use_exists_in_the_register():
+    """A Unity Catalog Volume source (D-13) has no storage_ref to check - it names no
+    profile in this register at all, by construction."""
     register = yaml.safe_load((CONF_ROOT / "storage.yaml").read_text(encoding="utf-8"))["storage"]
     for source_key in FILE_KEYS:
-        assert _resolve_file(source_key).storage_ref in register
+        cfg = _resolve_file(source_key)
+        if cfg.is_uc_volume_path:
+            assert cfg.storage_ref is None
+        else:
+            assert cfg.storage_ref in register
+
+
+# --------------------------------------------------------------------------------------
+# THE MAINTENANCE JOB (docs/build_log/DECISIONS.md D-11)
+#
+# resources/job_maintenance.yml hand-writes one task per covered source, landing_table
+# included - nothing else checks that string against what the source's own config actually
+# derives. A drift here is silent: OPTIMIZE/VACUUM against the wrong table either no-ops
+# (table exists, wrong one) or fails every week (table does not exist), and either way
+# nobody notices until someone goes looking.
+# --------------------------------------------------------------------------------------
+
+MAINTENANCE_JOB = CONF_ROOT.parent / "resources" / "job_maintenance.yml"
+
+
+def _maintenance_tasks() -> list[dict]:
+    document = yaml.safe_load(MAINTENANCE_JOB.read_text(encoding="utf-8"))
+    return document["resources"]["jobs"]["maintenance"]["tasks"]
+
+
+def _resolved_landing_table(source_key: str) -> str:
+    """This source's OWN resolution path, dispatched by its declared source_type - the same
+    partition `_declared_type` drives for every other cross-product test in this file."""
+    declared = _declared_type(CONF_ROOT / "sources" / f"{source_key}.yaml")
+    resolver = {"kafka": _resolve, "oracle": _resolve_oracle, "file": _resolve_file}[declared]
+    return resolver(source_key).landing_table
+
+
+@pytest.mark.parametrize("task", _maintenance_tasks(), ids=lambda t: t["task_key"])
+def test_every_maintenance_task_names_a_source_that_actually_exists(task):
+    source_key = task["task_key"]
+    assert (CONF_ROOT / "sources" / f"{source_key}.yaml").is_file(), f"{source_key}: no source file"
+
+
+@pytest.mark.parametrize("task", _maintenance_tasks(), ids=lambda t: t["task_key"])
+def test_every_maintenance_task_s_landing_table_matches_what_the_source_resolves_to(task):
+    source_key = task["task_key"]
+    declared = task["sql_task"]["parameters"]["landing_table"]
+    assert declared.startswith("${var.data_catalog}."), (
+        f"{source_key}: job_maintenance.yml hardcodes a catalog in '{declared}' instead of "
+        "using ${var.data_catalog} - that silently breaks every environment but the one it "
+        "was copied from."
+    )
+    resolved = _resolved_landing_table(source_key)
+    declared_suffix = declared.removeprefix("${var.data_catalog}.")
+    resolved_suffix = resolved.split(".", 1)[1]
+    assert declared_suffix == resolved_suffix, (
+        f"{source_key}: job_maintenance.yml names landing_table '{declared}', but the source "
+        f"itself resolves to '{resolved}' (prod) - one of the two is stale."
+    )
+
+
+# ========================================================================================
+# CROSS-PRODUCT COMPLETENESS (STAGE_6_gates.md section 3) - the four assertions the stage
+# names explicitly, generalised over all three source types rather than checked by hand per
+# field. Everything above this section already covers most of the same ground per source
+# type; what follows closes the gaps STAGE_6 calls out by name: a mechanical, forward-
+# compatible placeholder sweep (so a FUTURE field is covered without editing this file), a
+# checkpoint-collision check that spans source TYPES (not just within one), and an explicit
+# pin on which parts of a source's identity must never vary by environment.
+# ========================================================================================
+
+
+def _string_fields(obj) -> list[tuple[str, str]]:
+    """Every dataclass field on `obj` whose value is itself a plain string - tuples, dicts,
+    ints and bools are not table names, paths or endpoints and are not this sweep's job."""
+    return [(f.name, value) for f in dataclasses.fields(obj) if isinstance(value := getattr(obj, f.name), str)]
+
+
+@pytest.mark.parametrize("source_key, environment", SOURCE_ENVS)
+def test_no_placeholder_survives_anywhere_in_a_resolved_kafka_config(source_key, environment):
+    """A hand-picked list of fields (above) is only as complete as whoever wrote it
+    remembered to be. This sweeps every string field of the resolved config AND its cluster/
+    registry profiles, so a future field is covered by construction, not by memory."""
+    cfg = _resolve(source_key, environment)
+    for owner, obj in (("", cfg), ("cluster.", cfg.cluster), ("registry.", cfg.registry)):
+        for name, value in _string_fields(obj):
+            assert "{" not in value, f"{source_key}/{environment}: unresolved placeholder in {owner}{name}='{value}'"
+
+
+@pytest.mark.parametrize("source_key, environment", ORACLE_ENVS)
+def test_no_placeholder_survives_anywhere_in_a_resolved_oracle_config(source_key, environment):
+    cfg = _resolve_oracle(source_key, environment)
+    for owner, obj in (("", cfg), ("jdbc.", cfg.jdbc)):
+        for name, value in _string_fields(obj):
+            assert "{" not in value, f"{source_key}/{environment}: unresolved placeholder in {owner}{name}='{value}'"
+
+
+@pytest.mark.parametrize("source_key, environment", FILE_ENVS)
+def test_no_placeholder_survives_anywhere_in_a_resolved_file_config(source_key, environment):
+    """A Unity Catalog Volume source (D-13) has no `storage` profile to sweep - `cfg.storage
+    is None` is itself the point, not a gap in this test."""
+    cfg = _resolve_file(source_key, environment)
+    fields = [("", cfg)] if cfg.storage is None else [("", cfg), ("storage.", cfg.storage)]
+    for owner, obj in fields:
+        for name, value in _string_fields(obj):
+            assert "{" not in value, f"{source_key}/{environment}: unresolved placeholder in {owner}{name}='{value}'"
+
+
+def test_no_two_sources_of_different_checkpoint_based_types_share_a_checkpoint():
+    """Kafka and the file source are the only two checkpoint-based types - Oracle has none,
+    its correctness rests on ingest_state instead (docs/DESIGN.md section 10). Existing
+    checks only compare within one type; nothing else would notice a Kafka topic and a file
+    drop zone resolving to the same physical checkpoint path."""
+    owners: dict[str, tuple[str, str]] = {}
+    for source_key in KAFKA_KEYS:
+        path = _resolve(source_key).checkpoint_path
+        assert path not in owners, f"kafka/{source_key} and {owners[path]} share a checkpoint: {path}"
+        owners[path] = ("kafka", source_key)
+    for source_key in FILE_KEYS:
+        path = _resolve_file(source_key).checkpoint_path
+        assert path not in owners, f"file/{source_key} and {owners[path]} share a checkpoint: {path}"
+        owners[path] = ("file", source_key)
+
+
+def test_the_source_side_identity_never_varies_by_environment():
+    """STAGE_6_gates.md section 3: topic name, Oracle schema/table and file path stay
+    IDENTICAL across environments while catalogs, endpoints and secret scopes differ - they
+    are the source's own identity, not something an environment overlay should be able to
+    change. (The rare per-environment override sub-layer, CONFIGURATION.md section 4's
+    `environments:` block, exists for tuning values like `max_offsets_per_trigger` - not for
+    these.)"""
+    for source_key in KAFKA_KEYS:
+        topics = {_resolve(source_key, e).topic for e in ENVIRONMENTS}
+        assert len(topics) == 1, f"{source_key}: topic varies by environment: {topics}"
+    for source_key in ORACLE_KEYS:
+        resolved = [_resolve_oracle(source_key, e) for e in ENVIRONMENTS]
+        identities = {(cfg.source_schema, cfg.source_table) for cfg in resolved}
+        assert len(identities) == 1, f"{source_key}: source_schema/source_table varies by environment: {identities}"
+    for source_key in FILE_KEYS:
+        paths = {_resolve_file(source_key, e).source_path for e in ENVIRONMENTS}
+        assert len(paths) == 1, f"{source_key}: source_path varies by environment: {paths}"

@@ -12,7 +12,7 @@ import importlib
 
 import pytest
 
-from conftest import FakeSchema, FakeSpark, RecordingDataFrame, make_file_ctx
+from conftest import FakeSchema, FakeSpark, RecordingDataFrame, make_file_ctx, write_file_source
 
 file_run = importlib.import_module("kafka_ingest.sources.file.run")
 
@@ -81,6 +81,53 @@ def test_the_reset_id_is_recorded_on_the_audit_row(file_config_root, checkpoint,
     monkeypatch.setattr(file_run._Session, "run_streaming", lambda self: None)
     file_run.run(ctx, secrets=object())
     assert ctx.audit.rerun_id == "INC-1042"
+
+
+# --------------------------------------------------------------------------------------
+# Unity Catalog Volume source paths apply no storage credentials (docs/build_log/
+# DECISIONS.md D-13). `build_stream_reader` is stopped with a sentinel right after the
+# storage-option branch, the same distance a real streaming query is out of reach of these
+# stand-ins - see the module docstring for why `run_streaming` itself is monkeypatched away
+# everywhere else in this file.
+# --------------------------------------------------------------------------------------
+
+
+class _StreamingStoppedError(Exception):
+    """Raised by a stubbed `build_stream_reader` so a test can inspect what happened
+    before it, without needing a real Structured Streaming query object."""
+
+
+def test_a_volume_source_applies_no_storage_options(file_config_root, monkeypatch):
+    write_file_source(file_config_root, storage_ref=None, source_path="/Volumes/cat_dev/files_claims/landing/")
+    calls = []
+    monkeypatch.setattr(file_run.security, "build_storage_options", lambda *a, **k: calls.append("storage_options"))
+    monkeypatch.setattr(file_run, "apply_session_options", lambda *a, **k: calls.append("apply_session_options"))
+    monkeypatch.setattr(file_run, "build_stream_reader", lambda *a, **k: (_ for _ in ()).throw(_StreamingStoppedError))
+
+    ctx = _ctx(file_config_root)
+    with pytest.raises(_StreamingStoppedError):
+        file_run.run(ctx, secrets=object())
+    assert calls == [], "a Volume-governed source must apply no storage credentials at all"
+
+
+def test_a_storage_ref_source_still_applies_its_options(file_config_root, monkeypatch):
+    """The other branch, proven alongside the Volume one so a future edit cannot make both
+    paths silently skip session options - see conftest's default file source, which uses
+    storage_ref."""
+    calls = []
+
+    def _fake_apply_session_options(*_a, **_k):
+        calls.append("apply_session_options")
+        return lambda: None
+
+    monkeypatch.setattr(file_run.security, "build_storage_options", lambda *a, **k: calls.append("storage_options"))
+    monkeypatch.setattr(file_run, "apply_session_options", _fake_apply_session_options)
+    monkeypatch.setattr(file_run, "build_stream_reader", lambda *a, **k: (_ for _ in ()).throw(_StreamingStoppedError))
+
+    ctx = _ctx(file_config_root)
+    with pytest.raises(_StreamingStoppedError):
+        file_run.run(ctx, secrets=object())
+    assert calls == ["storage_options", "apply_session_options"]
 
 
 # --------------------------------------------------------------------------------------

@@ -668,7 +668,7 @@ Follow **§5.4a's five steps exactly**, substituting:
 | Record where the stream got to (Q13, Kafka-specific) | There is no per-partition offset query for Auto Loader's own position format. Instead, read the last COMPLETED run's `position_end` from the audit table — it carries Auto Loader's own offset JSON verbatim (`sources/file/run.py` `_record_positions`): `SELECT position_end FROM {ops_catalog}.{audit_schema}.ingest_audit WHERE source_key = 'file_claims_inbound' AND layer = 'landing' AND status = 'COMPLETED' ORDER BY event_ts DESC LIMIT 1;` |
 | Check the reset id has never been used (Q6d) | Same query shape, generic across source types: `SELECT run_id, rerun_id, min(event_ts), max(event_ts) FROM {ops_catalog}.{audit_schema}.ingest_audit WHERE source_key = 'file_claims_inbound' AND run_type = 'primary' AND rerun_id IS NOT NULL GROUP BY run_id, rerun_id ORDER BY 4 DESC;` |
 | Set a fresh reset id | `UPDATE {ops_catalog}.{control_schema}.ingest_control SET file_checkpoint_reset_id = 'INC12345', notes = '...', updated_by = current_user(), updated_at = current_timestamp() WHERE source_key = 'file_claims_inbound';` |
-| Backfill the gap | **There is no file replay job in this stage** (unlike Kafka's). A gap between the recorded position and the restart has to be closed by re-presenting the missing files to the landing zone under new names, or waiting for `docs/build_log/DECISIONS.md`-style follow-up work to add one — flag this explicitly during the incident rather than assuming a tool exists. |
+| Backfill the gap | **There is no file replay job, and none is planned** (`docs/build_log/DECISIONS.md` D-10, settled — unlike Kafka's, which has one). If the missing files are still sitting under `source_path` unprocessed, section 9.7 below is the recovery: it is this same checkpoint-loss procedure, applied deliberately. If the files were already consumed and are gone from the landing zone, the only path back is re-presenting them under new names, which is outside this framework's scope. |
 | Clear nothing | Same: `file_checkpoint_reset_id` is not a toggle. Leaving it set is correct and permanent. |
 
 ### 9.5 Emergency stop
@@ -683,3 +683,46 @@ This framework never moves, renames or deletes a source file (`docs/DESIGN.md` �
 "Deliberately not built"). If files are vanishing from the landing zone, that is happening
 outside this job — check the storage account's own lifecycle policies and any other process
 with write access to the container before assuming this job is responsible.
+
+### 9.7 Forcing a full or bounded re-read (there is no replay job for this source)
+
+`docs/build_log/DECISIONS.md` D-10, settled: no `file_replay` job or entrypoint exists, or is
+planned. A fresh (missing) checkpoint already makes Auto Loader re-read everything under
+`source_path` on its own (`cloudFiles.includeExistingFiles` defaults to `true`), so recovery
+reuses §9.4's checkpoint-loss procedure **deliberately**, rather than as an accident recovery.
+
+**Do not set `replay_rerun_id` expecting it to do this on its own.** This source has no
+replay `run_type` to fork a separate checkpoint namespace the way Kafka's replay does — the
+generic `rerun_id` column only labels the audit row for this source, and does not touch the
+checkpoint or the read path. `file_checkpoint_reset_id`, used together with the checkpoint
+being genuinely absent, is the lever that matters.
+
+**Run these three steps in order. Step 1 is not optional:**
+
+1. **Delete the affected landing partition(s) first.** Landing is append-only — a re-read
+   without this step appends everything again and silently duplicates the data. Match the
+   partition(s) to `landing_partition_by` (normally `ingest_date`); if you are not certain
+   which partitions the re-read will touch, narrow with step 2's `source_path` / `path_glob`
+   override first and use that to scope the `DELETE`.
+2. **Set a fresh, previously unused `file_checkpoint_reset_id`** — check it has never been
+   used for this `source_key` with the same query shape as Q6d (`sql/03_support_queries.sql`),
+   substituting this source's table names. Reusing an id is refused by the same guard that
+   protects Kafka's reset, for the same reason: every write would be skipped as a duplicate.
+3. **Run the normal file job.**
+
+**To bound the re-read to fewer files** — a targeted fix rather than the whole path —
+temporarily narrow `source_path` or `path_glob` for that one run, in a PR or a one-off job
+parameter override. **There is no offset or timestamp window for this source**, unlike
+Kafka's or Oracle's replay bounds: narrowing the path is the only bounding mechanism there
+is, and it only narrows *which files are listed*, not which rows within them.
+
+**Checklist**
+
+| | Step | Where |
+|---|---|---|
+| [ ] | Deleted the affected landing partition(s) | `DELETE ... WHERE ingest_date = ...` |
+| [ ] | Confirmed the reset id has never been used for this source | the audit table, Q6d's shape |
+| [ ] | Set a fresh `file_checkpoint_reset_id` | the control table |
+| [ ] | Narrowed `source_path` / `path_glob` if this is a bounded re-read, not a full one | source YAML or job parameters |
+| [ ] | Ran the normal file job and confirmed it logged `checkpoint_reset_engaged` | driver log, or Q1 |
+| [ ] | Verified row counts against what was expected, and no duplicates | landing table |
