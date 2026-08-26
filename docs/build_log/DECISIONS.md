@@ -404,6 +404,17 @@ maintenance coverage does not require hand-editing a YAML list at all (STAGE_5's
 stage plus "smallest correct change" both counsel against a template-generation mechanism for
 three data points).
 
+**Closed in full in Stage 7's addendum.** Flagged a third time in the Stage 7 report's own
+first pass (documentation only, per that stage's scope), then closed on request before the
+PR: `resources/job_maintenance.yml` gained an `oracle_claim_header` task, same shape as the
+file source's, landing_table derived the same way `conf/defaults/oracle.yaml` derives it
+(`CLAIMS.CLAIM_HEADER` -> `oracle_claims.claim_header`). No `sql/04_maintenance.sql` change
+needed - its `OPTIMIZE`/`VACUUM` statements were already source-agnostic. Verified by
+`tests/test_shipped_config.py`'s existing `test_every_maintenance_task_s_landing_table_
+matches_what_the_source_resolves_to`, parametrized automatically over every task in the YAML
+file, which now includes this one and passes. The "what would change it" redesign above is
+not attempted; this closes only the one concrete gap it named.
+
 ---
 
 ## D-12 -- Storage auth: SAS tokens and managed identity are deliberately not implemented
