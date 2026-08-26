@@ -24,6 +24,13 @@
 # type is validated against this file, so a type-specific key here is an unknown key for
 # every other type - which is exactly the error you want, at the wrong moment.
 #
+# TIER MARKERS
+#   [MUST CHANGE]         Placeholder or environment-specific. Will not work as shipped.
+#   [NICE TO CHANGE]      Sensible default. Tune with a reason.
+#   [NO CHANGE REQUIRED]  Framework contract or platform standard.
+#
+# Full reference: docs/CONFIGURATION.md section 1
+#
 # PLACEHOLDERS
 #   {catalog}      and any other key under `vars:` in the environment file
 #   {source_key}   the source's config filename without .yaml
@@ -33,7 +40,7 @@
 
 defaults:
 
-  # --- THE FRAMEWORK'S OWN THREE TABLES -------------------------------------------------
+  # --- THE FRAMEWORK'S OWN THREE TABLES ------------------------------ [NO CHANGE REQUIRED]
   # Shared by every source of every type. Only the catalog and schema vars change between
   # environments, so they belong here rather than repeated in every source file. Each is
   # created by sql/01_operational_config.sql or sql/02_layer_tables.sql when an environment
@@ -59,7 +66,7 @@ defaults:
   # Layer 4: the support team's runtime overrides. Written by support, read by the job.
   control_table: "{ops_catalog}.{control_schema}.ingest_control"
 
-  # --- TABLE PROPERTIES -----------------------------------------------------------------
+  # --- TABLE PROPERTIES ------------------------------------------------------------------
   # Delta table properties applied to EVERY table the framework creates, in every layer.
   # Applied at CREATE time only - editing this does not alter a table that already exists
   # (use ALTER TABLE for that).
@@ -67,13 +74,14 @@ defaults:
   # A source can override the whole map in its own file if one feed genuinely needs
   # different properties. Most never should.
   table_properties:
-    # ---- ON by default -----------------------------------------------------------------
+    # ---- ON by default ------------------------------------------------ [NO CHANGE REQUIRED]
     # Streaming appends, batch appends and per-layer audit rows all produce small files;
     # letting Delta compact them removes an entire class of "why is this table slow" tickets.
     delta.autoOptimize.optimizeWrite: "true"
     delta.autoOptimize.autoCompact: "true"
 
-    # ---- OFF by default - uncomment inside a source's OWN table_properties to opt in ----
+    # ---- OFF by default - uncomment inside a source's OWN table_properties [NICE TO CHANGE]
+    # (never here) to opt one source in --------------------------------------------------
     # These are commented OUT here deliberately: enabling any of them changes storage cost
     # or write behaviour, and that should be a decision for one source, made in that
     # source's PR - not a platform-wide default nobody chose. A source overrides the WHOLE

@@ -6,16 +6,19 @@
 # Only the catalog, endpoints and secret scopes differ.
 #
 # See conf/environments/dev.yaml for what belongs in this file and what does not.
+#
+# TIER MARKERS - see conf/environments/dev.yaml for the legend. Full reference:
+# docs/CONFIGURATION.md section 1
 # =====================================================================================
 
 vars:
-  catalog: platform_preprod
+  catalog: platform_preprod                                                 # [MUST CHANGE]
   # Operational catalog: the control and state tables. MUST match `ops_catalog`
-  # for this target in databricks.yml - a test asserts they agree.
+  # for this target in databricks.yml - a test asserts they agree.           # [MUST CHANGE]
   ops_catalog: ops_preprod
   # The three ops-catalog schemas (docs/build_log/DECISIONS.md D-06). There is no reason
   # for these to differ by environment - only catalog/ops_catalog do - so every environment
-  # file carries the same three values.
+  # file carries the same three values.                                [NO CHANGE REQUIRED]
   audit_schema: audit
   control_schema: ingestion
   logs_schema: logs
@@ -25,11 +28,11 @@ vars:
 # prod needs the same change - otherwise preprod stops being a valid rehearsal of prod.
 #
 # `defaults:` applies to every source type; `defaults_by_type: <type>:` applies to one.
-# See conf/environments/dev.yaml for a worked example of the second.
+# See conf/environments/dev.yaml for a worked example of the second.        [NICE TO CHANGE]
 defaults: {}
 defaults_by_type: {}
 
-clusters:
+clusters:                                                                    # [MUST CHANGE]
   confluent_cloud_shared:
     bootstrap_servers: "pkc-ppd01.westeurope.azure.confluent.cloud:9092"
     secret_scope: kv-kafka-preprod
@@ -42,7 +45,7 @@ clusters:
     bootstrap_servers: "kafka-af-ppd01.fraud.internal:9094,kafka-af-ppd02.fraud.internal:9094"
     secret_scope: kv-kafka-antifraud-preprod
 
-registries:
+registries:                                                                  # [MUST CHANGE]
   confluent_cloud_shared:
     url: "https://psrc-ppd01.westeurope.azure.confluent.cloud"
     secret_scope: kv-kafka-preprod
@@ -57,7 +60,7 @@ registries:
 # Overrides named profiles in conf/jdbc.yaml. The profile must already exist there -
 # conf/jdbc.yaml stays the single register of which databases we extract from. Host,
 # service name and secret scope are what differ per environment; the auth mode and the
-# secret KEY NAMES do not, so they stay in the register.
+# secret KEY NAMES do not, so they stay in the register.                     [MUST CHANGE]
 jdbc:
   oracle_prod_core:
     host: "oracle-core-ppd01.corp.internal"
@@ -70,6 +73,7 @@ jdbc:
     secret_scope: kv-oracle-preprod
 
 # Overrides named profiles in conf/storage.yaml - see conf/environments/dev.yaml.
+#                                                                             [MUST CHANGE]
 storage:
   adls_landing_prod:
     account: "adlsclaimsppd01"
